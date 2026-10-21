@@ -1712,3 +1712,25 @@ html.dark .pw-term-host.wterm {
 .pw-sess-runtime { font-size: 11px; color: #4ade80; margin-top: 2px; }
 .pw-sess-runtime-error { color: #f87171; }
 .pw-sess-lasttext { font-size: 11px; opacity: 0.6; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 420px; }
+
+/* --- alive sessions dialog (2026-10-21): header activity button + live list --- */
+.pw-alive-btn { position: relative; display: inline-flex; align-items: center; }
+.pw-alive-btn svg { width: 18px; height: 18px; }
+.pw-alive-count {
+	position: absolute; top: -3px; right: -5px;
+	min-width: 15px; height: 15px; padding: 0 4px;
+	border-radius: 8px; background: #4ade80; color: #052e12;
+	font-size: 10px; font-weight: 700; line-height: 15px; text-align: center;
+}
+.pw-alive-count-error { background: #f87171; color: #450a0a; }
+.pw-alive-dot { display: inline-block; width: 8px; height: 8px; border-radius: 8px; margin-right: 7px; vertical-align: 1px; flex-shrink: 0; }
+.pw-alive-dot.running { background: #4ade80; animation: pw-alive-pulse 1.4s ease-in-out infinite; }
+.pw-alive-dot.error { background: #f87171; }
+.pw-alive-dot.done { background: #86efac; animation: none; }
+@keyframes pw-alive-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.pw-alive-confirm { background: #f87171 !important; color: #fff !important; border-color: #f87171 !important; }
+.pw-alive-stopping { font-size: 11px; opacity: 0.7; align-self: center; white-space: nowrap; }
+.pw-alive-done { color: #4ade80 !important; }
+.pw-alive-current { outline: 1px solid rgba(37, 99, 235, 0.5); border-radius: 6px; }
+.pw-alive-link { background: none; border: none; color: #60a5fa; cursor: pointer; padding: 0; font-size: inherit; text-decoration: underline; }
+.pw-alive-foot { padding: 6px 14px; font-size: 11px; opacity: 0.55; border-top: 1px solid rgba(128, 128, 128, 0.2); }

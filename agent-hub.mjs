@@ -225,11 +225,6 @@ export class AgentHub {
 			messageCount: state.messages.length,
 		};
 		if (!entry.createdAt) entry.createdAt = now;
-		console.log(
-			"[agent-hub] persist:", sessionId.slice(0, 15),
-			"msgs:", state.messages.length,
-			"roles:", state.messages.map((m) => m.role[0]).join("").slice(0, 60) + (state.messages.length > 60 ? "…" : ""),
-		);
 		const lines = [JSON.stringify(metadata)];
 		for (const m of state.messages) {
 			const out = { role: m.role, content: m.content };
@@ -358,11 +353,20 @@ export class AgentHub {
 	}
 
 	/** Sink for runtime deltas: the server wires this to a {type:"runtime"} frame
-	 *  on /ws/sync. Boundaries emit immediately; lastText previews ≤1/2s. */
+	 *  on /ws/sync. Boundaries emit immediately; lastText previews ≤1/2s. Every
+	 *  emission advances the SHARED entry.seq (2026-10-21 commit review P2: runtime-
+	 *  only deltas — attach/detach client counts, queued prompts, the preview timer —
+	 *  previously reused the last agent-event seq, and the client's stale-frame guard
+	 *  `rt.seq <= cur.seq` dropped them, leaving the runtime UI stale. Agent-event seq
+	 *  is consumed nowhere else client-side, so one monotonic space is safe: gaps are
+	 *  fine, strictly-forward per emission is what the guard needs. Never bump from
+	 *  getRuntime — the counter moves ONLY on emit so REST snapshots and WS frames
+	 *  share one ordering. */
 	emitRuntime(sessionId) {
 		if (!this.onRuntimeChange) return;
 		const entry = this.sessions.get(sessionId);
 		if (!entry) return;
+		entry.seq += 1;
 		try { this.onRuntimeChange(sessionId, this.getRuntime(sessionId)); } catch { /* the sink must never break a run */ }
 	}
 

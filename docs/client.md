@@ -95,8 +95,27 @@ Covers `src/main.tsx`, `src/ui/chat.tsx`, `src/storage.ts`, `src/local-storage-b
 pendingPrompts, clients, seq}) fed by `{type:"runtime"}` delta frames (applied immediately, bypassing
 the 5s metadata throttle; seq-guard: stale frames dropped, idle deletes) and FULL-REPLACED from the
 embedded runtimes inside every "sessions" frame (restart/reconnect hygiene). `onRuntime(cb)` fires
-immediately; `seedRuntime()` ingests a REST /api/sessions boot snapshot. Consumers: session-list
-(live rows pinned top, badge, preview), main.tsx header `▶ N` badge + resume banner + document.title.
+immediately; `seedRuntime()` ingests a REST /api/sessions boot snapshot. `syncHealthy()` reports
+whether the sync socket is OPEN — the runtime map is live only then. Consumers: session-list
+(live rows pinned top, badge, preview), main.tsx header activity button + resume banner +
+document.title, and the AliveSessionsDialog (below).
+
+## Alive sessions dialog (`src/ui/alive-sessions.tsx`, 2026-10-21)
+
+Dedicated live view of sessions with a RUNNING or ERROR server-side run (the full session list
+still shows everything). Header activity button (heartbeat icon) — the badge counts alive sessions
+EXCLUDING the current one ("other stuff needs me"), red when any error; the DIALOG lists ALL alive
+incl. current. Rows are derived from the runtime map on every render (stable sort: error → running
+→ done, startedAt desc — rows only reorder on status transitions, so Kill targets don't jitter);
+a 1s tick re-renders elapsed time. Titles resolve metadata.title → runtime.lastText tail →
+`Session <id8>`; metadata is fetched on open and re-fetched (throttled 3s) when an unknown
+sessionId appears. Row click navigates (`loadSessionById`); the CURRENT session's row just closes
+(no reload). Kill = two-stage inline confirm (Kill → "Confirm?" for 3s → `POST /api/agent/abort`)
+→ "stopping…" until the runtime frame flips; abort failures are SILENT (the run may have finished
+naturally in the same instant); error rows have no kill (nothing in-flight) but stay clickable.
+A row whose run finishes while open lingers 2s as "✓ done" (grace map), then drops. Footer shows
+live/paused via `syncHealthy()`. (Server-side counterpart: every runtime emission advances the hub
+seq — see docs/server.md — so runtime-only deltas are never dropped by the stale-frame guard.)
 
 ## Session sync (`session-sync.ts`)
 

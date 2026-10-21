@@ -167,7 +167,21 @@ private, loopback, link-local (incl. cloud metadata 169.254.169.254), CGNAT, ben
 multicast/reserved, `localhost`/`*.local`/`*.internal` — including **inet_aton forms** (`127.1`,
 `2130706433`, `0177.0.0.1`, `0x7f.1`), **IPv4-mapped IPv6** in all spellings (`::ffff:127.0.0.1`,
 `0:0:0:0:0:ffff:127.0.0.1`, `::ffff:7f00:1`), expanded IPv6 loopback/unspecified, and FQDN trailing
-dots — applied to the initial target AND every redirect hop. Origin check: `origin ===
+dots — applied to the initial target AND every redirect hop. **Depth-2 — resolved-address
+validation (2026-10-21 commit review P2)**: `proxyLookup()` (the custom `dns.lookup` wired into the
+agent via `connect.lookup`) resolves with `all:true`, classifies EVERY resolved address through
+`ipAddressBlocked()` (loopback, RFC1918, CGNAT, link-local/metadata, ULA fc00::/7, fe80::/10,
+multicast, unspecified/0.0.0.0/8, IPv4-mapped/compatible, 6to4-embedded v4; unparseable → fail
+closed), rejects the connect when NOTHING allowed remains (error surfaces through the fetch's
+`cause` — `handleProxy` unwraps `err.cause.message` so the block reason is visible instead of a
+bare "fetch failed"), and PINS the allowed address(es) for the socket — `net.connect` uses exactly
+what the lookup returned (no second, unvalidated lookup); TLS SNI/cert still verify against the
+original hostname (the URL is never rewritten). A DNS name resolving to 127.0.0.1 (localtest.me,
+*.nip.io) is therefore rejected at connect; every redirect hop re-enters the same lookup.
+`ipAddressBlocked` is deliberately separate from `proxyTargetBlocked` — that function blocks
+IP-literal HOSTNAMES by design and would reject every resolved address. Accepted residual: NAT
+hairpin/DNAT (a public IP DNAT-ing to an internal host); env HTTP(S)_PROXY is irrelevant (per-request
+dispatcher, undici does not honor env proxies by default). Origin check: `origin ===
 new URL(c.req.url).origin` (Host-derived — kept as depth; the middleware browser-origin gate is the
 primary boundary now).
 `linkAborts()`: client `req.raw.signal` + incoming `aborted` + outgoing premature `close` → one

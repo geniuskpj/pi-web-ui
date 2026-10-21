@@ -96,9 +96,13 @@ refresh, `?session=` restore.
    tiny `{type:"runtime", runtime:{…, clients, seq}}` frame on **/ws/sync** — IMMEDIATE (bypasses the
    300ms coalesce + 1s list cache + the client 5s metadata merge); `message_update` refreshes lastText
    in memory only (broadcast ≤1/2s per running session); `/api/sessions` and full `sessions` frames
-   embed NON-IDLE runtime. Client: seq-guarded runtimeMap (volatile — never persisted, never
-   lastModified-merged) → session list pins running/error on top with badges + preview, header `▶ N`
-   badge, resume banner on bare boots, `document.title` prefix. Detached devices never get event
+   embed NON-IDLE runtime. EVERY runtime emission advances the shared hub seq (2026-10-21 review P2:
+   runtime-only deltas — attach/detach client counts via `agentHub.emitRuntime`, queued prompts —
+   were dropped by the client's stale seq guard before). Client: seq-guarded runtimeMap (volatile —
+   never persisted, never lastModified-merged) → session list pins running/error on top with badges
+   + preview, header activity button + **AliveSessionsDialog** (`src/ui/alive-sessions.tsx` — live
+   rows, click-to-navigate, two-stage Kill via `POST /api/agent/abort`, "✓ done" grace, live/paused
+   footer), resume banner on bare boots, `document.title` prefix. Detached devices never get event
    deltas — the attached view already has subscribe-first snapshot+live.
 6. **Terminal**: dock open → lazy `loadWterm()` (vendored bundle, CDN fallbacks) → WS
    `/ws/terminal?session=&cols=&rows=` → replay ring → live `{t:"d"}` frames → wterm.write; stdin via

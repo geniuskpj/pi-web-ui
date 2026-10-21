@@ -5,6 +5,7 @@ import { getModel, type TextContent } from "@earendil-works/pi-ai";
 import { customConvertToLlm } from "./llm.js";
 import { makeId } from "./id.js";
 import { SessionListDialog } from "./ui/session-list.js";
+import { AliveSessionsDialog } from "./ui/alive-sessions.js";
 import { SettingsDialog } from "./ui/settings.js";
 import { ModelSelector } from "./ui/model-selector.js";
 import { AppStorage, CustomProvidersStore, ProviderKeysStore, SessionsStore, SettingsStore, setAppStorage } from "./storage.js";
@@ -476,6 +477,7 @@ const ICONS = {
 		"M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z",
 	],
 	terminal: ["m4 17 6-6-6-6", "M12 19h8"],
+	activity: ["M22 12h-4l-3 9L9 3l-3 9H2"], // heartbeat — active server-side runs
 };
 
 const Icon = ({ d, ...rest }: { d: string | string[] } & Record<string, any>) => (
@@ -494,6 +496,7 @@ function App() {
 	const [runtime, setRuntime] = useState<ReadonlyMap<string, RuntimeRecord>>(() => sessionSync.runtimeSnapshot());
 	const [bannerDismissed, setBannerDismissed] = useState(false);
 	const [sessionsOpen, setSessionsOpen] = useState(false);
+	const [aliveOpen, setAliveOpen] = useState(false);
 	const [settingsOpen, setSettingsOpen] = useState(false);
 	const [modelOpen, setModelOpen] = useState(false);
 	const [themeMode, setThemeMode] = useState<string>(localStorage.getItem("theme") || "system");
@@ -573,6 +576,11 @@ function App() {
 		setThemeMode(next);
 	};
 
+	// alive sessions (running/error) EXCLUDING the current one — the badge counts
+	// "other stuff needs me"; the dialog lists ALL alive incl. current (claude review)
+	const aliveElsewhere = [...runtime.values()].filter(
+		(r) => (r.status === "running" || r.status === "error") && r.sessionId !== currentSessionId,
+	);
 	return (
 		<div class="w-full h-full flex flex-col overflow-hidden">
 			<header class="pi-header">
@@ -609,15 +617,18 @@ function App() {
 					<button class="pi-btn" title="Terminal (bash dock — no node-pty)" onClick={() => termBus.toggle()}>
 						<Icon d={ICONS.terminal} />
 					</button>
-					{[...runtime.values()].filter((r) => r.status === "running" && r.sessionId !== currentSessionId).length > 0 && (
-						<button
-							class="pi-btn pw-running-badge"
-							title="Sessions running on the server (other device or background) — click to open the list"
-							onClick={() => setSessionsOpen(true)}
-						>
-							▶ {[...runtime.values()].filter((r) => r.status === "running" && r.sessionId !== currentSessionId).length}
-						</button>
-					)}
+					<button
+						class="pi-btn pw-alive-btn"
+						title="Active sessions — runs live on the server (running/error), with Kill"
+						onClick={() => setAliveOpen(true)}
+					>
+						<Icon d={ICONS.activity} />
+						{aliveElsewhere.length > 0 && (
+							<span class={"pw-alive-count" + (aliveElsewhere.some((r) => r.status === "error") ? " pw-alive-count-error" : "")}>
+								{aliveElsewhere.length}
+							</span>
+						)}
+					</button>
 	<button class="pi-btn pi-theme" title={`Theme: ${themeMode} (click to cycle)`} onClick={cycleTheme}>
 						<span style={{ fontSize: 11, fontWeight: 600 }}>{themeMode === "system" ? "Auto" : themeMode === "light" ? "Light" : "Dark"}</span>
 					</button>
@@ -642,6 +653,13 @@ function App() {
 			})()}
 			{agent ? <ChatView agent={agent} /> : <div class="pw-chat" />}
 			{toast && <div class="pi-toast">{toast}</div>}
+			<AliveSessionsDialog
+				open={aliveOpen}
+				currentSessionId={currentSessionId}
+				onLoad={loadSessionById}
+				onViewAll={() => setSessionsOpen(true)}
+				onClose={() => setAliveOpen(false)}
+			/>
 			<SessionListDialog
 				open={sessionsOpen}
 				onLoad={loadSessionById}

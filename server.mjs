@@ -27,6 +27,8 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import fs from "node:fs";
+import net from "node:net";
+import dns from "node:dns";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -1194,6 +1196,14 @@ const llmAgent = new UndiciAgent({
 	connections: 16, pipelining: 1,
 	keepAliveTimeout: 30_000, keepAliveMaxTimeout: 60_000, connectTimeout: 30_000,
 	headersTimeout: 0, bodyTimeout: 0,
+	// SSRF depth-2 (2026-10-21 commit review): resolve BEFORE connecting and reject
+	// destinations whose resolved addresses are private/loopback/link-local — a public
+	// DNS name pointing at 127.0.0.1 (localtest.me, *.nip.io) previously sailed past
+	// the hostname-pattern check. The validated address is PINNED for the socket
+	// (net.connect uses exactly what the lookup returns — no second, unvalidated
+	// lookup); TLS SNI/cert verification still uses the original hostname (the URL is
+	// not rewritten). Every redirect hop re-enters this lookup (fresh fetch per hop).
+	connect: { lookup: proxyLookup },
 });
 
 function buildTarget(reqUrl, reqPath) {
@@ -1290,26 +1300,30 @@ function dottedFromInet(parts) {
 	return last <= 0xffff ? [...head, (last >>> 8) & 255, last & 255].join(".") : null;
 }
 
-// SSRF guard: block destinations that name the server's own or private networks
-// (metadata endpoints, loopback CDP on :9222, LAN hosts). Hostname-pattern based
-// — a DNS name re-resolving to an internal IP is still possible in theory; the
-// browser-origin gate above is the primary boundary, this is depth.
+// Shared IPv4 classifier (first two octets) — used by the hostname depth-1 check
+// below AND by the resolved-address depth-2 check (ipAddressBlocked).
+function ipv4Blocked(a, b) {
+	return (
+		a === 0 || a === 10 || a === 127 ||
+		(a === 100 && b >= 64 && b <= 127) || // CGNAT 100.64/10
+		(a === 169 && b === 254) || // link-local / cloud metadata
+		(a === 172 && b >= 16 && b <= 31) || // RFC1918 private
+		(a === 192 && b === 168) || // RFC1918 private
+		(a === 192 && b === 0) || // reserved
+		(a === 198 && (b === 18 || b === 19)) || // benchmark 198.18/15
+		a >= 224 // multicast 224/4 + reserved 240/4
+	);
+}
+
+// SSRF guard depth-1: block destinations that NAME the server's own or private
+// networks (metadata endpoints, loopback CDP on :9222, LAN hosts). Hostname-pattern
+// based; IP literals (incl. inet_aton + IPv4-mapped IPv6 spellings) are caught here.
+// Depth-2 (resolved-address validation) lives in proxyLookup + ipAddressBlocked:
+// a public DNS name resolving into the private range is rejected there.
 function proxyTargetBlocked(hostname) {
 	const h = String(hostname || "").toLowerCase().replace(/^\[|\]$/g, "").replace(/\.+$/, ""); // brackets + FQDN trailing dot
 	if (!h) return true;
 	if (h === "localhost" || h.endsWith(".localhost") || h.endsWith(".local") || h.endsWith(".internal")) return true;
-	function ipv4Blocked(a, b) { // shared by dotted-quad + inet_aton normalizations
-		return (
-			a === 0 || a === 10 || a === 127 ||
-			(a === 100 && b >= 64 && b <= 127) || // CGNAT 100.64/10
-			(a === 169 && b === 254) || // link-local / cloud metadata
-			(a === 172 && b >= 16 && b <= 31) || // RFC1918 private
-			(a === 192 && b === 168) || // RFC1918 private
-			(a === 192 && b === 0) || // reserved
-			(a === 198 && (b === 18 || b === 19)) || // benchmark 198.18/15
-			a >= 224 // multicast 224/4 + reserved 240/4
-		);
-	}
 	if (/^[0-9.]+$/.test(h)) { // inet_aton forms ("127.1", "2130706433", "0177.0.0.1")
 		const d = dottedFromInet(h.split("."));
 		if (d) {
@@ -1345,6 +1359,99 @@ function proxyTargetBlocked(hostname) {
 	return false;
 }
 
+// Expand an IPv6 string to 8 hextet numbers (or null if unparseable). Handles
+// "::", embedded forms, full 8-group spellings. Zone id must already be stripped.
+function expandV6(ip) {
+	const parts = ip.split("::");
+	if (parts.length > 2) return null;
+	const head = parts[0] ? parts[0].split(":").filter(Boolean) : [];
+	const tail = parts.length === 2 ? (parts[1] ? parts[1].split(":").filter(Boolean) : []) : null;
+	if (tail === null) {
+		if (head.length !== 8) return null;
+		return head.map((g) => parseInt(g, 16) || 0);
+	}
+	const fill = 8 - head.length - tail.length;
+	if (fill < 0) return null;
+	return [...head, ...Array(fill).fill("0"), ...tail].map((g) => parseInt(g, 16) || 0);
+}
+
+// SSRF guard depth-2: classify a RESOLVED address (canonical form from dns.lookup
+// or an IP literal). Deliberately SEPARATE from proxyTargetBlocked — that function
+// blocks IP-literal HOSTNAMES by design, so feeding resolved addresses into it
+// would block everything. Here an address is bad only if it lands in a
+// non-routable range: loopback, RFC1918, CGNAT, link-local/metadata, ULA,
+// unspecified, multicast/reserved, 0.0.0.0/8, plus IPv4-mapped/compatible and
+// 6to4-embedded IPv4 spellings. Unparseable input fails CLOSED.
+function ipAddressBlocked(raw) {
+	let ip = String(raw ?? "").toLowerCase().trim().replace(/%.*$/, ""); // strip IPv6 zone id
+	if (!ip) return true;
+	const fam = net.isIP(ip);
+	if (fam === 4) {
+		const o = ip.split(".").map(Number);
+		if (o.length !== 4 || o.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
+		return ipv4Blocked(o[0], o[1]);
+	}
+	if (fam !== 6) return true; // not an IP at all → fail closed
+	if (ip === "::" || ip === "::1") return true; // unspecified / loopback
+	if (ip.startsWith("::ffff:")) { // IPv4-mapped dotted form ("::ffff:127.0.0.1")
+		const rest = ip.slice(7);
+		if (/^\d{1,3}(\.\d{1,3}){3}$/.test(rest)) {
+			const o = rest.split(".").map(Number);
+			if (o.some((n) => n > 255)) return true;
+			return ipv4Blocked(o[0], o[1]);
+		}
+	}
+	if (/^::\d{1,3}(\.\d{1,3}){3}$/.test(ip)) { // deprecated IPv4-compatible ("::127.0.0.1")
+		const o = ip.slice(2).split(".").map(Number);
+		if (o.some((n) => n > 255)) return true;
+		return ipv4Blocked(o[0], o[1]);
+	}
+	const hx = expandV6(ip);
+	if (!hx) return true;
+	if (hx.every((g) => g === 0)) return true; // "0:0:...:0" spelling of ::
+	if (hx.slice(0, 7).every((g) => g === 0) && hx[7] === 1) return true; // "0:0:...:1" spelling of ::1
+	if (hx[5] === 0xffff) return ipv4Blocked(hx[6] >>> 8, hx[6] & 255); // mapped hex ("::ffff:7f00:1")
+	if (hx[0] === 0x2002) return ipv4Blocked(hx[1] >>> 8, hx[1] & 255); // 6to4 embedded v4 ("2002:7f00:1::")
+	if (hx[0] >= 0xfc && hx[0] <= 0xfd) return true; // fc00::/7 unique-local
+	if (hx[0] === 0xfe && (hx[1] & 0xc0) === 0x80) return true; // fe80::/10 link-local
+	if (hx[0] === 0xff) return true; // ff00::/8 multicast
+	return false;
+}
+
+// Custom dns.lookup for the proxy's undici dispatcher (llmAgent): resolve, VALIDATE
+// every resolved address against ipAddressBlocked, and hand net.connect ONLY allowed
+// addresses (the validated address is pinned — no second, unvalidated lookup).
+// Block if NOTHING allowed remains. Node's net.connect may call this in either
+// callback shape: autoSelectFamily → cb(null, [{address, family}]) (options.all),
+// otherwise cb(null, address, family) — mirror undici's own IP-literal override.
+function proxyLookup(hostname, options, callback) {
+	const h = String(hostname || "").toLowerCase().replace(/^\[|\]$/g, "").replace(/%.*$/, "");
+	const done = (addresses) => {
+		const allowed = [];
+		for (const a of addresses || []) {
+			const addr = String(a?.address ?? a ?? "").toLowerCase().replace(/%.*$/, "");
+			if (!addr) continue;
+			const fam = net.isIP(addr);
+			if (!fam) continue;
+			if (ipAddressBlocked(addr)) continue;
+			allowed.push({ address: addr, family: fam });
+		}
+		if (!allowed.length) {
+			const err = new Error(`blocked proxy target (resolved to private/loopback/link-local): ${h}`);
+			err.code = "PI_WEB_PROXY_TARGET_BLOCKED";
+			return callback(err);
+		}
+		if (options?.all) return callback(null, allowed);
+		callback(null, allowed[0].address, allowed[0].family);
+	};
+	const literal = net.isIP(h);
+	if (literal) return done([{ address: h, family: literal }]); // literal reaching lookup — validate, don't resolve
+	dns.lookup(h, { family: options?.family || 0, hints: options?.hints, all: true, verbatim: true }, (err, addresses) => {
+		if (err) return callback(err);
+		done(addresses);
+	});
+}
+
 async function handleProxy(c) {
 	const target = buildTarget(c.req.url, c.req.path);
 	if (!target) return c.json({ error: "missing ?url=" }, 400);
@@ -1366,7 +1473,14 @@ async function handleProxy(c) {
 	let upstream = null;
 	for (let hop = 0; hop < 6; hop++) {
 		try { upstream = await undiciFetch(currentUrl, init); }
-		catch (err) { if (ac.signal.aborted) return new Response(null, { status: 499 }); return c.json({ error: err.message }, 502); }
+		catch (err) {
+			if (ac.signal.aborted) return new Response(null, { status: 499 });
+			// undici wraps connect failures (incl. our SSRF lookup rejection) in
+			// TypeError("fetch failed") — surface the CAUSE so the block reason and
+			// real LLM connectivity errors are visible instead of a bare "fetch failed"
+			const msg = err?.cause?.message || err?.message || String(err);
+			return c.json({ error: msg }, 502);
+		}
 		const loc = upstream.status >= 300 && upstream.status < 400 ? upstream.headers.get("location") : null;
 		if (loc) {
 			if (hop === 5) return c.json({ error: "too many redirects" }, 502);
@@ -1646,7 +1760,7 @@ function agentConn(ws) {
 					if (currentSession) detachAgentClient(currentSession, ws);
 					currentSession = String(m.sessionId || "").slice(0, 80) || crypto.randomUUID();
 					attachAgentClient(currentSession, ws);
-					sendRuntime(currentSession, agentHub.getRuntime(currentSession)); // clients count changed (fable5)
+					agentHub.emitRuntime(currentSession); // clients count changed (fable5) — MUST go through the hub so seq advances
 					// ALWAYS ensure the hub session exists — fresh sessions have no store
 					// entry, and set-thinking/prompt assume a registered agent (2026-10-21)
 					try {
@@ -1697,8 +1811,8 @@ function agentConn(ws) {
 			safeSend(ws, { type: "error", error: err.message });
 		}
 	});
-	ws.on("close", () => { if (currentSession) { detachAgentClient(currentSession, ws); sendRuntime(currentSession, agentHub.getRuntime(currentSession)); } });
-	ws.on("error", () => { if (currentSession) { detachAgentClient(currentSession, ws); sendRuntime(currentSession, agentHub.getRuntime(currentSession)); } });
+	ws.on("close", () => { if (currentSession) { detachAgentClient(currentSession, ws); agentHub.emitRuntime(currentSession); } });
+	ws.on("error", () => { if (currentSession) { detachAgentClient(currentSession, ws); agentHub.emitRuntime(currentSession); } });
 }
 
 function attachAgentClient(sessionId, ws) {

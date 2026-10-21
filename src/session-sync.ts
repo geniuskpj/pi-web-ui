@@ -61,6 +61,11 @@ class SessionSync {
 	runtimeSnapshot(): ReadonlyMap<string, RuntimeRecord> {
 		return this.runtimeMap;
 	}
+	/** True while the sync socket is open — the runtime map is LIVE only then;
+	 *  UIs built on runtimeSnapshot() show a "paused" note when this is false. */
+	syncHealthy(): boolean {
+		return this.ws?.readyState === WebSocket.OPEN;
+	}
 	/** Subscribe to runtime changes — fired immediately on every runtime frame
 	 *  and on the full-replace inside "sessions" frames (bypasses the 5s throttle). */
 	onRuntime(cb: () => void): () => void {

@@ -56,6 +56,7 @@ claims without the raw source). Start with `architecture.md` — index + reading
 | Markdown + highlight + XSS | `src/ui/markdown.ts` | marked (GFM) + highlight.js lib/common + DOMPurify (style/id/name forbidden); memoized |
 | LLM connectivity (proxy + keys) | `src/ui/proxy-stream.ts` | vendored proxy-utils + build patches: clone-before-proxy, localStorage-first settings, key resolver w/ bounded server race |
 | Session list dialog | `src/ui/session-list.tsx` | server mirror + local metadata merge, load/delete |
+| **Alive sessions dialog** | `src/ui/alive-sessions.tsx` | header activity button (count badge) → live view of running/error sessions: click-to-navigate, two-stage Kill (abort), "✓ done" grace, live/paused footer; every runtime emission advances the hub seq so deltas are never stale-dropped |
 | Settings dialog | `src/ui/settings.tsx` | model, thinking level, keys (import/add/replace), proxy, token, quota |
 | Model selector | `src/ui/model-selector.tsx` | pi-config models only (no built-in catalog) |
 | Settings → Import from pi config | `src/ui/settings.tsx` | providers/defaults/key re-import (moved from the header 💾 button) |
@@ -250,10 +251,19 @@ Requirements & limits:
   `docs/client.md`.)
 - **Cross-device session status** (fable5 design): the hub broadcasts per-session runtime
   (running/idle/error · turn · current tool · a ≤120-char live progress preview · queued prompts ·
-  attached-client count, seq-stamped) as tiny `{type:"runtime"}` frames on /ws/sync + embedded in
-  `/api/sessions`. Other devices: `▶ N` header badge, running sessions pinned in the list with a live
-  preview line, and a "Resume" banner after reopening the app. No polling, no event deltas to
-  detached devices, runtime is memory-only (restart ⇒ all idle).
+  attached-client count) as tiny `{type:"runtime"}` frames on /ws/sync + embedded in `/api/sessions`.
+  EVERY emission advances the shared hub seq (2026-10-21 commit review P2 — runtime-only deltas
+  previously reused the last agent-event seq and were dropped by the client's stale-frame guard),
+  and attach/detach deltas go through `agentHub.emitRuntime` for the same reason. Devices: the
+  header **activity button** (heartbeat icon, count badge of alive sessions excluding the current
+  one, red when any error) opens the **AliveSessionsDialog** — live rows (status dot, title fallback
+  metadata → lastText → `Session <id8>`, turn/tool/queued/devices/elapsed), click-to-navigate (the
+  current session just closes), and a two-stage **Kill** button (Kill → "Confirm?" 3s →
+  `POST /api/agent/abort` → "stopping…" until the runtime flips; silent no-op aborts; error rows
+  have no kill; rows that finish while open linger 2s as "✓ done"; footer shows live/paused sync
+  state via `sessionSync.syncHealthy()`). Running sessions also pin in the full session list with a
+  live preview line, and a "Resume" banner appears after reopening the app. No polling, no event
+  deltas to detached devices, runtime is memory-only (restart ⇒ all idle).
 - **Server-side agents** (`src/proxy-agent.ts`, `/ws/agent`): now the **DEFAULT chat path** — tools
   (read/write/edit/bash + pi extensions) run in-process, keys stay in `.pi/auth.json`, every event is
   broadcast to all attached devices, and runs survive browser closes. `?local=1` restores the old
