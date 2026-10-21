@@ -10,7 +10,7 @@
  *   4. replay: a SECOND socket with the same id receives the history
  *   5. reset: kill + respawn → new prompt output arrives
  *
- * Usage: node term-smoke.mjs   (spawns + kills its own server on :8789)
+ * Usage: node tests/term-smoke.mjs   (spawns + kills its own server on a random :87xx port)
  */
 import { spawn, spawnSync } from "node:child_process";
 import path from "node:path";
@@ -109,7 +109,7 @@ function openTerminal({ id = GOOD_ID, origin = ORIGIN, timeoutMs = 20000 } = {})
 
 async function main() {
 	console.log(`[smoke] booting server on :${PORT} …`);
-	const server = spawn(process.execPath, [path.join(HERE, "server.mjs")], {
+	const server = spawn(process.execPath, [path.join(HERE, "..", "server.mjs")], {
 		env: { ...process.env, PORT: String(PORT), PI_WEB_PORT: String(PORT), PI_WEB_DEBUG: "1" },
 		stdio: ["ignore", "pipe", "pipe"],
 	});

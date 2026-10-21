@@ -7,6 +7,9 @@ import path from "node:path";
 
 const SESSIONS_DIR = workerData.sessionsDir;
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+// boot hygiene: stale .tmp leftovers from crashed writes must never be read as
+// sessions (loadFromDisk filters by extension, but they'd still accumulate)
+try { for (const f of fs.readdirSync(SESSIONS_DIR)) if (f.endsWith(".tmp")) fs.unlinkSync(path.join(SESSIONS_DIR, f)); } catch { /* ignore */ }
 
 import { SESSION_ID_RE } from "./session-id.mjs";
 const sessionFile = (id) => path.join(SESSIONS_DIR, `${id}.jsonl`);
@@ -39,18 +42,37 @@ function listSessions() {
 	return out;
 }
 
+// per-id put chains: the parentPort handler is ASYNC — with the server-side
+// agent persisting every turn AND browsers pushing /ws/sync puts, two puts for
+// the SAME session interleaved on the SHARED .jsonl.tmp path (one rename moved
+// it away, the other's rename → ENOENT, observed 2026-10-21) and concurrent
+// writes could corrupt each other. Serialize per id + unique tmp names.
+const putChains = new Map();
 async function putOne(id, jsonl) {
+	const prev = putChains.get(id) || Promise.resolve();
+	const run = prev.then(() => _putOne(id, jsonl));
+	putChains.set(id, run.then(() => undefined, () => undefined));
+	return run;
+}
+
+async function _putOne(id, jsonl) {
 	const lines = jsonl.split("\n").filter(Boolean);
 	const metadata = JSON.parse(lines[0]);
 	const messages = lines.slice(1).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
 	cache.set(id, { metadata, messages });
-	const tmp = sessionFile(id) + ".tmp";
-	await fsp.writeFile(tmp, jsonl, "utf8");
-	await fsp.rename(tmp, sessionFile(id));
+	const tmp = `${sessionFile(id)}.${Date.now()}-${Math.random().toString(36).slice(2, 8)}.tmp`;
+	try {
+		await fsp.writeFile(tmp, jsonl, "utf8");
+		await fsp.rename(tmp, sessionFile(id));
+	} catch (err) {
+		try { await fsp.unlink(tmp); } catch { /* already gone */ }
+		throw err;
+	}
 }
 
 async function delOne(id) {
 	cache.delete(id);
+	putChains.delete(id);
 	try { await fsp.unlink(sessionFile(id)); } catch { /* gone */ }
 }
 

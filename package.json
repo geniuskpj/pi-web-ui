@@ -11,7 +11,12 @@
     "dev": "node build.mjs && node server.mjs",
     "typecheck": "tsc --noEmit",
     "build:debug": "node build.mjs --debug",
-    "start:debug": "node build.mjs --debug && node server.mjs"
+    "start:debug": "node build.mjs --debug && node server.mjs",
+    "test": "node tests/term-smoke.mjs",
+    "test:agent": "node tests/server-agent.e2e.mjs",
+    "test:edit": "node tests/edit-tool.test.mjs",
+    "test:security": "node tests/security-gates.test.mjs",
+    "test:store": "node tests/session-store.test.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.75.3",

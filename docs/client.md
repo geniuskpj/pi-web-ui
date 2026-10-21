@@ -89,6 +89,15 @@ Covers `src/main.tsx`, `src/ui/chat.tsx`, `src/storage.ts`, `src/local-storage-b
 - `SessionsStore`: bodies in `sessions`, metadata in `sessions-metadata`; save/delete via the tx shim;
   `updateTitle` bumps `lastModified` in BOTH stores (re-sort + server sync).
 
+## Session runtime status (fable5, 2026-10-21)
+
+`session-sync` keeps a VOLATILE `runtimeMap` (id → {status, startedAt, turn, currentTool, lastText,
+pendingPrompts, clients, seq}) fed by `{type:"runtime"}` delta frames (applied immediately, bypassing
+the 5s metadata throttle; seq-guard: stale frames dropped, idle deletes) and FULL-REPLACED from the
+embedded runtimes inside every "sessions" frame (restart/reconnect hygiene). `onRuntime(cb)` fires
+immediately; `seedRuntime()` ingests a REST /api/sessions boot snapshot. Consumers: session-list
+(live rows pinned top, badge, preview), main.tsx header `▶ N` badge + resume banner + document.title.
+
 ## Session sync (`session-sync.ts`)
 
 - Push coalescing: one in-flight put per id; new pushes during flight mark `pushDirty` → re-push after.
@@ -149,12 +158,17 @@ attach. `initialFile` opens at a file: load its parent dir, then `select(entry, 
 FRESH dir (the closure `path` is stale until the next render — the first-click bug). Last dir
 persisted (`pi.filePickerDir`) with root fallback if it vanished.
 
-## Server-side agent adapter (`proxy-agent.ts`, non-default)
+## Server-side agent adapter (`proxy-agent.ts`, DEFAULT chat path since 2026-10-21)
 
 State mirror of pi-agent-core's event application (message_start/update → streamingMessage, message_end
-→ push, tool_execution_start/end → pendingToolCalls set copies, agent_start/end → isStreaming). One WS
-with generation-guarded reconnect (exponential + jitter), subscribe-first attach semantics
-server-side, `whenReady` polling, `waitForIdle` with a 5min cap, follow-ups via `prompt()` → WS.
+→ push, tool_execution_start/end → pendingToolCalls set copies, agent_start/end → isStreaming; partials
+(`tool_execution_update`) flow to chat.tsx's UI-only map via the event subscription). One WS with
+generation-guarded reconnect (exponential + jitter), subscribe-first attach semantics server-side,
+`whenReady` polling, `waitForIdle` with a 5min cap, follow-ups via `prompt()` → WS (`prompt` now also
+accepts `images`). `serverSide = true` flag drives the client behavior differences (no browser key
+prompt, no key-replacement 401 flow — keys live in `.pi/auth.json` on the server). The browser ALSO
+saves the mirrored transcript locally (session list stays instant offline) while the hub persists the
+authoritative JSONL copy server-side after every turn.
 
 ## Diagnostics (`diag.ts`, `diag-panel.tsx`)
 

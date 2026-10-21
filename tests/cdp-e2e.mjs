@@ -50,7 +50,7 @@ const expr = `(async () => {
 	const idA = "e2ea" + Date.now();
 	const wA = await dial(), wB = await dial();
 	const bFrames = framesOf(wB, 1500); // B listens from before the put
-	wA.send(JSON.stringify({ type: "put", id: idA, data: mkData(idA, { id: "glm-5.3-flash", provider: "nvidia" }), metadata: mkMeta(mkData(idA)) }));
+	wA.send(JSON.stringify({ type: "put", id: idA, data: mkData(idA, { id: "z-ai/glm-5.3-flash", provider: "nvidia" }), metadata: mkMeta(mkData(idA)) }));
 	const bf = await bFrames;
 	out.fanout = {
 		bGotSessions: bf.some(f => f.type === "sessions" && (f.sessions || []).some(s => s.id === idA)),
@@ -61,7 +61,7 @@ const expr = `(async () => {
 	// --- B) model-as-string branch + REST load path
 	const idS = "e2es" + Date.now();
 	const wS = await dial();
-	wS.send(JSON.stringify({ type: "put", id: idS, data: mkData(idS, "deepseek-v4.1-flash"), metadata: mkMeta(mkData(idS, "deepseek-v4.1-flash")) }));
+	wS.send(JSON.stringify({ type: "put", id: idS, data: mkData(idS, "z-ai/glm-5.3-flash"), metadata: mkMeta(mkData(idS, "z-ai/glm-5.3-flash")) }));
 	await framesOf(wS, 800);
 	wS.close();
 	try {

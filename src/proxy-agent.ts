@@ -9,6 +9,9 @@ type AnyRecord = Record<string, any>;
 import { makeId } from "./id.js";
 
 export class ProxyAgent {
+	/** true = the loop runs server-side (agent-hub.mjs): runs survive browser
+	 *  closes; the browser stores no API keys (getApiKey is absent by design). */
+	readonly serverSide = true;
 	state: AnyRecord = {
 		messages: [] as any[],
 		isStreaming: false,
@@ -65,7 +68,9 @@ export class ProxyAgent {
 			// small delay: WS handshake timing on Windows
 			setTimeout(() => {
 				if (gen !== this.generation || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-				this.sendMsg({ type: "attach", sessionId: this.sessionId });
+				// attach carries the client's chosen model/effort so a FRESH server
+				// session runs what the UI shows (grok r3: model desync)
+				this.sendMsg({ type: "attach", sessionId: this.sessionId, modelId: this.state.model?.id, thinkingLevel: this.state.thinkingLevel });
 				const cbs = this.readyCallbacks.splice(0);
 				cbs.forEach((cb) => cb(this.attached));
 			}, 50);
@@ -102,6 +107,9 @@ export class ProxyAgent {
 			this.state.model = msg.model;
 			this.state.thinkingLevel = msg.thinkingLevel || "high";
 			this.state.isStreaming = !!msg.isStreaming;
+			// mid-run attach: the hub includes the in-flight partial + pending tools
+			this.state.streamingMessage = msg.streamingMessage || undefined;
+			this.state.pendingToolCalls = new Set(msg.pendingToolCalls || []);
 			if (!msg.isStreaming) this.state.streamingMessage = undefined;
 			this.notifyListeners({ type: "state-snapshot" });
 			const cbs = this.readyCallbacks.splice(0);
@@ -160,11 +168,11 @@ export class ProxyAgent {
 		});
 	}
 
-	async prompt(input: any): Promise<void> {
+	async prompt(input: any, images?: any[]): Promise<void> {
 		const ready = await this.whenReady(8000);
 		if (!ready) throw new Error("Agent WS not connected");
 		const content = typeof input === "string" ? input : String(input?.content || "");
-		this.sendMsg({ type: "prompt", content });
+		this.sendMsg({ type: "prompt", content, images: images?.length ? images : undefined });
 	}
 
 	abort(): void {

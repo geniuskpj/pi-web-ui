@@ -19,11 +19,28 @@ const TOMBSTONE_KEY = "sync-tombstones";
 const TOMBSTONE_TTL = 30 * 24 * 3600 * 1000;
 const META_MERGE_MIN_INTERVAL = 5000;
 
+/** Runtime status of one session (hub-owned; idle = ABSENCE from the map). */
+export interface RuntimeRecord {
+	sessionId: string;
+	status: "running" | "error";
+	startedAt?: number;
+	turn?: number;
+	currentTool?: string | null;
+	lastText?: string | null;
+	pendingPrompts?: number;
+	clients?: number;
+	seq?: number;
+}
+
 type AnyRecord = Record<string, any>;
 
 class SessionSync {
 	private ws: WebSocket | null = null;
 	private enabled = false;
+	// runtime status map — VOLATILE by design (never persisted, never merged via
+	// lastModified): applied OUTSIDE the 5s metadata throttle so status feels live
+	private runtimeMap = new Map<string, RuntimeRecord>();
+	private runtimeListeners = new Set<() => void>();
 	private retry = 0;
 	private retryTimer: any;
 	private generation = 0; // invalidates callbacks from superseded sockets
@@ -38,6 +55,35 @@ class SessionSync {
 	connect() {
 		this.enabled = true;
 		this.dial();
+	}
+
+	/** Runtime snapshot for UI badges (session list, header, resume banner). */
+	runtimeSnapshot(): ReadonlyMap<string, RuntimeRecord> {
+		return this.runtimeMap;
+	}
+	/** Subscribe to runtime changes — fired immediately on every runtime frame
+	 *  and on the full-replace inside "sessions" frames (bypasses the 5s throttle). */
+	onRuntime(cb: () => void): () => void {
+		this.runtimeListeners.add(cb);
+		return () => this.runtimeListeners.delete(cb);
+	}
+	/** Seed from a REST /api/sessions snapshot (boot) — same seq guard as frames. */
+	seedRuntime(sessions: AnyRecord[]) {
+		for (const s of sessions || []) {
+			if (s?.id && s.runtime) this.applyRuntime({ ...s.runtime, sessionId: s.id });
+		}
+	}
+	private applyRuntime(rt: AnyRecord) {
+		if (!rt?.sessionId) return;
+		const cur = this.runtimeMap.get(rt.sessionId);
+		// stale-frame guard: seq must MOVE FORWARD (covers REST-vs-WS boot interleave
+		// and reconnect reordering)
+		if (cur && typeof rt.seq === "number" && typeof cur.seq === "number" && rt.seq <= cur.seq) return;
+		if (!rt.status || rt.status === "idle") this.runtimeMap.delete(rt.sessionId);
+		else this.runtimeMap.set(rt.sessionId, rt as RuntimeRecord);
+		for (const cb of [...this.runtimeListeners]) {
+			try { cb(); } catch { /* listener error */ }
+		}
 	}
 
 	private dial() {
@@ -174,6 +220,11 @@ class SessionSync {
 	}
 
 	private async handle(msg: AnyRecord) {
+		if (msg.type === "runtime") {
+			// runtime delta frame — applied IMMEDIATELY, bypassing the metadata throttle
+			this.applyRuntime(msg.runtime);
+			return;
+		}
 		if (msg.type === "session") {
 			// only fulfill explicit getSession() requests — never auto-write
 			const w = this.waiters.get(msg.id);
@@ -184,6 +235,20 @@ class SessionSync {
 			return;
 		}
 		if (msg.type !== "sessions") return;
+
+		// runtime FULL-REPLACE from the embedded non-idle runtimes — before/independent
+		// of the 5s metadata merge; clears stale state after reconnect/server restart
+		if (Array.isArray(msg.sessions)) {
+			const next = new Map<string, RuntimeRecord>();
+			for (const m of msg.sessions) {
+				if (!m?.id || !m.runtime || m.runtime.status === "idle") continue;
+				next.set(m.id, { ...m.runtime, sessionId: m.id });
+			}
+			this.runtimeMap = next;
+			for (const cb of [...this.runtimeListeners]) {
+				try { cb(); } catch { /* listener error */ }
+			}
+		}
 
 		// throttle AND coalesce (no overlapping merge passes)
 		const now = Date.now();

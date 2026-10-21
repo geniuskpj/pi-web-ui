@@ -359,6 +359,7 @@ function EffortPill({ agent }: { agent: Agent }) {
 	const level = String(agent.state.thinkingLevel || "high");
 	const setLevel = (v: string) => {
 		agent.state.thinkingLevel = v as any;
+		(agent as any).setThinkingLevel?.(v as any); // server-side agent: propagate to the hub
 		try {
 			localStorage.setItem("pi.lastThinkingLevel", v);
 		} catch {
@@ -562,6 +563,7 @@ export function ChatView({ agent }: { agent: Agent }) {
 	useEffect(() => {
 		return agent.subscribe((ev: any) => {
 			if (ev.type !== "agent_end") return;
+			if ((agent as any).serverSide) return; // server path: keys live in .pi/auth.json — the error chrome already shows the failure
 			// isStreaming is still true DURING agent_end listeners (finishRun flips it
 			// after they settle) — inspect state only after idle
 			agent.waitForIdle().then(async () => {
@@ -834,12 +836,20 @@ export function Editor({
 		const text = value.trim();
 		const hasAttachments = textFiles.length > 0 || images.length > 0;
 		if ((!text && !hasAttachments) || agent.state.isStreaming || sending.current) return;
+		// WS payload cap: /ws/agent frames over 25MB kill the socket — cap total
+		// image bytes (raw ≈ base64×0.75) at 12MB (grok r3: 4×8MB ≈ 42MB base64)
+		const imageBytes = images.reduce((n, im) => n + Math.floor((im.data?.length || 0) * 0.75), 0);
+		if (imageBytes > 12 * 1024 * 1024) {
+			onNote("attachments too large (>12MB total) — remove an image");
+			return;
+		}
 		sending.current = true;
 		try {
 			// pre-send key check (parity with the patched old UI: full resolver incl.
-			// server race, not just the fast tier)
+			// server race, not just the fast tier). Server-side agent: keys live in
+			// .pi/auth.json on the server — skip (no browser key prompt).
 			const provider = agent.state.model?.provider;
-			if (provider) {
+			if (provider && !(agent as any).serverSide) {
 				const key = await getResolver()(provider);
 				if (!key) {
 					const entered = window.prompt(`No API key for "${provider}".\nEnter it (stored locally in your browser):`);

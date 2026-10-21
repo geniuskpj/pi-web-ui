@@ -17,14 +17,17 @@ npm run dev          # build + start
 Browser (any device)              Node Server
 ┌──────────────────┐             ┌────────────────────────────────────┐
 │ Preact UI        │◄──HTTP─────►│ Hono (static + REST + CORS proxy) │
-│ in-browser Agent │◄──SSE/WS───►│ worker store (JSONL sessions)      │
-│ (pi-agent-core)  │             │ agent-hub (server-side agents)     │
+│ Chat UI + dock   │◄──SSE/WS───►│ agent-hub (DEFAULT chat loop+tools)│
+│ (sessions local) │             │ worker store (JSONL sessions)      │
 │ LocalStorage     │             │ keys in .pi/auth.json              │
 └──────────────────┘             └────────────────────────────────────┘
 ```
 
-- The **agent loop runs in-browser** (pi-agent-core) — LLM calls go through `/api/proxy` on the
-  server (undici-hardened, abort-propagating, stall-watchdog) or direct when proxy is off.
+- The **agent loop runs SERVER-SIDE by default** (`agent-hub.mjs`, `/ws/agent`): a run SURVIVES closing
+  the browser/phone, and every attached device (PC/phone) sees the same live streaming events — send
+  from one device, watch or continue from another. Tools execute in-process on the server; LLM keys
+  come from `.pi/auth.json`. `?local=1` → legacy in-browser loop (LLM calls through `/api/proxy`,
+  undici-hardened, abort-propagating, stall-watchdog).
 - **Sessions** persist to localStorage (LocalStorageBackend) + mirror to the server worker store
   (`data/sessions/*.jsonl`) after each turn.
 - **Provider/model config** lives on the server (`/api/pi/config` from pi's `models-store.json`)
@@ -245,5 +248,13 @@ Requirements & limits:
 - **`?reset-storage`**: wipes localStorage + IDB for a clean slate. (The previously listed
   `?nosync=1` / `?noproxy=1` were never implemented in the client — removed 2026-10-21; see
   `docs/client.md`.)
-- **Server-side agents** (`src/proxy-agent.ts`, `/ws/agent`): implemented, not the default chat
-  path. Ready for future use when jobs need to survive window closes.
+- **Cross-device session status** (fable5 design): the hub broadcasts per-session runtime
+  (running/idle/error · turn · current tool · a ≤120-char live progress preview · queued prompts ·
+  attached-client count, seq-stamped) as tiny `{type:"runtime"}` frames on /ws/sync + embedded in
+  `/api/sessions`. Other devices: `▶ N` header badge, running sessions pinned in the list with a live
+  preview line, and a "Resume" banner after reopening the app. No polling, no event deltas to
+  detached devices, runtime is memory-only (restart ⇒ all idle).
+- **Server-side agents** (`src/proxy-agent.ts`, `/ws/agent`): now the **DEFAULT chat path** — tools
+  (read/write/edit/bash + pi extensions) run in-process, keys stay in `.pi/auth.json`, every event is
+  broadcast to all attached devices, and runs survive browser closes. `?local=1` restores the old
+  in-browser loop.

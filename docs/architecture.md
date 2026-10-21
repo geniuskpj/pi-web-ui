@@ -8,8 +8,9 @@ Docs index: **architecture.md** (this file) · [server.md](server.md) · [termin
 
 A browser UI for LLM chat on `@earendil-works/pi-agent-core` + `@earendil-works/pi-ai`, served by a
 **Hono** server (`server.mjs`) with **esbuild** bundling (no Vite). The **default chat path runs the
-agent loop in the browser**; a server-side agent path (`agent-hub.mjs`, `/ws/agent`, `src/proxy-agent.ts`)
-exists but is not the default. Runs on Windows (msys Git Bash); designed to also be used from
+agent loop SERVER-SIDE** (`agent-hub.mjs`, `/ws/agent`) — a run survives closing the browser/phone,
+and every attached device (PC/phone) sees the same live streaming events; the legacy in-browser loop
+remains behind `?local=1`. Runs on Windows (msys Git Bash); designed to also be used from
 phones over plain-http LAN (hence the secure-context fallbacks in `src/id.ts`).
 
 ```
@@ -31,7 +32,7 @@ Browser (any device)                 Node server (:8787)
 |---|---|
 | `server.mjs` (1570 L) | Hono app: auth gate, REST, exec bridge, fs endpoints, LLM proxy, static serving, WS routing/upgrade, builtin tools (read/write/edit/bash), pi extension loader |
 | `terminal-hub.mjs` (998 L) | Pseudo-terminal hub: pty tier (msys2 `script.exe`) / pipes tier (`bash -i`), JSON-frame WS protocol, replay ring, session lifecycle |
-| `agent-hub.mjs` (263 L) | Server-side agent sessions (non-default path): Agent per session, subscribe-first attach, debounced persist |
+| `agent-hub.mjs` (263 L) | **Server-side agent sessions — the DEFAULT chat path**: Agent per session with in-process tools (builtin+pi extensions), effective system prompt, settings.json default model; subscribe-first attach, debounced persist, per-session SSE subscriber sets |
 | `session-worker.mjs` (89 L) | Worker-thread JSONL session store (atomic tmp+rename writes) |
 | `session-id.mjs` (5 L) | Shared `SESSION_ID_RE` (`^[A-Za-z0-9_-]{1,80}$`) used on both sides of the worker seam |
 | `build.mjs` (138 L) | esbuild bundle (`app-[hash].js`), hljs→lib/common alias, manifest.json, .br/.gz precompression, stale-bundle pruning |
@@ -43,7 +44,7 @@ Browser (any device)                 Node server (:8787)
 | `src/storage.ts` (248 L) | Store classes over LocalStorageBackend; `ProviderKeysStore` mirrors `pi.key.<provider>` to localStorage (fast tier) |
 | `src/local-storage-backend.js` (189 L) | Synchronous localStorage-backed IDB replacement (memory map + per-store key index) |
 | `src/session-sync.ts` (214 L) | `/ws/sync` client: metadata merge, push coalescing, pending-push queue, tombstones |
-| `src/proxy-agent.ts` (188 L) | Client adapter for server-side agents (event replay → local Agent-like state) |
+| `src/proxy-agent.ts` (188 L) | Client adapter for the SERVER-side agent loop (default chat path): WS event replay → local Agent-like state, survives reconnects |
 | `src/ui/proxy-stream.ts` (135 L) | streamFn with CORS-proxy rewrite (clone-before-proxy) + getApiKey resolver races |
 | `src/pi-tools.ts` (79 L) | Declares server tools to the browser agent; execute() → `/api/exec/tool` (NDJSON streaming for bash) |
 | `src/pi-import.ts` (118 L) | pi config cache (`pi.modelsCache`, `window.__PI_PROVIDERS`), default-model pick |
@@ -71,22 +72,35 @@ refresh, `?session=` restore.
 
 ## Core data flows
 
-1. **Chat turn (default, browser loop)**: Editor send → pre-send key check (resolver) → `agent.prompt()`
-   → pi-agent-core loop → `streamFn` (proxy-stream.ts rewrites baseUrl through `/api/proxy/?url=` when
-   the provider lacks CORS) → events (`message_update/end`, `tool_execution_*`) → ChatView renders from
-   `agent.state` (never appends deltas). Tools declared to the LLM = server tools from `pi-tools.ts`
-   (read/write/edit/bash + extension tools); execution POSTs `/api/exec/tool` with the token.
-2. **Persistence**: `message_end`/`agent_end` → debounced (1200 ms) `saveSession()` →
-   SessionsStore (localStorage) + `sessionSync.push(id)` → `/ws/sync put` → server converts to JSONL →
-   worker writes `data/sessions/<id>.jsonl` (tmp+rename) → `broadcastSessions()` fans metadata to other
-   devices. `agent_end` also does a `flushSession()`; `pagehide`/`visibilitychange` flush too.
+1. **Chat turn (default, SERVER-side loop, 2026-10-21)**: Editor send → `ProxyAgent.prompt()` → WS
+   `/ws/agent` `{prompt, content, images}` → `agent-hub.mjs` runs the Agent **in Node**: tools
+   (read/write/edit/bash + pi extensions) execute IN-PROCESS (same objects as the exec bridge), API
+   keys come from `.pi/auth.json`, system prompt = `WEB_SYSTEM.md`/`SYSTEM.md` precedence. EVERY event
+   (message_update, tool_execution_update partials, agent_end) is broadcast to ALL attached devices —
+   send from the PC, watch live from the phone, close the phone and the run keeps going.
+   `?local=1` → legacy browser loop (`streamFn` via `/api/proxy` when the provider lacks CORS).
+2. **Persistence (dual, 2026-10-21)**: the server-side hub persists the AUTHORITATIVE JSONL after every
+   turn (independent of any browser); the client additionally mirrors via debounced (1200 ms)
+   `saveSession()` → SessionsStore (localStorage) + `sessionSync.push(id)` → `/ws/sync put` →
+   `broadcastSessions()` fans metadata to other devices. `agent_end` also does a `flushSession()`;
+   `pagehide`/`visibilitychange` flush too.
 3. **Session restore**: `?session=` or list click → `loadSession()` pulls BOTH local store and
    `/api/agent/session/:id`, picks the copy with more messages, self-heals the server mirror, creates a
    new Agent WITH the loaded messages.
 4. **Tool exec (bash)**: chat → NDJSON stream frames (`partial` → UI-only partials map, throttled
    250 ms server-side; final `result`). Stop/abort → client aborts fetch → server sees `close` →
    AbortController → taskkill /F /T the process tree.
-5. **Terminal**: dock open → lazy `loadWterm()` (vendored bundle, CDN fallbacks) → WS
+5. **Session status discovery (fable5 design, 2026-10-21)**: the hub keeps an in-memory runtime per
+   session `{status: running|idle|error, startedAt, turn, currentTool, lastText (≤120-char preview),
+   pendingPrompts}`. BOUNDARY events (agent_start/end, tool start/end) and assistant message_end emit a
+   tiny `{type:"runtime", runtime:{…, clients, seq}}` frame on **/ws/sync** — IMMEDIATE (bypasses the
+   300ms coalesce + 1s list cache + the client 5s metadata merge); `message_update` refreshes lastText
+   in memory only (broadcast ≤1/2s per running session); `/api/sessions` and full `sessions` frames
+   embed NON-IDLE runtime. Client: seq-guarded runtimeMap (volatile — never persisted, never
+   lastModified-merged) → session list pins running/error on top with badges + preview, header `▶ N`
+   badge, resume banner on bare boots, `document.title` prefix. Detached devices never get event
+   deltas — the attached view already has subscribe-first snapshot+live.
+6. **Terminal**: dock open → lazy `loadWterm()` (vendored bundle, CDN fallbacks) → WS
    `/ws/terminal?session=&cols=&rows=` → replay ring → live `{t:"d"}` frames → wterm.write; stdin via
    `{t:"i"}` frames (entry bar diffs value, key strip sends raw bytes).
 

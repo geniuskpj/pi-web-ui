@@ -209,7 +209,7 @@ app.use("*", async (c, next) => {
 
 app.get("/api/health", (c) => c.json({ ok: true, bootId: BOOT_ID, buildId: BUILD_ID, piDir: PI_DIR }));
 app.get("/api/version", (c) => c.json({ buildId: BUILD_ID, bootId: BOOT_ID }));
-app.get("/api/pi/config", (c) => { refreshModelsStore(); return c.json(piConfig()); });
+app.get("/api/pi/config", (c) => { refreshModelsStore(); agentHub.defaultModelId = piDefaultModelId(); return c.json(piConfig()); });
 // pi system-prompt files — mirror pi-coding-agent resource-loader resolution exactly:
 // trusted-project .pi/SYSTEM.md wins over agentDir SYSTEM.md (per-name, NOT combined);
 // SYSTEM.md REPLACES pi's default prompt, APPEND_SYSTEM.md appends to it.
@@ -237,6 +237,22 @@ function isProjectTrusted(projectDir, agentDir) {
 			dir = parent;
 		}
 	} catch { return false; } // unreadable trust.json → fail-closed, like pi-web
+}
+// Effective system prompt for the SERVER-SIDE agent (same precedence the client
+// sees from /api/pi/system): WEB_SYSTEM.md > trusted project SYSTEM.md > global
+// SYSTEM.md; APPEND_SYSTEM.md appends. undefined → pi's built-in chat default.
+// Runtime-safe: AGENT_DIR/WORKSPACE_DIR are initialized before any call.
+function effectiveSystemPrompt() {
+	const needsTrust = projectNeedsTrust(WORKSPACE_DIR);
+	const trusted = !needsTrust || isProjectTrusted(WORKSPACE_DIR, AGENT_DIR);
+	const read = (p) => { try { const st = fs.statSync(p); return st.isFile() && st.size <= 1024 * 1024 ? fs.readFileSync(p, "utf8") : undefined; } catch { return undefined; } };
+	const base = read(path.join(AGENT_DIR, "WEB_SYSTEM.md"))
+		|| (trusted ? read(path.join(WORKSPACE_DIR, ".pi", "SYSTEM.md")) : undefined)
+		|| read(path.join(AGENT_DIR, "SYSTEM.md"));
+	const append = (trusted ? read(path.join(WORKSPACE_DIR, ".pi", "APPEND_SYSTEM.md")) : undefined)
+		|| read(path.join(AGENT_DIR, "APPEND_SYSTEM.md"));
+	if (!base && !append) return undefined;
+	return [base, append].filter(Boolean).join("\n\n");
 }
 function systemFileMeta(p, scope, name) {
 	try {
@@ -639,21 +655,50 @@ const builtinTools = [
 		description: "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. Copy oldText VERBATIM from read_file output (never include line-number prefixes); include 3+ unique surrounding lines; keep the file's indentation. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
 		parameters: { type: "object", properties: { path: { type: "string", description: "Path to the file to edit (relative or absolute)" }, edits: { type: "array", description: "One or more targeted replacements. Each edit is matched against the original file, not incrementally.", items: { type: "object", properties: { oldText: { type: "string", description: "Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call." }, newText: { type: "string", description: "Replacement text for this targeted edit." } }, required: ["oldText", "newText"] } } }, required: ["path", "edits"] },
 		async execute(_id, params, signal) {
-			// prepareEditArguments: models send edits as a JSON string, a single object,
-			// or the legacy flat {oldText,newText} — normalize all (pi verbatim)
+			// prepareEditArguments — hardened 2026-10-21 (the maintainer's own live
+			// failures while using this very tool): recover the malformed shapes
+			// models/agents actually send. Every recovery is reported in the result.
+			const repairNotes = [];
 			const args = { path: params.path, edits: params.edits };
-			if (typeof args.edits === "string") {
-				try {
-					const parsed = JSON.parse(args.edits);
-					args.edits = Array.isArray(parsed) ? parsed : (parsed && typeof parsed.oldText === "string" ? [parsed] : args.edits);
-				} catch { /* leave as-is → validation error below */ }
-			} else if (args.edits && typeof args.edits === "object" && !Array.isArray(args.edits) && typeof args.edits.oldText === "string") {
+			// path aliases at the TOP level ("path: must have required properties path")
+			if (args.path === undefined || args.path === null || String(args.path).trim() === "") {
+				for (const k of ["file", "file_path", "filePath"]) {
+					if (typeof params[k] === "string" && params[k].trim()) { args.path = params[k]; repairNotes.push(`path was missing — recovered from params.${k}`); break; }
+				}
+			}
+			// path sent as an object {path: "..."} — unwrap
+			if (args.path && typeof args.path === "object" && typeof args.path.path === "string") {
+				args.path = args.path.path;
+				repairNotes.push("path was an object — unwrapped .path");
+			}
+			// edits: unwrap JSON strings repeatedly (single- AND double-encoded)
+			let unwrapGuard = 0;
+			while (typeof args.edits === "string" && unwrapGuard++ < 4) {
+				let parsed;
+				try { parsed = JSON.parse(args.edits); } catch { break; }
+				if (typeof parsed === "string") { args.edits = parsed; continue; } // deeper encoding — unwrap again
+				if (Array.isArray(parsed)) { args.edits = parsed; repairNotes.push("edits was a JSON string — parsed"); continue; }
+				if (parsed && typeof parsed === "object") {
+					if (Array.isArray(parsed.edits)) {
+						if ((args.path === undefined || args.path === null || String(args.path).trim() === "") && typeof parsed.path === "string") { args.path = parsed.path; repairNotes.push("path was missing — recovered from the edits-string wrapper"); }
+						args.edits = parsed.edits;
+						repairNotes.push("edits was a double-encoded JSON string — unwrapped {edits}");
+						continue;
+					}
+					if (parsed.oldText !== undefined || parsed.old_string !== undefined) { args.edits = [parsed]; repairNotes.push("edits was a JSON string — parsed to a single object"); continue; }
+				}
+				break; // parsed to a scalar — handled by the entries step below
+			}
+			// edits: single object → one-element array
+			if (args.edits && typeof args.edits === "object" && !Array.isArray(args.edits) && (args.edits.oldText !== undefined || args.edits.old_string !== undefined)) {
 				args.edits = [args.edits];
 			}
 			if (params.oldText !== undefined && params.newText !== undefined) {
 				args.edits = [...(Array.isArray(args.edits) ? args.edits : []), { oldText: params.oldText, newText: params.newText }];
 			}
-			if (!Array.isArray(args.edits) || args.edits.length === 0) throw new Error("Edit tool input is invalid. edits must contain at least one replacement.");
+			if (!Array.isArray(args.edits) || args.edits.length === 0) {
+				throw new Error('Edit tool input is invalid. Call as {"path": "<file>", "edits": [{"oldText": "exact existing text", "newText": "replacement"}]}. Accepted shapes for `edits`: array, single object, JSON string, or the legacy flat {oldText, newText} directly on params.');
+			}
 			// robustness (user report: edit calls failing with missing path): models
 			// sometimes omit the top-level path and nest it inside edits[] — recover
 			// from edits[].path, then strip stray keys so entries carry ONLY
@@ -671,7 +716,26 @@ const builtinTools = [
 				if (recoveredPaths.size > 1) {
 					throw new Error(`Edit tool: edits[] entries carry ${recoveredPaths.size} DIFFERENT paths (${[...recoveredPaths].join(", ")}) — one edit call edits ONE file. Split into separate calls.`);
 				}
-				args.edits = args.edits.map((e) => {
+				args.edits = args.edits.map((e, i) => {
+					if (typeof e === "string") {
+						// edits[i] as a JSON string ("edits.0: must be object") or a bare old-text string
+						let handled = false;
+						try {
+							const parsed = JSON.parse(e);
+							if (parsed && typeof parsed === "object" && (parsed.oldText !== undefined || parsed.newText !== undefined || parsed.old_string !== undefined)) {
+								repairNotes.push(`edits[${i}] was a JSON string — parsed to an object`);
+								e = parsed;
+								handled = true;
+							}
+						} catch { /* not JSON */ }
+						if (!handled) {
+							if (e.length > 0) repairNotes.push(`edits[${i}] was a bare string — treated as oldText with an empty replacement (deletion)`);
+							e = { oldText: e, newText: "" };
+						}
+					} else if (typeof e === "number" || typeof e === "boolean") {
+						repairNotes.push(`edits[${i}] was a ${typeof e} — treated as oldText with an empty replacement (deletion)`);
+						e = { oldText: String(e), newText: "" };
+					}
 					if (!e || typeof e !== "object") return e;
 					// alias normalization (grok r1): other tools' schemas leak into calls
 					const oldText = e.oldText ?? e.old_string ?? e.oldtext;
@@ -680,6 +744,16 @@ const builtinTools = [
 					return { ...rest, oldText, newText };
 				});
 			}
+			// early actionable validation (before the file is even read): empty/missing
+			// oldText cannot be matched — say so with the fix instead of a bare length error
+			for (let i = 0; i < args.edits.length; i++) {
+				const e = args.edits[i];
+				if (!e || typeof e !== "object") throw new Error(`Edit tool: edits[${i}] must be an object {oldText, newText} (got ${e === null ? "null" : typeof e}).`);
+				if (typeof e.oldText !== "string" || e.oldText.length === 0) {
+					throw new Error(`Edit tool: edits[${i}].oldText must be a non-empty verbatim excerpt of the file (got ${e.oldText === undefined ? "undefined" : JSON.stringify(e.oldText)}). An empty oldText cannot be matched — to prepend, include the first existing line in oldText and repeat it in newText; to create a file, use write_file.`);
+				}
+			}
+			const repairPrefix = repairNotes.length ? "Repaired malformed call:\n" + repairNotes.map((n) => "- " + n).join("\n") + "\n\n" : "";
 			const p = assertInsideRoots(args.path, { mustExist: true });
 			const st = fs.statSync(p);
 			if (st.size > 10 * 1024 * 1024) throw new Error("file too large (>10MB): " + p);
@@ -779,13 +853,13 @@ const builtinTools = [
 						}
 					}
 					const viz = (baseEdits[0]?.oldText || "").split("\n")[0].replace(/ /g, "\u00b7").replace(/\t/g, "\u2192");
-					throw new Error("Could not apply edit to " + args.path + ". Attempts:\n" + attempts.map((a) => "- " + a).join("\n") + "\n\nFirst oldText line (whitespace visualized): " + viz + (excerpt ? "\n\nFile excerpt near a possible anchor:\n" + excerpt + "\n" : "") + "\nCopy oldText VERBATIM from read_file output (no line-number prefixes), keep the file's indentation, and include 3+ unique surrounding lines.");
+					throw new Error(repairPrefix + "Could not apply edit to " + args.path + ". Attempts:\n" + attempts.map((a) => "- " + a).join("\n") + "\n\nFirst oldText line (whitespace visualized): " + viz + (excerpt ? "\n\nFile excerpt near a possible anchor:\n" + excerpt + "\n" : "") + "\nCopy oldText VERBATIM from read_file output (no line-number prefixes), keep the file's indentation, and include 3+ unique surrounding lines.");
 				}
 				throwIfAborted();
 				fs.writeFileSync(p, bom + restoreLineEndings(applied.newContent, originalEnding), "utf8");
 				throwIfAborted();
 				const diffResult = generateDiffString(applied.baseContent, applied.newContent);
-				return { content: [{ type: "text", text: "Successfully replaced " + args.edits.length + " block(s) in " + args.path + " (match: " + applied.form + ").\n" + diffResult.diff }], details: { diff: diffResult.diff, patch: generateUnifiedPatch(args.path, applied.baseContent, applied.newContent), firstChangedLine: diffResult.firstChangedLine, matchForm: applied.form } };
+				return { content: [{ type: "text", text: repairPrefix + "Successfully replaced " + args.edits.length + " block(s) in " + args.path + " (match: " + applied.form + ").\n" + diffResult.diff }], details: { diff: diffResult.diff, patch: generateUnifiedPatch(args.path, applied.baseContent, applied.newContent), firstChangedLine: diffResult.firstChangedLine, matchForm: applied.form } };
 			});
 		},
 	},
@@ -1375,6 +1449,11 @@ function refreshModelsStore() {
 }
 refreshModelsStore();
 
+function piDefaultModelId() {
+	const s = readJsonSafe("settings.json") || {};
+	return String(s.default_model || s.defaultModel || "");
+}
+
 const agentHub = new AgentHub({
 	modelsStore: piModelsStore,
 	getAuth: () => readJsonSafe("auth.json") || {},
@@ -1383,6 +1462,13 @@ const agentHub = new AgentHub({
 		const payload = JSON.stringify({ type: "agent", sessionId, ...msg });
 		for (const c of agentClients.get(sessionId) || []) { if (c.readyState === 1) c.send(payload); }
 	},
+	// server-side agent loop (2026-10-21, now the DEFAULT chat path): the same
+	// tool objects the exec bridge exposes run IN-PROCESS; the system prompt and
+	// pi settings.json default model mirror what the browser path used
+	getTools: () => [...builtinTools, ...extensionTools],
+	getSystemPrompt: () => effectiveSystemPrompt(),
+	defaultModelId: piDefaultModelId(),
+	onRuntimeChange: (sessionId, rt) => sendRuntime(sessionId, rt), // runtime deltas → tiny frame to ALL devices, bypasses all caches/throttles (fable5)
 });
 
 const syncClients = new Set();
@@ -1421,12 +1507,31 @@ function safeSend(ws, obj) {
 	ws.send(JSON.stringify(obj));
 }
 
+// runtime delta frame: {type:"runtime", runtime:{sessionId,status,startedAt,turn,
+// currentTool,lastText,pendingPrompts,clients,seq}} — sent IMMEDIATELY on hub
+// boundary events and attach/detach (no 300ms coalesce, no 1s list cache — the
+// client applies runtime frames outside its 5s metadata merge throttle)
+function sendRuntime(sessionId, rt) {
+	if (!rt) return;
+	const frame = { type: "runtime", runtime: { ...rt, clients: agentClients.get(sessionId)?.size ?? 0 } };
+	for (const c of syncClients) safeSend(c.ws, frame);
+}
+
 let listCache = null;
 let listCacheAt = 0;
 async function listCached() {
 	const now = Date.now();
 	if (!listCache || now - listCacheAt > 1000) { listCache = await storeOp("list"); listCacheAt = now; }
 	return listCache;
+}
+// metadata + non-idle runtime per session (embedded "runtime" field — idle is
+// the ABSENCE of the field; a server restart clears every runtime for free)
+async function enrichedSessions() {
+	const sessions = await listCached();
+	return sessions.map((m) => {
+		const rt = agentHub.getRuntime(m.id);
+		return rt && rt.status !== "idle" ? { ...m, runtime: { ...rt, clients: agentClients.get(m.id)?.size ?? 0 } } : m;
+	});
 }
 
 let broadcastPending = false;
@@ -1437,7 +1542,7 @@ async function broadcastSessions() {
 		broadcastPending = false;
 		listCache = null;
 		try {
-			const sessions = await listCached();
+			const sessions = await enrichedSessions();
 			for (const c of syncClients) safeSend(c.ws, { type: "sessions", sessions });
 		} catch {}
 	}, 300);
@@ -1541,14 +1646,21 @@ function agentConn(ws) {
 					if (currentSession) detachAgentClient(currentSession, ws);
 					currentSession = String(m.sessionId || "").slice(0, 80) || crypto.randomUUID();
 					attachAgentClient(currentSession, ws);
+					sendRuntime(currentSession, agentHub.getRuntime(currentSession)); // clients count changed (fable5)
+					// ALWAYS ensure the hub session exists — fresh sessions have no store
+					// entry, and set-thinking/prompt assume a registered agent (2026-10-21)
 					try {
 						const prev = await storeOp("get", { id: currentSession });
 						if (prev?.messages && prev?.metadata) {
-							agentHub.getSession(currentSession, {
-								modelId: prev.metadata.modelId,
-								thinkingLevel: prev.metadata.thinkingLevel,
-								messages: prev.messages,
-							});
+						agentHub.getSession(currentSession, {
+							modelId: prev.metadata.modelId,
+							thinkingLevel: prev.metadata.thinkingLevel,
+							messages: prev.messages,
+						});
+						} else {
+						// fresh session: honor the client's chosen model/effort (grok r3:
+						// otherwise the UI shows model A while the first prompt runs model B)
+						agentHub.getSession(currentSession, { modelId: m.modelId, thinkingLevel: m.thinkingLevel });
 						}
 					} catch (err) { console.warn("[agent-ws] cold-load:", err.message); }
 					const state = agentHub.getState(currentSession);
@@ -1557,7 +1669,11 @@ function agentConn(ws) {
 				}
 				case "prompt": {
 					if (!currentSession) { safeSend(ws, { type: "error", error: "attach first" }); break; }
-					agentHub.prompt(currentSession, String(m.content || "")).then((r) => safeSend(ws, { type: "accepted", ...r })).catch((err) => safeSend(ws, { type: "error", error: err.message }));
+					// images: base64 ImageContent parts from the composer (validated + capped)
+					const images = Array.isArray(m.images)
+						? m.images.filter((im) => im && im.type === "image" && typeof im.data === "string" && typeof im.mimeType === "string").slice(0, 4)
+						: undefined;
+					agentHub.prompt(currentSession, String(m.content || ""), images?.length ? images : undefined).then((r) => safeSend(ws, { type: "accepted", ...r })).catch((err) => safeSend(ws, { type: "error", error: err.message }));
 					break;
 				}
 				case "abort":
@@ -1581,8 +1697,8 @@ function agentConn(ws) {
 			safeSend(ws, { type: "error", error: err.message });
 		}
 	});
-	ws.on("close", () => { if (currentSession) detachAgentClient(currentSession, ws); });
-	ws.on("error", () => { if (currentSession) detachAgentClient(currentSession, ws); });
+	ws.on("close", () => { if (currentSession) { detachAgentClient(currentSession, ws); sendRuntime(currentSession, agentHub.getRuntime(currentSession)); } });
+	ws.on("error", () => { if (currentSession) { detachAgentClient(currentSession, ws); sendRuntime(currentSession, agentHub.getRuntime(currentSession)); } });
 }
 
 function attachAgentClient(sessionId, ws) {
@@ -1640,8 +1756,19 @@ app.post("/api/agent/session", async (c) => {
 	try {
 		const body = await c.req.json();
 		const sessionId = String(body?.sessionId || crypto.randomUUID());
-		agentHub.getSession(sessionId, { modelId: body?.modelId, thinkingLevel: body?.thinkingLevel });
+		const messages = Array.isArray(body?.messages) ? body.messages : undefined;
+		agentHub.getSession(sessionId, { modelId: body?.modelId, thinkingLevel: body?.thinkingLevel, messages });
+		if (messages?.length) agentHub.persistSession(sessionId, true); // migrate a local-only copy (grok r3 Q2)
 		return c.json({ sessionId });
+	} catch (err) { return c.json({ error: err.message }, 500); }
+});
+// delete-side hook: a session deleted on any device must not resurrect via a
+// later hub persist — abort a live run, drop the in-memory entry, tombstone id
+app.post("/api/agent/discard", async (c) => {
+	try {
+		const body = await c.req.json();
+		agentHub.discard(String(body?.sessionId || ""));
+		return c.json({ ok: true });
 	} catch (err) { return c.json({ error: err.message }, 500); }
 });
 
@@ -1671,7 +1798,7 @@ app.get("/api/agent/events", async (c) => {
 
 // --- session list REST ----------------------------------------------------------
 app.get("/api/sessions", async (c) => {
-	try { return c.json({ sessions: await storeOp("list") }); }
+	try { return c.json({ sessions: await enrichedSessions() }); }
 	catch (err) { return c.json({ error: err.message }, 500); }
 });
 app.post("/api/sessions", async (c) => {

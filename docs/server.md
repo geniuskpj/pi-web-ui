@@ -97,9 +97,14 @@ Common helpers:
 inside the mutation queue.
 
 **edit** (port of pi's edit + hardening):
-1. Argument repair: accepts `edits` as JSON string / single object; legacy flat `{oldText,newText}`;
-   recovers a missing top-level `path` from `edits[].path|file|file_path|filePath` (rejects entries
+1. Argument repair (**hardened 2026-10-21 — recovers the maintainer's own live failures**): accepts
+   `edits` as a JSON string (single- AND double-encoded `{"edits":...}` wrappers), a single object, or
+   the legacy flat `{oldText,newText}` on params; `edits[i]` may be a JSON string (parsed) or a bare
+   old-text string (treated as a deletion); numeric/boolean entries coerced; `path` recovered from
+   top-level `file|file_path|filePath` aliases, an object `{path}`, or `edits[].path` (rejects entries
    carrying DIFFERENT paths); strips stray keys; alias normalization `old_string/new_string` etc.
+   Every recovery is reported as `Repaired malformed call:` notes in the result; empty/missing
+   `oldText` fails EARLY with actionable guidance (prepend pattern / use write_file).
 2. `assertInsideRoots(mustExist)` + 10MB cap; read → BOM strip → CRLF detect → normalize to LF.
 3. Candidate match FORMS (each must still be unique + non-overlapping): as-is → line-number-prefixes
    stripped (`N| ` / `N: `) → backslashes collapsed → both. Fuzzy match normalizes NFKC, trailing
@@ -192,9 +197,14 @@ value ignored, then identical logic repeated (double reads) — dead code.
 
 JSONL: line 1 = metadata, remaining lines = messages. Worker holds an in-memory `cache` (id →
 {metadata, messages}); first `list/get/put` triggers `loadFromDisk()` (reads all `*.jsonl|*.json` in
-`sessionsDir`, skips corrupt). `putOne`: update cache → write `<id>.jsonl.tmp` → rename (atomic).
-`SESSION_ID_RE = /^[A-Za-z0-9_-]{1,80}$/` gates ids on both threads. Main thread wraps ops in
-`storeOp()` (promise map keyed by a monotonically increasing id; worker replies resolve/reject).
+`sessionsDir`, skips corrupt). `putOne` is **serialized per id** through a promise chain and writes a
+**unique** `.tmp` (timestamp+rand) before rename — the parentPort handler is async, and with the hub
+persisting every turn while browsers push `/ws/sync` puts, two overlapping puts for the same id used
+to race on the shared `.jsonl.tmp` path (rename → ENOENT, breaking sync — fixed 2026-10-21). Failed
+writes clean their tmp; boot deletes stale `.tmp` leftovers; `delOne` drops the chain. Corrupt files
+are skipped on load. `SESSION_ID_RE = /^[A-Za-z0-9_-]{1,80}$/` gates ids on both threads. Main thread
+wraps ops in `storeOp()` (promise map keyed by a monotonically increasing id; worker replies
+resolve/reject).
 
 ## `/ws/sync` hub (`syncConn`)
 
@@ -208,16 +218,33 @@ branch (`{type:"session", id, data:{messages}, metadata, jsonl}`; before 2026-10
 serialized `data: j.data` which was undefined, so watched updates carried NO body). Backpressure-aware
 via `MAX_BUFFERED` 4MB.
 
+## Runtime status frames (fable5, 2026-10-21)
+
+The hub tracks an in-memory runtime per session (status/startedAt/turn/currentTool/lastText/
+pendingPrompts); boundaries + assistant message_end fire `onRuntimeChange` → `sendRuntime()` pushes
+`{type:"runtime", runtime:{...rt, clients}}` to ALL syncClients IMMEDIATELY (no coalesce/cache — the
+client applies it outside its 5s throttle, seq-guarded: stale seq dropped, idle deletes the entry,
+MAX-seq idle from discard()). `enrichedSessions()` embeds NON-IDLE runtime (idle = absence) into
+`/ws/sync` sessions frames and `GET /api/sessions`. Memory-only: a restart leaves everything idle.
+
 ## Server-side agent hub (`agent-hub.mjs`, non-default path)
 
-Agent per session; `getApiKey` reads `.pi/auth.json` server-side (keys never sent to clients);
-`persist()` → worker store. Events: every event seq-stamped + broadcast to `/ws/agent` clients;
+Agent per session (**the DEFAULT chat path since 2026-10-21**); `getApiKey` reads `.pi/auth.json`
+server-side (keys never sent to clients); `persist()` → worker store. **The loop is fully server-side**:
+tools = `builtinTools + extensionTools` run IN-PROCESS via `getTools()` (same objects as the exec
+bridge), `systemPrompt = effectiveSystemPrompt()` (WEB_SYSTEM.md precedence), default model from pi
+`settings.json default_model` via `defaultModelId`. `prompt(sessionId, content, images)` repairs
+dangling toolCalls (Anthropic/OpenAI validity) and inlines composer images for queued follow-ups;
+`/ws/agent` attach ALWAYS ensures the hub session exists (fresh sessions have no store entry —
+`setThinkingLevel` was a crash on `entry.agent` before 2026-10-21). Events: every event seq-stamped +
+broadcast to `/ws/agent` clients;
 user-message ends persist immediately, others debounced 400ms with a 2s maxWait. `attach()` =
-subscribe-first: temporarily swaps `this.broadcast` to buffer events while snapshotting, then delivers
-snapshot + buffered (dedup by seq) — the swap/restore is not reentrant (quirk). `prompt()` queues ONE
-follow-up while streaming (depth 2+ rejected). Eviction: idle >30min (flush first) or LRU beyond
-HOT_AGENT_CAP+5; `flushAll()` on shutdown (note: no SIGINT wiring in server.mjs currently).
-`onEvents()` backs the SSE endpoint the same (swap) way.
+subscribe-first: buffers events via a per-session `entry.buffer` hook while snapshotting (2026-10-21 —
+the old global broadcast swap was not reentrant), then delivers snapshot + buffered (dedup by seq).
+`prompt()` queues ONE follow-up while streaming (depth 2+ rejected). Eviction: idle >30min (flush
+first) or LRU beyond HOT_AGENT_CAP+5 — non-streaming sessions only, so a live run is never evicted.
+`flushAll()` exists for shutdown (note: no SIGINT wiring in server.mjs currently).
+`onEvents()` backs the SSE endpoint via the per-session subscriber Set (no swapping).
 
 ## Upgrade routing (`serve().on("upgrade")`)
 

@@ -11,7 +11,8 @@ import { AppStorage, CustomProvidersStore, ProviderKeysStore, SessionsStore, Set
 import { ChatView } from "./ui/chat.js";
 import { createApiKeyResolver, createProxyStreamFn } from "./ui/proxy-stream.js";
 import { defaultModelFromCache, fetchAndApplyConfig, loadCachedConfig, type PiConfig } from "./pi-import.js";
-import { sessionSync } from "./session-sync.js";
+import { ProxyAgent } from "./proxy-agent.js";
+import { sessionSync, type RuntimeRecord } from "./session-sync.js";
 import { LocalStorageBackend } from "./local-storage-backend.js";
 import { fetchPiServerTools } from "./pi-tools.js";
 import { termBus } from "./ui/terminal.js";
@@ -22,7 +23,8 @@ import { dlog } from "./diag.js";
 // CONSTANTS + GLOBAL STATE
 // ============================================================================
 const DB_NAME = "pi-web-ui-app-v3";
-let agent: Agent;
+let agent: any;
+let serverMode = false; // default: server-side loop (?local=1 → legacy in-browser loop)
 let currentSessionId: string | undefined;
 let currentTitle = "";
 let piConfigData: PiConfig | null = null;
@@ -154,6 +156,52 @@ const updateUrl = (sessionId: string) => {
 };
 
 // ============================================================================
+// SERVER-SIDE AGENT (default path, 2026-10-21)
+// ============================================================================
+// The agent loop runs in Node (agent-hub.mjs): runs SURVIVE browser/phone
+// closes (the server keeps going as long as it is alive), and every attached
+// device (PC/phone) receives the same live /ws/agent event stream — send from
+// one device, watch progress from another, or send from the other one.
+// ?local=1 restores the legacy in-browser loop (createAgent below).
+const createServerAgent = async (sessionId: string, initialModel?: any) => {
+	if (agentUnsubscribe) agentUnsubscribe();
+	// close the PREVIOUS server agent's socket (a listener-only unsubscribe would
+	// leave it attached to the old session, still receiving every event)
+	if (agent && typeof agent.disconnect === "function") agent.disconnect();
+	const serverAgent = new ProxyAgent(sessionId, initialModel);
+	serverAgent.subscribe((event: any) => {
+		// the SERVER persists to the JSONL mirror after every turn; the local save
+		// keeps this device's session list instant and works while offline
+		const messages: AgentMessage[] = serverAgent.state.messages;
+		if (event.type === "state-snapshot") {
+			if (!currentTitle && shouldSaveSession(messages)) currentTitle = generateTitle(messages);
+			notify();
+			return;
+		}
+		if (event.type === "message_end" || event.type === "message_update") {
+			if (!currentTitle && shouldSaveSession(messages)) currentTitle = generateTitle(messages);
+			if (!currentSessionId && shouldSaveSession(messages)) {
+				currentSessionId = sessionId;
+				updateUrl(currentSessionId);
+				sessionSync.push(currentSessionId);
+			}
+			if (currentSessionId) saveSessionSoon();
+		}
+		if (event.type === "agent_end") {
+			flushSession();
+			if (currentSessionId) sessionSync.push(currentSessionId);
+		}
+		notify();
+	});
+	agent = serverAgent;
+	currentSessionId = sessionId;
+	currentTitle = ""; // re-derived from the attach snapshot
+	updateUrl(sessionId);
+	serverAgent.connect();
+	notify();
+};
+
+// ============================================================================
 // AGENT CREATION
 // ============================================================================
 // effective system prompt for the WEB agent only: .pi/WEB_SYSTEM.md (a filename
@@ -279,6 +327,35 @@ function setToastBg(msg: string) {
 const loadSession = async (sessionId: string): Promise<boolean> => {
 	if (!sessionId) return false;
 	flushSession(); // grok P4: don't lose the last debounce when switching sessions
+	if (serverMode) {
+		// SERVER path: the hub hydrates from the JSONL mirror itself; the attach
+		// snapshot delivers messages + model — works from any device (the session
+		// list on the phone opens the same transcript the PC is streaming)
+		try {
+			const r = await fetch(`/api/agent/session/${encodeURIComponent(sessionId)}`, { signal: AbortSignal.timeout(8000) });
+			if (r.ok) {
+				const j = await r.json();
+				if (j.exists === false && !(Array.isArray(j.messages) && j.messages.length > 0)) {
+				// not on the server — if this device has a LOCAL copy (e.g. from the
+				// old browser-loop era), migrate it to the hub, else prune (grok r3 Q2)
+				const localData = await storage.sessions.get(sessionId).catch(() => null);
+				if (localData && Array.isArray(localData.messages) && localData.messages.length > 0) {
+					await fetch(`/api/agent/session/${encodeURIComponent(sessionId)}`, {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({ sessionId, messages: localData.messages, modelId: localData.model?.id || localData.modelId, thinkingLevel: localData.thinkingLevel }),
+					}).catch(() => {});
+					await createServerAgent(sessionId, localData.model || lastModelFromLocal());
+					return true;
+				}
+				try { await ((storage.sessions as any).getBackend()).delete("sessions-metadata", sessionId); } catch { /* noop */ }
+				dlog.warn("[init]", "session not found on server:", String(sessionId).replace(/[^A-Za-z0-9_-]/g, "").slice(0, 24) || "(unparseable)");
+				return false;				}
+			}
+		} catch { /* offline — try the attach anyway */ }
+		await createServerAgent(sessionId, lastModelFromLocal() || defaultModelFromCache());
+		return true;
+	}
 	// bugs.md #17: resolve from BOTH stores and take the more complete copy.
 	// Local is authoritative on this device (saved every turn); the server mirror
 	// matters for cross-device ?session= links and may be empty/stale.
@@ -343,6 +420,12 @@ const deleteSessionById = (deletedSessionId: string) => {
 		clearTimeout(saveTimer);
 		saveTimer = undefined;
 	}
+	// hub-side tombstone: abort a live run + block later persists (no resurrection)
+	void fetch("/api/agent/discard", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ sessionId: deletedSessionId }),
+	}).catch(() => {});
 	const wasCurrent = deletedSessionId === currentSessionId;
 	if (wasCurrent) currentSessionId = undefined; // saveSession/flush no-op from here
 	sessionSync.delete(deletedSessionId);
@@ -408,6 +491,8 @@ function App() {
 	const [toast, setToast] = useState<string | undefined>();
 	const [serverOnline, setOnline] = useState<boolean | null>(null);
 	const [genStatus, setGenStatus] = useState<"" | "thinking" | "generating">("");
+	const [runtime, setRuntime] = useState<ReadonlyMap<string, RuntimeRecord>>(() => sessionSync.runtimeSnapshot());
+	const [bannerDismissed, setBannerDismissed] = useState(false);
 	const [sessionsOpen, setSessionsOpen] = useState(false);
 	const [settingsOpen, setSettingsOpen] = useState(false);
 	const [modelOpen, setModelOpen] = useState(false);
@@ -420,6 +505,14 @@ function App() {
 		agentListeners.add(listener);
 		return () => agentListeners.delete(listener);
 	}, []);
+
+	// runtime status (fable5 design): header badge + resume banner + tab title.
+	// Applied immediately — session-sync bypasses its 5s metadata throttle for these.
+	useEffect(() => sessionSync.onRuntime(() => setRuntime(new Map(sessionSync.runtimeSnapshot()))), []);
+	useEffect(() => {
+		const running = [...runtime.values()].filter((r) => r.status === "running").length;
+		document.title = (running > 0 ? "▶ " : "") + "pi web";
+	}, [runtime]);
 
 	// Editor's model button → open the picker (decoupled via event)
 	useEffect(() => {
@@ -465,6 +558,7 @@ function App() {
 	const applyModel = (model: any) => {
 		if (!agent) return;
 		agent.state.model = model;
+		agent.setModel?.(model.id); // server-side agent: propagate to the hub
 		saveLastModel(model);
 		localStorage.setItem("pi.lastThinkingLevel", String(agent.state.thinkingLevel ?? "high"));
 		notify();
@@ -515,6 +609,15 @@ function App() {
 					<button class="pi-btn" title="Terminal (bash dock — no node-pty)" onClick={() => termBus.toggle()}>
 						<Icon d={ICONS.terminal} />
 					</button>
+					{[...runtime.values()].filter((r) => r.status === "running" && r.sessionId !== currentSessionId).length > 0 && (
+						<button
+							class="pi-btn pw-running-badge"
+							title="Sessions running on the server (other device or background) — click to open the list"
+							onClick={() => setSessionsOpen(true)}
+						>
+							▶ {[...runtime.values()].filter((r) => r.status === "running" && r.sessionId !== currentSessionId).length}
+						</button>
+					)}
 	<button class="pi-btn pi-theme" title={`Theme: ${themeMode} (click to cycle)`} onClick={cycleTheme}>
 						<span style={{ fontSize: 11, fontWeight: 600 }}>{themeMode === "system" ? "Auto" : themeMode === "light" ? "Light" : "Dark"}</span>
 					</button>
@@ -523,6 +626,20 @@ function App() {
 					</button>
 				</div>
 			</header>
+			{!currentSessionId && !bannerDismissed && runtime.size > 0 && (() => {
+				// resume banner (fable5: NO auto-navigation — one deliberate tap)
+				const latest = [...runtime.values()].sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0))[0];
+				if (!latest) return null;
+				return (
+					<div class="pw-resume-banner">
+						<span class="pw-resume-text">
+							▶ Task running in background{latest.lastText ? ` — ${latest.lastText.slice(0, 80)}` : ""}
+						</span>
+						<button class="pw-resume-btn" onClick={() => { setBannerDismissed(true); loadSessionById(latest.sessionId); }}>Resume</button>
+						<button class="pw-resume-close" title="Dismiss" onClick={() => setBannerDismissed(true)}>✕</button>
+					</div>
+				);
+			})()}
 			{agent ? <ChatView agent={agent} /> : <div class="pw-chat" />}
 			{toast && <div class="pi-toast">{toast}</div>}
 			<SessionListDialog
@@ -615,13 +732,22 @@ async function init() {
 		}
 	};
 
-	// resolve local pi's SYSTEM.md / APPEND_SYSTEM.md (bugs: the web agent must
-	// SHARE the local pi's system prompt, not just display it) — resolved once
-	// before any createAgent() call (boot, ?session= restore, dialog click)
-	piSystemPrompt = await resolvePiSystemPrompt();
-	(window as any).__piSystemPrompt = piSystemPrompt; // debuggable from the console
-	piServerTools = await fetchPiServerTools(); // pi extensions + workspace tools (sync for toolsFactory)
-	(window as any).__piServerTools = piServerTools.map((t) => t.name);
+	// server-side agent (DEFAULT, 2026-10-21): tools + system prompt live server-side —
+	// the browser fetches neither. ?local=1 restores the legacy in-browser loop.
+	serverMode = !params.has("local");
+	if (serverMode) {
+		piServerTools = []; // tools are declared AND executed by agent-hub in-process
+		const bootModel = lastModelFromLocal() || defaultModelFromCache();
+		await createServerAgent(params.get("session") || makeId(), bootModel);
+	} else {
+		// resolve local pi's SYSTEM.md / APPEND_SYSTEM.md (bugs: the web agent must
+		// SHARE the local pi's system prompt, not just display it) — resolved once
+		// before any createAgent() call (boot, ?session= restore, dialog click)
+		piSystemPrompt = await resolvePiSystemPrompt();
+		(window as any).__piSystemPrompt = piSystemPrompt; // debuggable from the console
+		piServerTools = await fetchPiServerTools(); // pi extensions + workspace tools (sync for toolsFactory)
+		(window as any).__piServerTools = piServerTools.map((t) => t.name);
+	}
 
 	// proxy defaults in SYNCHRONOUS localStorage
 	if (location.protocol.startsWith("http")) {
@@ -631,7 +757,13 @@ async function init() {
 
 	// background enrichment — never blocks first paint
 	void (async () => {
-		fetch("/api/health").then((r) => setServerStatus(r.ok)).catch(() => setServerStatus(false));
+	 fetch("/api/health").then((r) => setServerStatus(r.ok)).catch(() => setServerStatus(false));
+
+	 // seed session runtime status (banner/badge) before the first sync frame
+	 try {
+	  const sr = await fetch("/api/sessions", { signal: AbortSignal.timeout(8000) });
+	  if (sr.ok) { const sd = await sr.json(); sessionSync.seedRuntime(sd.sessions || []); }
+	 } catch { /* offline */ }
 
 		try {
 			const fresh = await withTimeout(fetchAndApplyConfig(), 8000, "pi config refresh");
@@ -656,14 +788,16 @@ async function init() {
 		// removed (grok P4: don't keep a second source of truth).
 
 		const sessionId = new URLSearchParams(window.location.search).get("session");
-		if (sessionId) {
+		// server mode: the session was passed to the server agent at boot and the
+		// attach snapshot hydrates it — no background restore needed
+		if (sessionId && !serverMode) {
 			const ok = (await withTimeout(loadSession(sessionId), 15000, "session load")) === true;
 			dlog.debug("[init]", since(), "background session load:", ok);
 			if (!ok) setToastBg("Could not load that session (server or storage unavailable).");
 		}
 	})();
 
-	await createAgent();
+	if (!serverMode) await createAgent(); // server mode already created the ProxyAgent
 	render(<><App /><DiagPanel /></>, document.getElementById("app")!);
 	dlog.debug("[init]", since(), "rendered");
 

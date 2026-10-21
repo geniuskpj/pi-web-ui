@@ -154,7 +154,10 @@ export function SettingsDialog({
 								value={thinking}
 								onChange={(e) => {
 									const v = (e.target as HTMLSelectElement).value;
-									if (agent) agent.state.thinkingLevel = v as any;
+									if (agent) {
+										agent.state.thinkingLevel = v as any;
+										(agent as any).setThinkingLevel?.(v); // server-side agent: propagate to the hub
+									}
 									localStorage.setItem("pi.lastThinkingLevel", v);
 									window.dispatchEvent(new CustomEvent("pi-agent-state-changed")); // sync toolbar
 									flash(`Thinking: ${v}`);
