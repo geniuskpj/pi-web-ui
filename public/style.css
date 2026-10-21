@@ -1,0 +1,1704 @@
+/* Shell chrome for pi web (plain CSS — no tailwind build step).
+   Theme variables (--background, --foreground, ...) come from the
+   official @earendil-works/pi-web-ui app.css (light + dark, .dark class). */
+
+* {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	margin: 0;
+	padding: 0;
+	height: 100%;
+	-webkit-text-size-adjust: 100%;
+	text-size-adjust: 100%;
+}
+
+body {
+	background: var(--background, #fff);
+	color: var(--foreground, #111);
+	font-family:
+		ui-sans-serif,
+		system-ui,
+		-apple-system,
+		"Segoe UI",
+		Roboto,
+		"Helvetica Neue",
+		Arial,
+		sans-serif;
+	overscroll-behavior: none;
+}
+
+#app {
+	height: 100vh; /* fallback */
+	height: 100dvh; /* mobile browser chrome aware */
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+}
+
+/* ---------- header ---------- */
+.pi-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	padding: 6px 10px;
+	padding-top: calc(6px + env(safe-area-inset-top));
+	padding-left: calc(10px + env(safe-area-inset-left));
+	padding-right: calc(10px + env(safe-area-inset-right));
+	border-bottom: 1px solid var(--border, #e5e5e5);
+	background: var(--background, #fff);
+	flex-shrink: 0;
+	min-height: 52px;
+}
+
+.pi-header-left,
+.pi-header-right {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	min-width: 0;
+}
+
+.pi-title-btn {
+	appearance: none;
+	border: 0;
+	background: transparent;
+	color: inherit;
+	font: inherit;
+	font-weight: 600;
+	font-size: 15px;
+	padding: 8px 10px;
+	border-radius: 8px;
+	cursor: pointer;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	max-width: 46vw;
+}
+.pi-title-btn:hover {
+	background: var(--secondary, #f5f5f5);
+}
+
+.pi-input {
+	appearance: none;
+	border: 1px solid var(--border, #e5e5e5);
+	background: var(--background, #fff);
+	color: inherit;
+	font-size: 16px; /* >=16px prevents iOS focus zoom */
+	border-radius: 8px;
+	padding: 8px 10px;
+	outline: none;
+	min-width: 0;
+}
+.pi-input:focus {
+	border-color: var(--ring, #999);
+}
+
+.pi-btn {
+	appearance: none;
+	border: 0;
+	background: transparent;
+	color: var(--foreground, #111);
+	width: 40px; /* touch-friendly tap target */
+	height: 40px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	border-radius: 8px;
+	cursor: pointer;
+	padding: 0;
+	flex-shrink: 0;
+}
+.pi-btn:hover {
+	background: var(--secondary, #f5f5f5);
+}
+.pi-btn:active {
+	background: var(--accent, #ececec);
+}
+.pi-btn svg {
+	width: 20px;
+	height: 20px;
+	display: block;
+}
+.pi-btn.lit {
+	pointer-events: none;
+	display: contents; /* theme-toggle renders its own button */
+}
+
+/* ---------- chat panel fills the rest ---------- */
+.chat-host {
+	flex: 1;
+	min-height: 0; /* let flexbox, not content, control height */
+	display: flex;
+}
+.chat-host chat-panel,
+.chat-host pi-chat-panel {
+	display: block;
+	flex: 1;
+	min-width: 0;
+	min-height: 0;
+}
+
+/* ---------- toast ---------- */
+.pi-toast {
+	position: fixed;
+	right: 12px;
+	bottom: calc(12px + env(safe-area-inset-bottom));
+	left: 12px;
+	max-width: 420px;
+	margin-left: auto;
+	background: var(--primary, #111);
+	color: var(--primary-foreground, #fff);
+	padding: 12px 16px;
+	border-radius: 10px;
+	font-size: 14px;
+	line-height: 1.45;
+	box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+	z-index: 1000;
+	word-break: break-word;
+}
+
+/* ---------- small screens ---------- */
+@media (max-width: 800px) {
+	.pi-title-btn {
+		font-size: 14px;
+		max-width: 38vw;
+	}
+	.pi-header {
+		min-height: 48px;
+	}
+}
+
+/* ---------- loading splash ---------- */
+.pi-splash {
+	height: 100%;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	color: var(--muted-foreground, #777);
+}
+
+/* ---------- new Preact chat UI (src/ui/chat.tsx) ----------
+   Design tokens: sonnet-5-high round. 4px spacing grid; borders over shadows
+   in flow; shadows only for floating layers; 11/12/14.5 font hierarchy;
+   tabular-nums on live numbers; focus-visible ring = 2px card + 4px ring. */
+
+.pw-chat {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+	background: var(--background, #fff);
+	color: var(--foreground, #111);
+}
+.pw-scroll {
+	flex: 1;
+	min-height: 0;
+	overflow-y: auto;
+	overscroll-behavior: contain;
+}
+.pw-thread {
+	max-width: calc(48rem + 40px); /* border-box: content = 48rem, shared edges with composer (grok p6) */
+	margin: 0 auto;
+	padding: 20px 20px 12px;
+	padding-left: calc(20px + env(safe-area-inset-left));
+	padding-right: calc(20px + env(safe-area-inset-right));
+	display: flex;
+	flex-direction: column;
+	gap: 20px;
+}
+
+/* --- messages: flat assistant, tinted right-aligned user --- */
+.pw-msg-row {
+	display: flex;
+	min-width: 0;
+}
+.pw-user-row {
+	justify-content: flex-end;
+}
+.pw-msg {
+	font-size: 14.5px;
+	line-height: 1.6;
+	word-break: break-word;
+	min-width: 0;
+}
+.pw-user {
+	max-width: 75%;
+	padding: 10px 14px;
+	border-radius: 14px 14px 4px 14px;
+	background: var(--secondary, #f4f4f5);
+	border: 1px solid transparent;
+}
+@media (max-width: 640px) {
+	.pw-user { max-width: 85%; }
+}
+.pw-text-plain {
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
+/* --- markdown body --- */
+.pw-md > :first-child { margin-top: 0; }
+.pw-md > :last-child { margin-bottom: 0; }
+.pw-md p { margin: 0.5em 0; }
+/* Tailwind preflight (in app.css) strips heading weights + list markers —
+   restore them inside markdown bodies (user report: "only bold works") */
+.pw-md h1, .pw-md h2, .pw-md h3, .pw-md h4 {
+	margin: 1em 0 0.4em;
+	line-height: 1.3;
+	font-weight: 650;
+}
+.pw-md h1 { font-size: 1.35em; }
+.pw-md h2 { font-size: 1.2em; }
+.pw-md h3, .pw-md h4 { font-size: 1.06em; }
+.pw-md h1:first-child, .pw-md h2:first-child, .pw-md h3:first-child, .pw-md h4:first-child {
+	margin-top: 0;
+}
+.pw-md ul { list-style: disc outside; }
+.pw-md ol { list-style: decimal outside; }
+.pw-md li { margin: 0.25em 0; }
+.pw-md li > ul, .pw-md li > ol { margin: 0.25em 0; }
+.pw-md li::marker { color: var(--muted-foreground, #888); }
+.pw-md ul, .pw-md ol { margin: 0.5em 0; padding-left: 1.5em; }
+.pw-md li { margin: 0.2em 0; }
+.pw-md blockquote {
+	margin: 0.5em 0;
+	padding: 0.1em 0.9em;
+	border-left: 3px solid var(--border, #ddd);
+	color: var(--muted-foreground, #777);
+}
+.pw-md code {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 0.88em;
+	background: var(--secondary, #f4f4f5);
+	border-radius: 4px;
+	padding: 0.1em 0.35em;
+}
+.pw-md pre {
+	background: var(--card, #fafafa);
+	border: 1px solid var(--border, #e5e5e5);
+	border-radius: 10px;
+	padding: 12px 14px;
+	overflow-x: auto;
+	margin: 0.6em 0;
+}
+.pw-md pre code {
+	background: transparent;
+	padding: 0;
+	font-size: 13px;
+	line-height: 1.55;
+}
+.pw-md table {
+	border-collapse: collapse;
+	margin: 0.6em 0;
+	display: block;
+	overflow-x: auto;
+	max-width: 100%;
+}
+.pw-md th, .pw-md td {
+	border: 1px solid var(--border, #ddd);
+	padding: 5px 10px;
+	font-size: 0.92em;
+	text-align: left;
+}
+.pw-md th { background: var(--secondary, #f4f4f5); }
+.pw-md a { color: var(--primary, #0066cc); text-decoration: underline; }
+.pw-md hr { border: 0; border-top: 1px solid var(--border, #ddd); margin: 0.8em 0; }
+.pw-md img { max-width: 100%; }
+
+/* --- thinking block: rail, not a box --- */
+.pw-think {
+	border-left: 2px solid var(--border, #ddd);
+	padding: 2px 0 2px 10px;
+	margin: 4px 0;
+	color: var(--muted-foreground, #777);
+	font-size: 13px;
+}
+.pw-think summary {
+	cursor: pointer;
+	user-select: none;
+	font-size: 12px;
+	font-weight: 600;
+	letter-spacing: 0.04em;
+	padding: 2px 0;
+	list-style: none;
+}
+.pw-think summary::-webkit-details-marker { display: none; }
+.pw-think summary::before {
+	content: "\25b8"; /* ▸ */
+	display: inline-block;
+	margin-right: 5px;
+	transition: transform 0.15s;
+	color: var(--muted-foreground, #999);
+}
+.pw-think[open] summary::before { transform: rotate(90deg); }
+.pw-think-body {
+	max-height: 300px;
+	overflow-y: auto;
+	padding: 2px 2px 6px;
+	font-size: 12.5px;
+	font-style: italic;
+}
+
+/* --- tool rows: compact chrome, borders not shadows --- */
+.pw-tool {
+	border: 1px solid var(--border, #e0e0e0);
+	border-radius: 10px;
+	margin: 6px 0;
+	background: var(--card, #fafafa);
+	font-size: 12.5px;
+	overflow: hidden;
+	min-width: 0; /* let .pw-tool-args ellipsis engage (grok p6) */
+	width: 100%;
+}
+.pw-tool summary {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 6px 10px;
+	cursor: pointer;
+	user-select: none;
+	list-style: none;
+	min-width: 0;
+}
+.pw-tool summary:hover { background: var(--secondary, #f4f4f5); }
+.pw-tool summary::-webkit-details-marker { display: none; }
+.pw-tool summary::before {
+	content: "\25b8"; /* ▸ */
+	flex-shrink: 0;
+	color: var(--muted-foreground, #999);
+	transition: transform 0.15s;
+}
+.pw-tool[open] summary::before { transform: rotate(90deg); }
+.pw-tool-name {
+	font-weight: 600;
+	flex-shrink: 0;
+}
+.pw-tool-args {
+	color: var(--muted-foreground, #888);
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 11.5px;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	flex: 1;
+	min-width: 0;
+}
+.pw-tool-state {
+	flex-shrink: 0;
+	font-size: 11px;
+}
+.pw-state-ok { color: var(--stat-ok, #1a7f43); }
+.pw-state-error { color: var(--stat-danger, #b91c1c); font-weight: 600; }
+.pw-state-running {
+	color: var(--muted-foreground, #888);
+	animation: pw-pulse 1.2s ease-in-out infinite;
+}
+.pw-state-queued { color: var(--muted-foreground, #999); }
+@keyframes pw-pulse {
+	50% { opacity: 0.35; }
+}
+@media (prefers-reduced-motion: reduce) {
+	.pw-state-running,
+	.pw-thinking-hint {
+		animation: none;
+	}
+}
+.pw-tool-error {
+	border-color: #e5484d55;
+	background: rgba(229, 72, 77, 0.06);
+}
+.pw-tool-running { border-style: dashed; }
+.pw-tool-body {
+	padding: 4px 10px 10px;
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+.pw-tool-body pre {
+	margin: 0;
+	padding: 8px 10px;
+	border-radius: 6px;
+	background: var(--background, #fff);
+	border: 1px solid var(--border, #eee);
+	overflow-x: auto;
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 11.5px;
+	line-height: 1.45;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	max-height: 320px;
+	overflow-y: auto;
+}
+
+/* --- assistant meta (usage + copy) --- */
+.pw-meta {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	margin-top: 3px;
+	font-size: 11.5px;
+	color: var(--muted-foreground, #888);
+	min-height: 18px;
+}
+.pw-copy {
+	appearance: none;
+	border: 0;
+	background: transparent;
+	color: var(--muted-foreground, #888);
+	font-size: 11.5px;
+	cursor: pointer;
+	padding: 2px 6px;
+	border-radius: 6px;
+}
+.pw-copy:hover { background: var(--secondary, #f4f4f5); color: var(--foreground, #111); }
+
+/* --- error / abort chrome --- */
+.pw-failed { opacity: 0.85; }
+.pw-error-chrome {
+	margin-top: 6px;
+	padding: 7px 10px;
+	border-radius: 8px;
+	background: rgba(229, 72, 77, 0.08);
+	border: 1px solid rgba(229, 72, 77, 0.35);
+	color: #e5484d;
+	font-size: 12.5px;
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	justify-content: space-between;
+}
+.pw-retry {
+	appearance: none;
+	border: 1px solid rgba(229, 72, 77, 0.45);
+	background: transparent;
+	color: #e5484d;
+	font-size: 12px;
+	font-weight: 600;
+	padding: 3px 12px;
+	border-radius: 7px;
+	cursor: pointer;
+	flex-shrink: 0;
+}
+.pw-retry:hover { background: rgba(229, 72, 77, 0.12); }
+
+/* --- system notification line --- */
+.pw-note {
+	text-align: center;
+	font-size: 12px;
+	color: var(--muted-foreground, #888);
+	padding: 2px 12px;
+}
+.pw-note-destructive { color: #e5484d; }
+.pw-note-time { opacity: 0.6; margin-left: 8px; font-size: 11px; }
+
+/* --- thinking hint (idle gap before first delta) --- */
+.pw-thinking-hint {
+	color: var(--muted-foreground, #999);
+	font-size: 13px;
+	padding: 4px 2px;
+	animation: pw-pulse 1.4s ease-in-out infinite;
+}
+
+/* --- composer (arena pattern, sonnet-5-high round): pills live inside the
+   composer container; effort = native select styled AS the pill. NEVER give a
+   select a transparent text color — the opened dropdown options inherit it and
+   turn invisible on Windows Chrome. --- */
+.pw-editor {
+	flex-shrink: 0;
+	max-width: calc(48rem + 40px); /* same gutter as thread (grok p6) */
+	margin: 0 auto;
+	width: 100%;
+	padding: 6px 20px 4px;
+	padding-left: calc(20px + env(safe-area-inset-left));
+	padding-right: calc(20px + env(safe-area-inset-right));
+}
+.pw-composer {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	background: var(--card, #fafafa);
+	border: 1px solid var(--border, #e5e5e5);
+	border-radius: 16px;
+	padding: 10px 10px 8px 14px;
+	transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+.pw-composer:focus-within {
+	border-color: var(--ring, #bbb);
+	box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.28); /* fallback for old engines */
+	box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring, #bbb) 22%, transparent);
+}
+.pw-input {
+	width: 100%;
+	resize: none;
+	border: 0;
+	outline: none;
+	background: transparent;
+	color: var(--foreground, #111);
+	font: inherit;
+	font-size: 14.5px;
+	line-height: 1.45;
+	padding: 4px 2px 8px;
+	max-height: 240px;
+	overflow-y: auto;
+}
+.pw-input::placeholder { color: var(--muted-foreground, #888); }
+@media (max-width: 640px) {
+	.pw-input { font-size: 16px; } /* iOS zoom guard */
+}
+.pw-composer-row {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+.pw-spacer { flex: 1 1 auto; }
+
+/* attachment strip (workspace picker + clipboard paste) */
+.pw-attach-strip {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px;
+	padding: 2px 0 0;
+}
+.pw-attach-chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	border: 1px solid var(--border, #e5e5e5);
+	background: var(--secondary, #f4f4f5);
+	border-radius: 8px;
+	padding: 3px 6px;
+	font-size: 11.5px;
+	max-width: 240px;
+}
+.pw-attach-name {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 11px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.pw-attach-img {
+	padding: 2px;
+}
+.pw-attach-img img {
+	height: 30px;
+	max-width: 64px;
+	object-fit: cover;
+	border-radius: 5px;
+	display: block;
+}
+.pw-attach-x {
+	appearance: none;
+	border: 0;
+	background: transparent;
+	color: var(--muted-foreground, #888);
+	cursor: pointer;
+	font-size: 10px;
+	padding: 1px 3px;
+	border-radius: 4px;
+	flex-shrink: 0;
+}
+.pw-attach-x:hover {
+	color: #e5484d;
+	background: rgba(229, 72, 77, 0.12);
+}
+.pw-attach-note {
+	font-size: 11px;
+	color: #b45309;
+}
+.pw-attach-btn {
+	font-size: 11.5px;
+}
+/* attached file name = clickable → opens the explorer at that file (user request) */
+.pw-attach-link {
+	appearance: none;
+	border: 0;
+	background: transparent;
+	color: inherit;
+	font: inherit;
+	cursor: pointer;
+	padding: 0;
+	text-decoration: underline;
+	text-decoration-style: dotted;
+	text-underline-offset: 2px;
+}
+.pw-attach-link:hover {
+	color: var(--primary, #0066cc);
+}
+/* clickable file chips inside sent user messages */
+.pw-user-files {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px;
+	margin-top: 8px;
+	justify-content: flex-end;
+}
+.pw-user-file {
+	appearance: none;
+	border: 0;
+	background: color-mix(in srgb, var(--foreground, #111) 8%, transparent);
+	color: var(--foreground, #111);
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 11px;
+	padding: 2px 8px;
+	border-radius: 6px;
+	cursor: pointer;
+	max-width: 220px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.pw-user-file:hover {
+	text-decoration: underline;
+	background: color-mix(in srgb, var(--foreground, #111) 14%, transparent);
+}
+
+/* generic pill */
+.pw-pill {
+	height: 26px;
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	padding: 0 10px;
+	border-radius: 9999px;
+	border: 1px solid var(--border, #e5e5e5);
+	background: var(--secondary, #f4f4f5);
+	color: var(--foreground, #111);
+	font-size: 12px;
+	font-weight: 500;
+	letter-spacing: 0.01em;
+	max-width: 220px;
+	white-space: nowrap;
+	cursor: pointer;
+	user-select: none;
+	transition: background-color 120ms ease, border-color 120ms ease;
+}
+button.pw-pill:hover { background: var(--accent, #ececec); }
+button.pw-pill:active { transform: translateY(0.5px); }
+.pw-pill:focus-visible {
+	outline: none;
+	box-shadow: 0 0 0 2px var(--card, #fff), 0 0 0 4px var(--ring, #bbb);
+}
+.pw-pill-text {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 11.5px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	min-width: 0;
+}
+.pw-pill-caret {
+	flex: none;
+	width: 0;
+	height: 0;
+	border-left: 4px solid transparent;
+	border-right: 4px solid transparent;
+	border-top: 5px solid var(--muted-foreground, #888);
+}
+
+/* effort: native select styled AS the pill */
+.pw-pill-select {
+	position: relative;
+	padding: 0;
+	overflow: hidden;
+	min-height: 30px; /* touch target */
+}
+.pw-pill-label {
+	flex: none;
+	font-size: 11px;
+	line-height: 1;
+	color: var(--muted-foreground, #888);
+	padding-left: 10px;
+	pointer-events: none; /* label click must reach the select (grok p6) */
+}
+.pw-pill-select-el {
+	appearance: none;
+	-webkit-appearance: none;
+	-moz-appearance: none;
+	width: auto;
+	min-width: 4.5ch; /* stable pill width across low/medium/high (grok p6) */
+	height: 100%;
+	border: 0;
+	margin: 0;
+	outline: none;
+	background: transparent; /* pill bg shows through — text color stays REAL */
+	color: var(--foreground, #111);
+	font: inherit;
+	font-size: 12px;
+	font-weight: 500;
+	line-height: 1;
+	padding: 0 18px 0 2px;
+	cursor: pointer;
+}
+.pw-pill-select::after {
+	content: "";
+	position: absolute;
+	right: 9px;
+	top: 50%;
+	width: 0;
+	height: 0;
+	transform: translateY(-50%);
+	border-left: 4px solid transparent;
+	border-right: 4px solid transparent;
+	border-top: 5px solid var(--muted-foreground, #888);
+	pointer-events: none;
+}
+.pw-pill-select-el:hover { background: var(--accent, #ececec); }
+.pw-pill-select-el:focus-visible {
+	box-shadow: 0 0 0 2px var(--card, #fff), 0 0 0 4px var(--ring, #bbb);
+	border-radius: 9999px;
+}
+/* native popup palette (Chromium/Firefox honor; Safari uses OS chrome) */
+.pw-pill-select-el option {
+	color: var(--foreground, #111);
+	background-color: var(--card, #fff);
+}
+
+/* Send — primary, text label kept (plan §2.7) */
+.pw-send {
+	height: 30px;
+	padding: 0 14px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 4px;
+	border-radius: 10px;
+	border: none;
+	background: var(--primary, #111);
+	color: var(--primary-foreground, #fff);
+	font-size: 12.5px;
+	font-weight: 600;
+	letter-spacing: 0.01em;
+	cursor: pointer;
+	flex-shrink: 0;
+	transition: opacity 120ms ease, transform 120ms ease;
+}
+.pw-send:hover:not(:disabled) { opacity: 0.9; }
+.pw-send:active:not(:disabled) { transform: scale(0.96); }
+.pw-send:disabled {
+	background: var(--secondary, #f4f4f5);
+	color: var(--muted-foreground, #888);
+	cursor: not-allowed;
+}
+.pw-send:focus-visible {
+	outline: none;
+	box-shadow: 0 0 0 2px var(--card, #fff), 0 0 0 4px var(--ring, #bbb);
+}
+.pw-send.pw-stop { background: #b91c1c; }
+
+.pw-copy:focus-visible,
+.pw-retry:focus-visible {
+	outline: none;
+	box-shadow: 0 0 0 2px var(--card, #fff), 0 0 0 4px var(--ring, #bbb);
+}
+
+/* --- stats line (no "context" word — just the number) --- */
+.pw-stats {
+	flex-shrink: 0;
+	max-width: calc(48rem + 40px); /* same gutter as thread + composer (grok p6) */
+	margin: 0 auto;
+	width: 100%;
+	padding: 4px 20px calc(6px + env(safe-area-inset-bottom));
+	padding-left: calc(20px + env(safe-area-inset-left));
+	padding-right: calc(20px + env(safe-area-inset-right));
+}
+.pw-stats-inner {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	font-size: 11px;
+	line-height: 14px;
+	letter-spacing: 0.01em;
+	color: var(--muted-foreground, #888);
+	font-variant-numeric: tabular-nums;
+	min-height: 16px;
+}
+.pw-ctx { white-space: nowrap; }
+.pw-ctx-pct { font-weight: 600; }
+.pw-stats[data-level="warn"] .pw-ctx-pct { color: var(--stat-warn, #b45309); }
+.pw-stats[data-level="danger"] .pw-ctx-pct { color: var(--stat-danger, #b91c1c); font-weight: 700; }
+.pw-totals { white-space: nowrap; }
+
+/* theme-aware stat hues + color-scheme (native popup palette) */
+:root { --stat-warn: #b45309; --stat-danger: #b91c1c; --stat-ok: #1a7f43; --checker-a: #fafafa; --checker-b: #e5e5e5; color-scheme: light; }
+html.dark { --stat-warn: #fbbf24; --stat-danger: #f87171; --stat-ok: #4ade80; --checker-a: #1c1c1c; --checker-b: #2a2a2a; color-scheme: dark; }
+
+/* global focus ring inside the chat UI (sonnet checklist item) */
+.pw-chat :focus-visible {
+	outline: none;
+	box-shadow: 0 0 0 2px var(--card, #fff), 0 0 0 4px var(--ring, #bbb);
+	border-radius: 6px;
+}
+.pw-pill:focus-visible,
+.pw-pill-select-el:focus-visible,
+.pw-send:focus-visible {
+	border-radius: 9999px;
+}
+
+/* --- highlight.js tokens (theme-aware, no external theme css) --- */
+.hljs-comment, .hljs-quote {
+	color: var(--muted-foreground, #6a737d);
+	font-style: italic;
+}
+.hljs-keyword, .hljs-selector-tag, .hljs-doctag, .hljs-meta { color: #cf222e; }
+.dark .hljs-keyword, .dark .hljs-selector-tag, .dark .hljs-doctag, .dark .hljs-meta { color: #ff7b72; }
+.hljs-string, .hljs-regexp, .hljs-addition { color: #0a7d3f; }
+.dark .hljs-string, .dark .hljs-regexp, .dark .hljs-addition { color: #7ee787; }
+.hljs-number, .hljs-literal, .hljs-variable, .hljs-template-variable, .hljs-attr, .hljs-attribute { color: #9551e6; }
+.dark .hljs-number, .dark .hljs-literal, .dark .hljs-variable, .dark .hljs-template-variable, .dark .hljs-attr, .dark .hljs-attribute { color: #d2a8ff; }
+.hljs-title, .hljs-section, .hljs-name, .hljs-selector-id, .hljs-selector-class { color: #116329; font-weight: 600; }
+.dark .hljs-title, .dark .hljs-section, .dark .hljs-name, .dark .hljs-selector-id, .dark .hljs-selector-class { color: #79c0ff; }
+.hljs-built_in, .hljs-builtin-name, .hljs-type { color: #953800; }
+.dark .hljs-built_in, .dark .hljs-builtin-name, .dark .hljs-type { color: #ffa657; }
+.hljs-deletion { color: #e5484d; }
+.hljs-symbol, .hljs-bullet, .hljs-link { color: #0066cc; }
+.dark .hljs-symbol, .dark .hljs-bullet, .dark .hljs-link { color: #58a6ff; }
+
+
+/* ---------- dialogs (P4) ---------- */
+.pw-overlay {
+	position: fixed;
+	inset: 0;
+	background: rgba(0, 0, 0, 0.4);
+	z-index: 1200;
+	display: flex;
+	align-items: flex-start;
+	justify-content: center;
+	padding: max(6vh, env(safe-area-inset-top)) 12px 12px;
+}
+.pw-dialog {
+	background: var(--background, #fff);
+	color: var(--foreground, #111);
+	border: 1px solid var(--border, #ddd);
+	border-radius: 12px;
+	width: 100%;
+	max-width: 560px;
+	max-height: 82vh;
+	display: flex;
+	flex-direction: column;
+	box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+	overflow: hidden;
+}
+.pw-dialog-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 12px 16px;
+	border-bottom: 1px solid var(--border, #eee);
+	font-weight: 600;
+	font-size: 15px;
+	flex-shrink: 0;
+}
+.pw-dialog-close {
+	appearance: none;
+	border: 0;
+	background: transparent;
+	color: var(--muted-foreground, #888);
+	font-size: 14px;
+	cursor: pointer;
+	padding: 4px 8px;
+	border-radius: 6px;
+}
+.pw-dialog-close:hover {
+	background: var(--secondary, #f4f4f5);
+}
+.pw-dialog-search {
+	margin: 10px 16px 4px;
+	flex-shrink: 0;
+}
+
+/* --- two-pane file explorer (user request) --- */
+.pw-file-dialog {
+	max-width: min(960px, 94vw);
+	height: min(74vh, 720px);
+}
+.pw-file-crumbs {
+	display: flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: 2px;
+	padding: 8px 16px 0;
+	font-size: 12px;
+	flex-shrink: 0;
+}
+.pw-crumb {
+	appearance: none;
+	border: 0;
+	background: transparent;
+	color: var(--primary, #0066cc);
+	font-size: 12px;
+	cursor: pointer;
+	padding: 2px 4px;
+	border-radius: 5px;
+	max-width: 180px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.pw-crumb:hover {
+	background: var(--secondary, #f4f4f5);
+}
+.pw-crumb-sep {
+	color: var(--muted-foreground, #999);
+	margin: 0 2px;
+}
+.pw-file-quick {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+}
+.pw-file-panes {
+	flex: 1;
+	display: flex;
+	min-height: 0;
+	margin-top: 8px;
+}
+.pw-file-list {
+	width: 30%;
+	min-width: 240px;
+	border-right: 1px solid var(--border, #e5e5e5);
+	overflow-y: auto;
+	padding-right: 4px;
+}
+.pw-file-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	width: 100%;
+	text-align: left;
+	appearance: none;
+	border: 0;
+	background: transparent;
+	color: inherit;
+	font: inherit;
+	padding: 7px 8px;
+	border-radius: 8px;
+	cursor: pointer;
+	min-width: 0;
+}
+.pw-file-row:hover {
+	background: var(--secondary, #f4f4f5);
+}
+.pw-file-row:disabled {
+	opacity: 0.5;
+	cursor: default;
+}
+.pw-file-sel {
+	border-left-color: var(--accent, #ccc); /* locator: "showing on the right" — no bg fight with checked */
+}
+.pw-file-icon {
+	flex-shrink: 0;
+	font-size: 14px;
+}
+.pw-file-main {
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+	flex: 1;
+}
+.pw-file-name {
+	font-size: 12px;
+	min-width: 0;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis; /* fallback — JS does middle-truncation (sonnet) */
+}
+.pw-file-attached {
+	color: #1a7f43;
+	font-weight: 600;
+}
+.pw-file-meta {
+	font-size: 11px;
+	color: var(--muted-foreground, #888);
+	font-variant-numeric: tabular-nums;
+}
+.pw-file-checkbox-col {
+	flex: 0 0 20px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+.pw-file-checkbox-col input[type="checkbox"] {
+	width: 14px;
+	height: 14px;
+	accent-color: var(--primary, #111);
+	cursor: pointer;
+	margin: 0;
+	opacity: 1; /* always visible — hover-reveal is a discoverability tax (sonnet) */
+}
+.pw-file-checked {
+	background: color-mix(in srgb, var(--accent, #ccc) 8%, transparent);
+}
+.pw-attach-bar {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 8px 16px;
+	border-top: 1px solid var(--border, #e5e5e5); /* attached toolbar, not a new surface (sonnet) */
+	background: var(--card, #fafafa);
+	flex-shrink: 0;
+}
+.pw-attach-count {
+	font-size: 12px;
+	font-weight: 600;
+	flex: 1;
+}
+
+/* syntax-highlighted code view: sticky gutter + highlighted block, no wrap
+   (wrap would desync gutter/code lines) */
+.pw-preview-codewrap {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	align-items: flex-start; /* CRITICAL: default stretch shrinks both <pre>s to the
+		viewport height — their text then overflows and the code paints over the
+		gutter below the first screen (user-reported line-number overlap) */
+	overflow: auto;
+	border: 1px solid var(--border, #e5e5e5);
+	border-radius: 10px;
+	background: var(--card, #fafafa);
+}
+.pw-code-gutter {
+	position: sticky;
+	left: 0;
+	z-index: 1; /* paint above the scrolling code text — user-reported overlap */
+	flex: none;
+	margin: 0;
+	padding: 10px 8px 10px 10px;
+	background: var(--card, #fafafa);
+	color: var(--muted-foreground, #888); /* resolved token, not opacity (sonnet) */
+	text-align: right;
+	user-select: none;
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 11px; /* meta tier — numbers are metadata, not content (sonnet) */
+	line-height: var(--code-line-h, 20px); /* pixel-identical to the code block */
+	border-right: 1px solid var(--border, #eee);
+}
+.pw-code-html {
+	flex: 1;
+	margin: 0;
+	padding: 10px 14px;
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 12px;
+	line-height: var(--code-line-h, 20px); /* must match the gutter exactly */
+	white-space: pre;
+	color: var(--foreground, #111);
+}
+.pw-preview-prose {
+	flex: 1;
+	min-height: 0;
+	overflow-y: auto;
+	margin: 0;
+	padding: 10px 12px;
+	border: 1px solid var(--border, #e5e5e5);
+	border-radius: 10px;
+	background: var(--background, #fff);
+	font-size: 14px;
+	line-height: 1.6;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+.pw-preview-empty {
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: 6px;
+	text-align: center;
+	padding: 20px;
+}
+.pw-preview-empty-title {
+	font-size: 12px;
+	font-weight: 600;
+	color: var(--muted-foreground, #888);
+}
+.pw-preview-empty-sub {
+	font-size: 11px;
+	color: var(--muted-foreground, #999);
+}
+.pw-file-preview {
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+	padding-left: 12px;
+}
+.pw-preview-head {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 4px 0 8px;
+	flex-shrink: 0;
+	min-width: 0;
+}
+.pw-preview-name {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 12.5px;
+	font-weight: 600;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	flex: 1;
+	min-width: 0;
+}
+.pw-preview-size {
+	font-size: 11px;
+	color: var(--muted-foreground, #888);
+	flex-shrink: 0;
+}
+.pw-preview-text {
+	flex: 1;
+	min-height: 0;
+	overflow: auto;
+	margin: 0;
+	padding: 10px 12px;
+	border: 1px solid var(--border, #e5e5e5);
+	border-radius: 10px;
+	background: var(--background, #fff);
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 12px;
+	line-height: 1.5;
+	white-space: pre;
+}
+.pw-preview-imgwrap {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	border: 1px solid var(--border, #e5e5e5);
+	border-radius: 10px;
+	/* theme-aware checkerboard for transparent images (sonnet) */
+	background-image:
+		linear-gradient(45deg, var(--checker-b) 25%, transparent 25%),
+		linear-gradient(-45deg, var(--checker-b) 25%, transparent 25%);
+	background-color: var(--checker-a);
+	background-size: 16px 16px;
+	overflow: hidden;
+}
+.pw-preview-img {
+	max-width: 100%;
+	max-height: 100%;
+	object-fit: contain;
+}
+@media (max-width: 760px) {
+	.pw-file-panes {
+		flex-direction: column;
+		overflow-y: auto;
+	}
+	.pw-file-list {
+		width: 100%;
+		min-width: 0;
+		max-height: 40%;
+		border-right: 0;
+		border-bottom: 1px solid var(--border, #e5e5e5);
+		padding-right: 0;
+	}
+	.pw-file-preview {
+		min-height: 260px;
+		padding-left: 0;
+		padding-top: 10px;
+	}
+}
+.pw-dialog-body {
+	overflow-y: auto;
+	padding: 10px 16px 16px;
+}
+.pw-empty {
+	color: var(--muted-foreground, #888);
+	font-size: 13px;
+	padding: 14px 4px;
+	text-align: center;
+}
+.pw-saved {
+	background: rgba(26, 158, 85, 0.1);
+	border: 1px solid rgba(26, 158, 85, 0.35);
+	color: #1a9e55;
+	font-size: 12.5px;
+	padding: 6px 10px;
+	border-radius: 8px;
+	margin-bottom: 8px;
+}
+
+/* model selector */
+.pw-model-group {
+	margin-bottom: 10px;
+}
+.pw-model-provider {
+	font-size: 11px;
+	font-weight: 700;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	color: var(--muted-foreground, #888);
+	padding: 6px 2px 3px;
+}
+.pw-model-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	width: 100%;
+	text-align: left;
+	appearance: none;
+	border: 0;
+	background: transparent;
+	color: inherit;
+	font: inherit;
+	padding: 8px 10px;
+	border-radius: 8px;
+	cursor: pointer;
+}
+.pw-model-row:hover {
+	background: var(--secondary, #f4f4f5);
+}
+.pw-model-row.pw-current {
+	background: var(--accent, #ececec);
+}
+.pw-model-id {
+	font-size: 13.5px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.pw-model-check {
+	color: #1a9e55;
+	font-weight: 700;
+}
+
+/* session list */
+.pw-session-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 9px 8px;
+	border-radius: 8px;
+	cursor: pointer;
+}
+.pw-session-row:hover {
+	background: var(--secondary, #f4f4f5);
+}
+.pw-session-main {
+	flex: 1;
+	min-width: 0;
+}
+.pw-session-title {
+	font-size: 13.5px;
+	font-weight: 500;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.pw-session-sub {
+	font-size: 11.5px;
+	color: var(--muted-foreground, #888);
+	margin-top: 2px;
+}
+.pw-session-delete {
+	appearance: none;
+	border: 0;
+	background: transparent;
+	color: var(--muted-foreground, #aaa);
+	cursor: pointer;
+	font-size: 12px;
+	padding: 5px 8px;
+	border-radius: 6px;
+	flex-shrink: 0;
+}
+.pw-session-delete:hover {
+	color: #e5484d;
+	background: rgba(229, 72, 77, 0.1);
+}
+
+/* settings */
+.pw-set-section {
+	padding: 10px 0;
+	border-bottom: 1px solid var(--border, #eee);
+}
+.pw-set-section:last-child {
+	border-bottom: 0;
+}
+.pw-set-section h3 {
+	margin: 0 0 8px;
+	font-size: 12px;
+	font-weight: 700;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	color: var(--muted-foreground, #888);
+}
+.pw-set-model {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	width: 100%;
+	appearance: none;
+	border: 1px solid var(--border, #ddd);
+	background: var(--card, #fafafa);
+	color: inherit;
+	font: inherit;
+	padding: 9px 12px;
+	border-radius: 9px;
+	cursor: pointer;
+	margin-bottom: 8px;
+}
+.pw-set-model:hover {
+	border-color: var(--ring, #999);
+}
+.pw-set-model .pw-model-provider {
+	padding: 0;
+	text-transform: none;
+	letter-spacing: 0;
+	font-weight: 400;
+}
+.pw-model-edit {
+	margin-left: auto;
+	font-size: 12px;
+	color: var(--muted-foreground, #888);
+}
+.pw-set-row {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	font-size: 13.5px;
+	padding: 4px 0;
+}
+.pw-set-select {
+	width: auto;
+	min-width: 130px;
+}
+.pw-set-input {
+	width: 100%;
+	margin-top: 6px;
+}
+.pw-keys-list {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	margin-bottom: 8px;
+}
+.pw-key-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	font-size: 13px;
+	padding: 3px 0;
+}
+.pw-key-name {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 12.5px;
+}
+.pw-key-has {
+	color: #1a9e55;
+	font-size: 12px;
+}
+.pw-key-input {
+	flex: 1;
+	margin: 0;
+}
+.pw-mini-btn {
+	appearance: none;
+	border: 1px solid var(--border, #ddd);
+	background: var(--card, #fafafa);
+	color: inherit;
+	font-size: 12px;
+	padding: 4px 10px;
+	border-radius: 7px;
+	cursor: pointer;
+	flex-shrink: 0;
+}
+.pw-mini-btn:hover {
+	border-color: var(--ring, #999);
+}
+.pw-hint {
+	font-size: 12px;
+	color: var(--muted-foreground, #888);
+	margin-top: 6px;
+	line-height: 1.4;
+}
+
+/* ---------- diagnostics FAB + drawer ---------- */
+.diag-fab {
+	position: fixed;
+	right: calc(10px + env(safe-area-inset-right));
+	bottom: calc(10px + env(safe-area-inset-bottom));
+	width: 34px;
+	height: 34px;
+	border-radius: 50%;
+	border: 2px solid var(--background, #fff);
+	color: #fff;
+	font-size: 13px;
+	font-weight: 700;
+	cursor: pointer;
+	z-index: 1100;
+	box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+}
+.diag-drawer {
+	position: fixed;
+	left: 0;
+	right: 0;
+	bottom: 0;
+	max-height: 70vh;
+	background: var(--background, #fff);
+	color: var(--foreground, #111);
+	border-top: 1px solid var(--border, #ccc);
+	z-index: 1101;
+	overflow-y: auto;
+	padding: 12px 14px calc(14px + env(safe-area-inset-bottom));
+	font-size: 12px;
+	box-shadow: 0 -8px 24px rgba(0,0,0,0.2);
+}
+.diag-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.diag-build { color: var(--muted-foreground, #888); font-size: 11px; flex: 1; }
+.diag-close { border: 0; background: transparent; color: inherit; font-size: 14px; cursor: pointer; }
+.diag-copy { width: 100%; padding: 10px; border-radius: 8px; border: 0; background: var(--primary, #111); color: var(--primary-foreground, #fff); font-size: 14px; font-weight: 600; cursor: pointer; margin-bottom: 8px; }
+.diag-server { margin-bottom: 8px; word-break: break-all; color: var(--muted-foreground, #666); }
+.diag-filters { display: flex; gap: 6px; margin-bottom: 6px; }
+.diag-filters button { padding: 4px 10px; border-radius: 99px; border: 1px solid var(--border, #ccc); background: transparent; color: inherit; font-size: 11px; cursor: pointer; }
+.diag-filters button.on { background: var(--primary, #111); color: var(--primary-foreground, #fff); }
+.diag-log { max-height: 40vh; overflow-y: auto; }
+.diag-entry { padding: 3px 0; border-bottom: 1px solid var(--border, #eee); word-break: break-all; display: flex; gap: 6px; }
+.diag-entry .lv { font-weight: 700; width: 14px; }
+.diag-entry.error .lv, .diag-entry.warn .lv { color: #e5484d; }
+.diag-entry .src { color: var(--muted-foreground, #888); min-width: 60px; }
+.diag-entry .data { color: var(--muted-foreground, #999); }
+
+/* ---------- terminal dock (wterm renderer + winpty backend, NO node-pty) ----------
+   wterm (@wterm/dom, CDN) reads the --term-* custom properties below; the app
+   theme (html.dark) cascades onto the host, so the terminal follows the theme
+   without JS. terminal.css itself is fetched once from jsDelivr and cached in
+   localStorage (see src/ui/terminal.tsx). */
+.pw-term-dock {
+	flex-shrink: 0;
+	display: flex;
+	flex-direction: column;
+	min-height: 0;
+	position: relative;
+	border-top: 1px solid var(--border, #e5e5e5);
+	background: var(--card, #fafafa);
+}
+.pw-term-grip {
+	flex: none;
+	height: 7px;
+	cursor: ns-resize;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	touch-action: none; /* pointermove drag on touch */
+}
+.pw-term-grip span {
+	width: 42px;
+	height: 3px;
+	border-radius: 3px;
+	background: var(--border, #ccc);
+}
+.pw-term-grip:hover span {
+	background: var(--muted-foreground, #999);
+}
+.pw-term-head {
+	flex: none;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 3px 10px 5px;
+	font-size: 11px;
+	color: var(--muted-foreground, #888);
+	min-width: 0;
+}
+.pw-term-dot {
+	width: 7px;
+	height: 7px;
+	border-radius: 50%;
+	flex: none;
+}
+.pw-dot-ok { background: var(--stat-ok, #1a7f43); }
+.pw-dot-error { background: var(--stat-danger, #b91c1c); }
+.pw-dot-wait {
+	background: var(--muted-foreground, #999);
+	animation: pw-pulse 1.2s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+	.pw-dot-wait { animation: none; }
+}
+.pw-term-status {
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	min-width: 0;
+}
+.pw-term-cwd {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 10.5px;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	max-width: 30%;
+	min-width: 0;
+}
+.pw-term-exit {
+	font-variant-numeric: tabular-nums;
+	color: var(--stat-ok, #1a7f43);
+	flex: none;
+}
+.pw-term-exit-bad {
+	color: var(--stat-danger, #b91c1c);
+	font-weight: 600;
+}
+.pw-term-spacer {
+	flex: 1 1 auto;
+	min-width: 8px;
+}
+.pw-term-head .pw-mini-btn {
+	padding: 2px 8px;
+	font-size: 11px;
+	flex-shrink: 0;
+}
+.pw-term-host {
+	flex: 1 1 auto;
+	min-height: 0;
+	overflow: hidden; /* the emulator scrolls internally */
+	padding: 0 10px 8px;
+}
+/* wterm theme mapped to app tokens. NOTE: wterm adds the "wterm" class TO THE
+   ELEMENT WE PASS (our host) — so theme vars must target .pw-term-host.wterm.
+   GEOMETRY INTENTIONALLY NOT SET HERE (no height/padding/border/shadow): the
+   host is sized by flex and terminal.css's own padding/box-shadow are the
+   known-good look — setting them broke the composer layout (user report:
+   white gap right of the scrollbar, composer pushed off-screen). */
+.pw-term-host.wterm {
+	--term-fg: #24292f;
+	--term-bg: #ffffff;
+	--term-cursor: #24292f;
+	--term-font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	--term-font-size: 12.5px;
+	--term-line-height: 1.35;
+	--term-color-0: #24292f; --term-color-1: #cf222e; --term-color-2: #116329; --term-color-3: #9a6700;
+	--term-color-4: #0969da; --term-color-5: #8250df; --term-color-6: #1b7c83; --term-color-7: #6e7781;
+	--term-color-8: #57606a; --term-color-9: #a40e26; --term-color-10: #1a7f37; --term-color-11: #9a6700;
+	--term-color-12: #0969da; --term-color-13: #8250df; --term-color-14: #1b7c83; --term-color-15: #ffffff;
+	--term-selection-bg: color-mix(in srgb, #0969da 22%, transparent);
+}
+/* narrow screens: a smaller cell = more columns (a too-wide prompt was one
+   cause of mobile readline redraw glitches; the prompt is also adaptive in
+   the rc). NOTE: wterm's own padding is left alone — its cell probe measures
+   the live DOM and we don't want to re-sync it mid-cascade (sonnet r4) */
+@media (max-width: 640px) {
+	.pw-term-host {
+		padding: 0 6px 6px;
+	}
+	.pw-term-host.wterm {
+		--term-font-size: 11px;
+	}
+}
+html.dark .pw-term-host.wterm {
+	--term-fg: #d6d6d6;
+	--term-bg: #16181b;
+	--term-cursor: #d6d6d6;
+	--term-color-0: #2f3336; --term-color-1: #ff7b72; --term-color-2: #7ee787; --term-color-3: #e3b341;
+	--term-color-4: #79c0ff; --term-color-5: #d2a8ff; --term-color-6: #56d4dd; --term-color-7: #d6d6d6;
+	--term-color-8: #6e7681; --term-color-9: #ffa198; --term-color-10: #56d364; --term-color-11: #e3b341;
+	--term-color-12: #79c0ff; --term-color-13: #d2a8ff; --term-color-14: #39c5cf; --term-color-15: #ffffff;
+	--term-selection-bg: color-mix(in srgb, #79c0ff 25%, transparent);
+}
+.pw-term-veil {
+	position: absolute;
+	inset: 26px 10px 8px;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: 6px;
+	background: var(--card, #fafafa);
+	text-align: center;
+	padding: 12px;
+}
+.pw-term-veil-title {
+	font-size: 12.5px;
+	font-weight: 600;
+	color: var(--foreground, #111);
+}
+.pw-term-veil-sub {
+	font-size: 11.5px;
+	color: var(--muted-foreground, #888);
+}
+/* mobile command entry: streams each char to the shell by diffing the field
+   value — bypasses wterm's compose-per-word touch overlay (IME underline in
+   the terminal + Tab needing space+backspace first). 16px = iOS zoom guard. */
+.pw-term-entry {
+	flex: none;
+	display: flex;
+	padding: 0 10px 6px;
+}
+.pw-term-entry-input {
+	flex: 1 1 auto;
+	min-width: 0;
+	appearance: none;
+	border: 1px solid var(--border, #e5e5e5);
+	background: var(--background, #fff);
+	color: var(--foreground, #111);
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 16px; /* iOS focus zoom guard */
+	line-height: 1.2;
+	padding: 8px 10px;
+	border-radius: 8px;
+	outline: none;
+}
+.pw-term-entry-input:focus {
+	border-color: var(--ring, #999);
+}
+.pw-term-entry-input::placeholder {
+	color: var(--muted-foreground, #999);
+}
+/* mobile key strip: touch keyboards lack arrows/Tab/Esc/Paste — visibility is
+   JS-driven (terminal.tsx keysOn: desktop hidden by default, "Keys" toggle in
+   the head, persisted); no media query so the dock can grow to fit when shown */
+.pw-term-keys {
+	flex: none;
+	align-items: center;
+	gap: 6px;
+	padding: 0 10px 6px;
+	overflow-x: auto;
+	overscroll-behavior-x: contain; /* edge scroll must not rubber-band the page */
+}
+.pw-term-key {
+	appearance: none;
+	border: 1px solid var(--border, #ddd);
+	background: var(--secondary, #f4f4f5);
+	color: var(--foreground, #111);
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 13px;
+	line-height: 1;
+	min-width: 44px; /* touch target minimum (iOS HIG / Material) */
+	height: 44px;
+	padding: 0 12px;
+	border-radius: 8px;
+	cursor: pointer;
+	flex-shrink: 0;
+	user-select: none;
+	-webkit-user-select: none;
+	touch-action: manipulation; /* no double-tap zoom delay */
+}
+.pw-term-key:active {
+	background: var(--accent, #ececec);
+	transform: translateY(0.5px);
+}
+.pw-term-key:disabled {
+	opacity: 0.45;
+	cursor: default;
+}
+.pw-term-key:focus-visible {
+	outline: none;
+	box-shadow: 0 0 0 2px var(--card, #fff), 0 0 0 4px var(--ring, #bbb);
+}
+/* "↗ terminal" affordance on bash tool rows */
+.pw-tool-termrow {
+	display: flex;
+}
+.pw-tool-termrow .pw-mini-btn {
+	font-size: 11px;
+}

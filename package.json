@@ -1,0 +1,45 @@
+{
+  "name": "pi-web-ui-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Web UI for pi based on official @earendil-works/pi-web-ui dist (Preact shell, nvidia-only provider build)",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "start": "node server.mjs",
+    "dev": "node build.mjs && node server.mjs",
+    "typecheck": "tsc --noEmit",
+    "build:debug": "node build.mjs --debug",
+    "start:debug": "node build.mjs --debug && node server.mjs"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.75.3",
+    "@earendil-works/pi-ai": "0.75.3",
+    "@hono/node-server": "^1.13.7",
+    "diff": "^8.0.4",
+    "dompurify": "^3.4.17",
+    "hono": "^4.6.14",
+    "highlight.js": "^11.10.0",
+    "marked": "^18.1.1",
+    "preact": "^10.27.2",
+    "undici": "^8.12.2",
+    "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "@types/dompurify": "^3.0.5",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.3"
+  },
+  "overrides": {
+    "@anthropic-ai/sdk": "file:stubs/empty",
+    "@aws-sdk/client-bedrock-runtime": "file:stubs/empty",
+    "@google/genai": "file:stubs/empty",
+    "@mistralai/mistralai": "file:stubs/empty",
+    "@lmstudio/sdk": "file:stubs/empty",
+    "ollama": "file:stubs/empty"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true
+  }
+}
