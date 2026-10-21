@@ -16,6 +16,17 @@ See [architecture.md](architecture.md) for the module map and trust-boundary sum
   logs, Referer and history; only the WS upgrade path actually needs it.
 - `tokenMatches()`: length check + `crypto.timingSafeEqual` (timing-safe).
 - `authorized()`: loopback OR token. Loopback = remoteAddress `127.0.0.1` / `::1` / `::ffff:127.0.0.1`.
+- **Browser-origin gate (2026-10-21, r2 after re-review, DNS-rebinding defense)**: `ALLOWED_HOSTS`
+  (localhost, 127.0.0.1, [::1], `os.hostname()`, ALL non-internal interfaces — IPv4 AND bracketed IPv6,
+  zone ids stripped, `PI_WEB_TERM_ORIGIN` extras with scheme stripped + bare IPv6 bracket-wrapped — all
+  lowercased `host:port`) + `browserOriginAllowed(req)` require the `Host` header AND the `Origin`
+  header (when present) to be allowlisted. `headerHostAllowed` NORMALIZES: FQDN trailing dot stripped,
+  portless Host (browsers omit :80/:443) gets `:PORT` appended before the lookup. Applied by middleware
+  to **every `/api/*` route except `/api/health`** (r2: the original prefix list left
+  `/api/agent/session/:id` — which returns message BODIES — un-gated), and at upgrade to `/ws/sync` +
+  `/ws/agent` (a missing Origin = non-browser client → token gate only). `TERM_ALLOWED_ORIGINS =
+  ALLOWED_HOSTS` (shared with the terminal hub). Rationale: loopback trust is not a browser boundary —
+  a rebinding or `*.nip.io` hostname makes an attacker page same-origin over a loopback socket.
 - Middleware (first `app.use`): 401 for any `/api/*` except `/api/health` when not authorized; logs
   every `/api/*` request (errors to console.error always, successes only in debug).
 
@@ -27,7 +38,7 @@ See [architecture.md](architecture.md) for the module map and trust-boundary sum
 | `GET /api/version` | blanket | same ids |
 | `GET /api/pi/config` | blanket | re-reads `.pi/models-store.json` + `settings.json` → providers with models, defaults |
 | `GET /api/pi/system` | blanket | system-prompt resolution (below) |
-| `GET /api/pi/keys` | blanket | **returns ALL provider keys from `.pi/auth.json`** |
+| `GET /api/pi/keys` | **always token** (2026-10-21) | **returns ALL provider keys from `.pi/auth.json`** — strongest secrets oracle; no client call path uses it |
 | `POST /api/pi/key` | blanket + env-TOKEN check | `{provider}` → that provider's key |
 | `GET /api/sessions` | blanket | worker `list` (metadata only), 1s-cached (`listCached`) |
 | `POST /api/sessions` | blanket | returns a fresh `crypto.randomUUID()` (creates nothing) |
@@ -146,12 +157,23 @@ kept last 50, amended after execution, exposed via `/api/debug/state`.
 ## LLM proxy (`/api/proxy`)
 
 `buildTarget()`: `?url=` (optionally + path suffix after the mount), decoded once. Protocol allowlist
-http/https. Origin check: `origin === new URL(c.req.url).origin` (Host-derived — see quirks).
+http/https. **SSRF guard (`proxyTargetBlocked` + `dottedFromInet`)**: rejects hostnames that are/become
+private, loopback, link-local (incl. cloud metadata 169.254.169.254), CGNAT, benchmark 198.18/15,
+multicast/reserved, `localhost`/`*.local`/`*.internal` — including **inet_aton forms** (`127.1`,
+`2130706433`, `0177.0.0.1`, `0x7f.1`), **IPv4-mapped IPv6** in all spellings (`::ffff:127.0.0.1`,
+`0:0:0:0:0:ffff:127.0.0.1`, `::ffff:7f00:1`), expanded IPv6 loopback/unspecified, and FQDN trailing
+dots — applied to the initial target AND every redirect hop. Origin check: `origin ===
+new URL(c.req.url).origin` (Host-derived — kept as depth; the middleware browser-origin gate is the
+primary boundary now).
 `linkAborts()`: client `req.raw.signal` + incoming `aborted` + outgoing premature `close` → one
 AbortController. `passRequestHeaders()` drops hop-by-hop + `cookie` + `x-pi-web-token` + others, forces
 `accept-encoding: identity`. Body buffered via `c.req.arrayBuffer()` (≤25MB per `MAX_INBOUND`).
 `undiciFetch` with a pinned `UndiciAgent` (16 connections, pipelining 1, keepAlive 30s, connect
-timeout 30s, **headersTimeout/bodyTimeout 0** so SSE can stream forever).
+timeout 30s, **headersTimeout/bodyTimeout 0** so SSE can stream forever). **Redirects are followed
+MANUALLY** (max 5 hops): each hop re-applies the protocol allowlist + `proxyTargetBlocked`, and a
+**cross-host hop strips `Authorization`** from the forwarded headers (spec-fetch behavior; the proxy
+otherwise forwards caller auth to the first hop BY DESIGN — that is how provider keys reach the
+upstream). 303 (and 301/302 on POST) downgrade to GET without a body.
 `pinAndPipe()`: manual `ReadableStream` pulling `upstream.body`; **stall watchdog** every 5s — no bytes
 for `PROXY_IDLE_MS` (150s) → `reader.cancel` + `controller.error("upstream stalled")`; abort → cancel +
 close. `passResponseHeaders()` drops `set-cookie` etc., forces `no-cache, no-transform` +
@@ -181,7 +203,10 @@ pong). Inbound (`MAX_INBOUND` size guard): `list` (1s cache), `put` (id regex; a
 or the browser's legacy `{data:{messages...}, metadata}` — converted line-by-line, counted in
 `legacySyncPuts` for shim removal), `get` (returns `{jsonl, metadata, data:{messages}}`), `watch`
 (add + immediate `pushWatched`), `delete`. After put: `broadcastSessions()` (300ms-coalesced,
-invalidates `listCache`) + `pushWatched(id)` to watchers (backpressure-aware via `MAX_BUFFERED` 4MB).
+invalidates `listCache`) + `pushWatched(id)` to watchers — same body shape as the explicit `get`
+branch (`{type:"session", id, data:{messages}, metadata, jsonl}`; before 2026-10-21 `pushWatched`
+serialized `data: j.data` which was undefined, so watched updates carried NO body). Backpressure-aware
+via `MAX_BUFFERED` 4MB.
 
 ## Server-side agent hub (`agent-hub.mjs`, non-default path)
 
@@ -197,5 +222,10 @@ HOT_AGENT_CAP+5; `flushAll()` on shutdown (note: no SIGINT wiring in server.mjs 
 ## Upgrade routing (`serve().on("upgrade")`)
 
 1. Non-loopback without token → 401 + destroy.
-2. Path dispatch: `/ws/sync` and `/ws/agent` → shared 25MB-maxPayload WSS; `/ws/terminal` →
-   `terminalHub.handleUpgrade()` (its own size-capped WSS + Origin allowlist); anything else destroyed.
+2. **Browser-origin gate for `/ws/sync` + `/ws/agent` (2026-10-21)**: browsers ALWAYS send Origin on WS
+   handshakes (WS has no CORS) — a present Origin must be in `ALLOWED_HOSTS` even from loopback
+   (rebinding presents an attacker Origin over a loopback socket); a MISSING Origin = non-browser
+   client and keeps the token-gate behavior.
+3. Path dispatch: `/ws/sync` and `/ws/agent` → shared 25MB-maxPayload WSS; `/ws/terminal` →
+   `terminalHub.handleUpgrade()` (its own size-capped WSS + Origin allowlist, missing Origin allowed
+   only for loopback); anything else destroyed.

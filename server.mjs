@@ -113,6 +113,63 @@ function authorized(req) {
 	return isLoopback(req) || (AUTH_TOKEN && tokenMatches(req));
 }
 
+// --- browser-origin allowlist (DNS-rebinding defense) ------------------------
+// Loopback-trust alone is not a browser boundary: a rebinding hostname (or a
+// public DNS name that already points at 127.0.0.1, e.g. *.nip.io / localtest.me)
+// makes an attacker page SAME-ORIGIN with this server while the socket is
+// loopback — every loopback-exempt route becomes readable. Fix: privileged
+// routes require BOTH the Host header AND the Origin header (when the browser
+// sends one) to name a host this server is ACTUALLY reachable on. The same set
+// backs the /ws/sync + /ws/agent upgrade gates and the terminal hub. Custom DNS
+// names / reverse proxies: add them via PI_WEB_TERM_ORIGIN.
+const ALLOWED_HOSTS = new Set();
+(function buildAllowedHosts() {
+	const port = String(PORT);
+	const add = (h) => ALLOWED_HOSTS.add(`${String(h).toLowerCase()}:${port}`);
+	add("localhost");
+	add("127.0.0.1");
+	add("[::1]");
+	try { add(os.hostname()); } catch { /* hostname unavailable */ }
+	try {
+		for (const n of Object.values(os.networkInterfaces()).flat()) {
+			if (!n || n.internal || !n.address) continue;
+			const fam = String(n.family); // Node historically: "IPv4"/"IPv6" (older: 4/6)
+			const addr = String(n.address).split("%")[0]; // strip IPv6 zone id
+			if (fam === "IPv4" || fam === "4") add(addr);
+			else if (fam === "IPv6" || fam === "6") add(`[${addr}]`);
+		}
+	} catch { /* ignore */ }
+	// extra names (reverse proxy, custom DNS) — host or host:port, comma-separated
+	// (scheme stripped, bare IPv6 bracket-wrapped — "http://box.local/" must match)
+	for (const extra of (process.env.PI_WEB_TERM_ORIGIN || "").split(",")) {
+		let v = extra.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/+$/, "");
+		if (!v) continue;
+		const isV6 = !v.includes("]") && (v.match(/:/g) || []).length > 1;
+		if (isV6) v = `[${v}]`;
+		const hasPort = isV6 ? v.includes("]:") : v.includes(":");
+		ALLOWED_HOSTS.add(hasPort ? v : `${v}:${port}`);
+	}
+})();
+function headerHostAllowed(hostHeader) {
+	let h = String(hostHeader || "").toLowerCase().trim();
+	if (!h) return false;
+	h = h.replace(/\.+$/, ""); // FQDN trailing dot: "localhost." → "localhost"
+	// portless Host (browsers omit :80/:443): normalize to host:PORT before the set lookup
+	if (/^\[[^\]]+\]$/.test(h)) h = `${h}:${PORT}`; // bracketed IPv6 without port
+	else if (!h.includes(":")) h = `${h}:${PORT}`;
+	return ALLOWED_HOSTS.has(h);
+}
+// Privileged scope (2026-10-21 r2): EVERY /api/* route except /api/health — a rebound page may not
+// read session content via un-gated GETs either (/api/agent/session/:id returns message bodies).
+function browserOriginAllowed(req) {
+	if (!headerHostAllowed(req?.headers?.host)) return false; // rebinding/nip.io Host fails here
+	const origin = req?.headers?.origin;
+	if (!origin) return true; // non-browser — token gate still applies where required
+	let oh = null;
+	try { oh = new URL(origin).host.toLowerCase(); } catch { return false; } // malformed Origin
+	return !!oh && ALLOWED_HOSTS.has(oh);
+}
+
 // --- MIME types -------------------------------------------------------------
 const MIME = {
 	".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
@@ -129,6 +186,17 @@ app.use("*", async (c, next) => {
 	// (health is exempt — it only reports build/uptime, no secrets)
 	if (c.req.path.startsWith("/api/") && c.req.path !== "/api/health" && !authorized(c.env?.incoming)) {
 		return c.json({ error: "unauthorized — set x-pi-web-token (see data/auth-token.txt)" }, 401);
+	}
+	// browser-origin gate for privileged routes (DNS-rebinding defense — see
+	// browserOriginAllowed above): Host and Origin must be allowlisted even for
+	// loopback peers. Runs AFTER the token gate: a valid non-loopback token holder
+	// still needs a real Host.
+	if (
+		c.req.path.startsWith("/api/") &&
+		c.req.path !== "/api/health" &&
+		!browserOriginAllowed(c.env?.incoming)
+	) {
+		return c.json({ error: "forbidden — Host/Origin not allowlisted for /api/* routes (custom names: PI_WEB_TERM_ORIGIN)" }, 403);
 	}
 	const start = Date.now();
 	await next();
@@ -1006,6 +1074,14 @@ app.post("/api/exec/tool", async (c) => {
 loadPiExtensions();
 
 app.get("/api/pi/keys", (c) => {
+	// ALWAYS token-required (P1): this single endpoint dumps EVERY provider key in
+	// auth.json — the strongest secrets oracle in the stack. No client call path
+	// uses it (the browser resolves keys via POST /api/pi/key per provider); the
+	// browser-origin gate above already blocks rebinding pages, the token closes
+	// the loopback drive-by case too.
+	if (!tokenMatches(c.env?.incoming)) {
+		return c.json({ error: "unauthorized — /api/pi/keys needs x-pi-web-token (see data/auth-token.txt)" }, 401);
+	}
 	const auth = readJsonSafe("auth.json") || {};
 	const out = {};
 	for (const [p, e] of Object.entries(auth)) { const k = typeof e === "string" ? e : e?.key; if (k) out[p] = k; }
@@ -1120,22 +1196,125 @@ function pinAndPipe(upstream, ac) {
 	});
 }
 
+// inet_aton semantics: "2130706433" · "127.1" · "127.0.0.1" · "0177.0.0.1" · "0x7f.1" —
+// all name 127.0.0.1 to the OS resolver; normalize before the range checks
+function dottedFromInet(parts) {
+	if (!parts.length || parts.length > 4) return null;
+	const nums = parts.map((p) => {
+		if (/^0[xX][0-9a-fA-F]+$/.test(p)) return parseInt(p, 16);
+		if (p.length > 1 && p[0] === "0" && /^[0-7]+$/.test(p)) return parseInt(p.slice(1), 8);
+		if (!/^\d+$/.test(p)) return NaN;
+		return parseInt(p, 10);
+	});
+	if (nums.some((n) => !Number.isFinite(n) || n < 0)) return null;
+	if (parts.length === 4) return nums.every((n) => n <= 255) ? nums.join(".") : null;
+	const last = nums[nums.length - 1];
+	const head = nums.slice(0, -1);
+	if (head.some((n) => n > 255)) return null;
+	if (parts.length === 1) return last <= 0xffffffff ? `${(last >>> 24) & 255}.${(last >>> 16) & 255}.${(last >>> 8) & 255}.${last & 255}` : null;
+	if (parts.length === 2) return last <= 0xffffff ? [head[0], (last >>> 16) & 255, (last >>> 8) & 255, last & 255].join(".") : null;
+	return last <= 0xffff ? [...head, (last >>> 8) & 255, last & 255].join(".") : null;
+}
+
+// SSRF guard: block destinations that name the server's own or private networks
+// (metadata endpoints, loopback CDP on :9222, LAN hosts). Hostname-pattern based
+// — a DNS name re-resolving to an internal IP is still possible in theory; the
+// browser-origin gate above is the primary boundary, this is depth.
+function proxyTargetBlocked(hostname) {
+	const h = String(hostname || "").toLowerCase().replace(/^\[|\]$/g, "").replace(/\.+$/, ""); // brackets + FQDN trailing dot
+	if (!h) return true;
+	if (h === "localhost" || h.endsWith(".localhost") || h.endsWith(".local") || h.endsWith(".internal")) return true;
+	function ipv4Blocked(a, b) { // shared by dotted-quad + inet_aton normalizations
+		return (
+			a === 0 || a === 10 || a === 127 ||
+			(a === 100 && b >= 64 && b <= 127) || // CGNAT 100.64/10
+			(a === 169 && b === 254) || // link-local / cloud metadata
+			(a === 172 && b >= 16 && b <= 31) || // RFC1918 private
+			(a === 192 && b === 168) || // RFC1918 private
+			(a === 192 && b === 0) || // reserved
+			(a === 198 && (b === 18 || b === 19)) || // benchmark 198.18/15
+			a >= 224 // multicast 224/4 + reserved 240/4
+		);
+	}
+	if (/^[0-9.]+$/.test(h)) { // inet_aton forms ("127.1", "2130706433", "0177.0.0.1")
+		const d = dottedFromInet(h.split("."));
+		if (d) {
+			const [a, b] = d.split(".").map(Number);
+			return ipv4Blocked(a, b); // canonical quad — do NOT recurse (it re-matches this branch)
+		}
+	}
+	if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) {
+		const [a, b] = h.split(".").map(Number);
+		return ipv4Blocked(a, b);
+	}
+	if (h.includes(":")) { // IPv6 literal
+		// IPv4-mapped: "::ffff:127.0.0.1" · "0:0:0:0:0:ffff:127.0.0.1" · "::ffff:7f00:1"
+		const v4d = h.match(/^(?:::ffff:|(?:0{1,4}:){5}ffff:)(\d{1,3}(?:\.\d{1,3}){3})$/i);
+		if (v4d) {
+			const [a, b] = v4d[1].split(".").map(Number);
+			return ipv4Blocked(a, b); // mapped dotted — evaluate inline, no recursion
+		}
+		const v4h = h.match(/^(?:::ffff:|(?:0{1,4}:){5}ffff:)([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+		if (v4h) {
+			const a = parseInt(v4h[1], 16), b = parseInt(v4h[2], 16);
+			return proxyTargetBlocked(`${(a >>> 8) & 255}.${a & 255}.${(b >>> 8) & 255}.${b & 255}`);
+		}
+		const groups = h.split(":");
+		if (groups.length === 8) { // expanded "::" / "::1" ("0:0:0:0:0:0:0:1" etc.)
+			const norm = groups.map((g) => g.padStart(4, "0")).join(":");
+			if (norm === "0000:0000:0000:0000:0000:0000:0000:0000" || norm === "0000:0000:0000:0000:0000:0000:0000:0001") return true;
+		}
+		if (h === "::" || h === "::1") return true;
+		if (/^f[cd]/.test(h)) return true; // fc00::/7 unique-local
+		if (/^fe[89ab]/.test(h)) return true; // fe80::/10 link-local
+	}
+	return false;
+}
+
 async function handleProxy(c) {
 	const target = buildTarget(c.req.url, c.req.path);
 	if (!target) return c.json({ error: "missing ?url=" }, 400);
 	let parsed;
 	try { parsed = new URL(target); } catch { return c.json({ error: "invalid url" }, 400); }
 	if (!["http:", "https:"].includes(parsed.protocol)) return c.json({ error: "bad protocol" }, 400);
+	if (proxyTargetBlocked(parsed.hostname)) return c.json({ error: "blocked proxy target (private/loopback/link-local)" }, 403);
 	const origin = c.req.header("origin");
 	if (origin && origin !== new URL(c.req.url).origin) return c.json({ error: "cross-origin forbidden" }, 403);
 
 	const ac = linkAborts(c);
-	const init = { method: c.req.method, headers: passRequestHeaders(c.req.raw.headers), redirect: "follow", signal: ac.signal, dispatcher: llmAgent };
+	let init = { method: c.req.method, headers: passRequestHeaders(c.req.raw.headers), redirect: "manual", signal: ac.signal, dispatcher: llmAgent };
 	if (!["GET", "HEAD"].includes(c.req.method)) init.body = await c.req.arrayBuffer();
 
-	let upstream;
-	try { upstream = await undiciFetch(parsed.toString(), init); }
-	catch (err) { if (ac.signal.aborted) return new Response(null, { status: 499 }); return c.json({ error: err.message }, 502); }
+	// manual redirect loop: re-apply the protocol + SSRF checks on EVERY hop — a
+	// public URL must not be able to redirect into the private network (with
+	// redirect:"follow" undici hopped for us, unvalidated)
+	let currentUrl = parsed.toString();
+	let upstream = null;
+	for (let hop = 0; hop < 6; hop++) {
+		try { upstream = await undiciFetch(currentUrl, init); }
+		catch (err) { if (ac.signal.aborted) return new Response(null, { status: 499 }); return c.json({ error: err.message }, 502); }
+		const loc = upstream.status >= 300 && upstream.status < 400 ? upstream.headers.get("location") : null;
+		if (loc) {
+			if (hop === 5) return c.json({ error: "too many redirects" }, 502);
+			let next;
+			try { next = new URL(loc, currentUrl); } catch { return c.json({ error: "bad redirect location" }, 502); }
+			if (!["http:", "https:"].includes(next.protocol)) return c.json({ error: "bad protocol" }, 403);
+			if (proxyTargetBlocked(next.hostname)) return c.json({ error: "blocked redirect target (private/loopback/link-local)" }, 403);
+			if (next.host !== new URL(currentUrl).host) {
+				// cross-origin redirect: drop caller credentials (spec fetch would too)
+				const hd = new Headers(init.headers);
+				hd.delete("authorization");
+				init = { ...init, headers: hd };
+			}
+			// 303 always becomes GET; 301/302 turn non-GET into GET (browser behavior)
+			if (upstream.status === 303 || ((upstream.status === 301 || upstream.status === 302) && !["GET", "HEAD"].includes(init.method))) {
+				init = { ...init, method: "GET", body: undefined };
+			}
+			currentUrl = next.toString();
+			continue;
+		}
+		break;
+	}
 
 	const pinned = pinAndPipe(upstream, ac);
 	if (!pinned) return new Response(null, { status: upstream.status, headers: passResponseHeaders(upstream.headers) });
@@ -1218,29 +1397,12 @@ const wss = new WebSocketServer({ noServer: true, maxPayload: 25 * 1024 * 1024 }
 // pipes. /ws/terminal security: non-loopback token gate (upgrade handler above
 // this file's dispatch) + strict Origin allowlist inside the hub.
 
-// Origin allowlist for the terminal WS: WS has no CORS, and matching against
-// the Host header would NOT stop DNS-rebinding (attacker.com rebinds to
+// Origin allowlist for the terminal WS (SHARED with the HTTP browser-origin
+// gate — built once above as ALLOWED_HOSTS): WS has no CORS, and matching
+// against the Host header would NOT stop DNS-rebinding (attacker.com rebinds to
 // 127.0.0.1, Host stays attacker.com — equal Origin+Host, game over). Compare
 // against the hosts this server is ACTUALLY reachable on instead.
-const TERM_ALLOWED_ORIGINS = new Set();
-(function buildTermOrigins() {
-	const port = String(PORT);
-	const add = (h) => TERM_ALLOWED_ORIGINS.add(`${String(h).toLowerCase()}:${port}`);
-	add("localhost");
-	add("127.0.0.1");
-	add("[::1]");
-	try { add(os.hostname()); } catch { /* hostname unavailable */ }
-	try {
-		for (const n of Object.values(os.networkInterfaces()).flat()) {
-			if (n && n.family === "IPv4" && n.address && !n.internal) add(n.address);
-		}
-	} catch { /* ignore */ }
-	// extra names (reverse proxy, custom DNS) — host or host:port, comma-separated
-	for (const extra of (process.env.PI_WEB_TERM_ORIGIN || "").split(",")) {
-		const v = extra.trim().toLowerCase();
-		if (v) TERM_ALLOWED_ORIGINS.add(v.includes(":") ? v : `${v}:${port}`);
-	}
-})();
+const TERM_ALLOWED_ORIGINS = ALLOWED_HOSTS;
 
 const terminalHub = createTerminalHub({
 	workspaceDir: WORKSPACE_DIR,
@@ -1284,7 +1446,10 @@ async function broadcastSessions() {
 async function pushWatched(id) {
 	const j = await storeOp("get", { id });
 	if (!j) return;
-	const payload = JSON.stringify({ type: "session", id, data: j.data, metadata: j.metadata });
+	// same shape as the explicit "get" branch: the worker returns
+	// {jsonl, metadata, messages} — the old `data: j.data` was undefined, so
+	// watched-session notifications carried NO body (P2 fix)
+	const payload = JSON.stringify({ type: "session", id, data: { messages: j.messages }, metadata: j.metadata, jsonl: j.jsonl });
 	for (const c of syncClients) {
 		if (c.watch.has(id) && c.ws.readyState === 1 && c.ws.bufferedAmount <= MAX_BUFFERED) c.ws.send(payload);
 	}
@@ -1559,6 +1724,16 @@ serve({ fetch: app.fetch, port: PORT, hostname: HOST }, (info) => {
 	const { pathname } = new URL(req.url, "http://localhost");
 	// /ws/* carries session metadata + agent streams — token-gate non-loopback peers
 	if (!isLoopback(req) && !authorized(req)) { socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n"); socket.destroy(); return; }
+	// browser-origin allowlist for sync/agent (P1): browsers ALWAYS send Origin on
+	// WS handshakes and WS has no CORS — a rebinding page presents an attacker
+	// Origin over a loopback socket (token-gated paths never fire for loopback).
+	// Missing Origin = non-browser client: allowed (the token gate above still
+	// applies to non-loopback peers). /ws/terminal does its own stricter check.
+	if ((pathname === "/ws/sync" || pathname === "/ws/agent") && req.headers.origin) {
+		let oh = null;
+		try { oh = new URL(String(req.headers.origin)).host.toLowerCase(); } catch { oh = null; }
+		if (!oh || !ALLOWED_HOSTS.has(oh)) { socket.write("HTTP/1.1 403 Forbidden\r\n\r\n"); socket.destroy(); return; }
+	}
 	if (pathname === "/ws/sync") wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 	else if (pathname === "/ws/agent") wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 	else if (pathname === "/ws/terminal") {

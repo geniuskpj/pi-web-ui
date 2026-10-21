@@ -27,6 +27,7 @@ export class AgentHub {
 		this.persist = persist; // async (id, data, metadata) — worker store (atomic)
 		this.broadcast = broadcast; // (sessionId, msg) — send to attached clients
 		this.sessions = new Map(); // sessionId -> entry
+		this.subscribers = new Map(); // sessionId -> Set<SSE callbacks> — stable fan-out, NEVER a broadcast swap
 	}
 
 	_getModel(modelId) {
@@ -70,6 +71,7 @@ export class AgentHub {
 				thinkingLevel: level,
 				seq: 0, // monotonic event sequence for attach dedup
 				pending: new Map(), // attached-socket event buffer (subscribe-first attach)
+				buffer: null, // attach() buffering hook — non-null ⇒ emit path queues events
 				lastActivity: Date.now(),
 				persistTimer: null,
 				persistMaxTimer: null,
@@ -81,7 +83,14 @@ export class AgentHub {
 			agent.subscribe((event) => {
 				entry.seq += 1;
 				const payload = { type: "agent-event", sessionId, seq: entry.seq, event };
-				const clients = this.broadcast(sessionId, payload); // returns # delivered
+				// attach() buffering hook (2026-10-21: replaces the old global
+				// this.broadcast swap, which was not reentrant when two attaches overlapped)
+				if (entry.buffer) entry.buffer.push(payload);
+				else this.broadcast(sessionId, payload);
+				// SSE subscribers fan out from a per-session set (2026-10-21 P2 fix:
+				// onEvents no longer wraps/restores the shared broadcast)
+				const subs = this.subscribers.get(sessionId);
+				if (subs) for (const cb of [...subs]) { try { cb({ type: "agent-event", event }); } catch { /* listener error — drop */ } }
 				entry.lastActivity = Date.now();
 				// persistence triggers: user message immediately; everything else debounced
 				if (event.type === "message_end" && event.message?.role === "user") {
@@ -96,18 +105,13 @@ export class AgentHub {
 	}
 
 	/** Subscribe-first attach: buffer events while building the snapshot, then
-	 *  deliver snapshot + buffered (deduped by seq). Prevents event loss. */
+	 *  deliver snapshot + buffered (deduped by seq). Prevents event loss.
+	 *  2026-10-21: per-session entry.buffer hook — the old implementation swapped
+	 *  the GLOBAL this.broadcast, which was not reentrant when two attaches
+	 *  interleaved (one restore clobbered the other's interception). */
 	attach(sessionId, deliver) {
 		const entry = this.getSession(sessionId);
-		const queue = [];
-		const buffering = { active: true };
-		const origBroadcast = { fn: this.broadcast };
-		// temporarily intercept broadcast for THIS session to buffer events
-		const bufferedBroadcast = (sid, msg) => {
-			if (sid === sessionId && buffering.active) queue.push(msg);
-			else origBroadcast.fn(sid, msg);
-		};
-		this.broadcast = bufferedBroadcast;
+		const queue = (entry.buffer = []); // emit path buffers while non-null
 		const state = {
 			exists: true,
 			messages: entry.agent.state.messages,
@@ -116,9 +120,7 @@ export class AgentHub {
 			isStreaming: entry.agent.state.isStreaming,
 			seq: entry.seq,
 		};
-		buffering.active = false;
-		this.broadcast = origBroadcast.fn; // restore
-		// deliver snapshot then buffered events (already seq-stamped, in order)
+		entry.buffer = null; // stop buffering BEFORE delivering (synchronous — no interleave)
 		deliver({ type: "state", sessionId, ...state });
 		for (const msg of queue) deliver(msg);
 		return entry;
@@ -204,15 +206,22 @@ export class AgentHub {
 		entry.thinkingLevel = level;
 	}
 
-	/** Subscribe to a session's events (for SSE clients). Returns unsubscribe. */
+	/** Subscribe to a session's events (for SSE clients). Returns unsubscribe —
+	 *  idempotent, removes ONLY its own callback. 2026-10-21 P2 fix: the old
+	 *  implementation wrapped/restored the shared this.broadcast, so with two
+	 *  overlapping subscribers the first unsubscribe stopped the second one's
+	 *  delivery (and the reverse order restored a closed subscriber's wrapper). */
 	onEvents(sessionId, callback) {
 		this.getSession(sessionId); // ensure agent exists
-		const origBroadcast = this.broadcast;
-		this.broadcast = (sid, msg) => {
-			origBroadcast(sid, msg);
-			if (sid === sessionId) callback({ type: 'agent-event', event: msg.event || msg });
+		let subs = this.subscribers.get(sessionId);
+		if (!subs) { subs = new Set(); this.subscribers.set(sessionId, subs); }
+		subs.add(callback);
+		return () => {
+			const s = this.subscribers.get(sessionId);
+			if (!s) return;
+			s.delete(callback);
+			if (s.size === 0) this.subscribers.delete(sessionId);
 		};
-		return () => { this.broadcast = origBroadcast; };
 	}
 
 	/** Snapshot for attaching clients (cold sessions). */
@@ -236,6 +245,7 @@ export class AgentHub {
 			if (now - entry.lastActivity > IDLE_EVICT_MS) {
 				this._writeSession(id); // force-flush pending debounce
 				this.sessions.delete(id);
+				this.subscribers.delete(id); // SSE subscribers die with the session
 				console.info(`[agent-hub] evicted idle session ${id.slice(0, 8)}`);
 			}
 		}
@@ -248,6 +258,7 @@ export class AgentHub {
 				const [id] = active[i];
 				this._writeSession(id);
 				this.sessions.delete(id);
+				this.subscribers.delete(id);
 			}
 		}
 	}

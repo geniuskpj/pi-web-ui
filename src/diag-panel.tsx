@@ -32,18 +32,24 @@ export function DiagPanel() {
 	};
 
 	const copy = async () => {
-		try {
-			const report = await buildDiagnosticsReport();
-			// copyText: navigator.clipboard is secure-context-only (undefined on http://LAN-IP)
-			const ok = await copyText(report);
-			if (!ok) throw new Error("copy failed");
+		// copyText: navigator.clipboard is secure-context-only (undefined on http://LAN-IP)
+		const report = await buildDiagnosticsReport();
+		const ok = await copyText(report);
+		if (ok) {
 			setCopied(true);
 			setTimeout(() => setCopied(false), 2000);
-		} catch {
-			const w = window.open("", "_blank");
-			const report = await buildDiagnosticsReport();
-			w?.document.write(`<pre>${report.replace(/</g, "<")}</pre>`);
+			return;
 		}
+		// fallback: show the report in a new tab via textContent — NEVER
+		// document.write. The report contains log lines with URL-derived values
+		// (e.g. a crafted ?session=), and the old `report.replace(/</g, "<")` was a
+		// NO-OP that escaped nothing — interpolated markup would execute in the
+		// same-origin about:blank window (P2 fix).
+		const w = window.open("", "_blank");
+		if (!w) return;
+		const pre = w.document.createElement("pre");
+		pre.textContent = report;
+		w.document.body.appendChild(pre);
 	};
 
 	const shown = entries.filter((e) => filter === "all" || e.level === filter || (filter === "warn" && e.level === "error")).slice(-100).reverse();

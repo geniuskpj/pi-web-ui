@@ -89,8 +89,13 @@ Downloads a PINNED package (`util-linux-2.40.2-2` from repo.msys2.org, sha256-pi
 - Session ids must be unguessable (`validSessionId`: ≥16 chars, not all digits/`-`/`_`) — the id is the
   reattach credential for loopback peers. Ids are sanitized to `[A-Za-z0-9_-]{1,64}` before validation.
 - Input backpressure: `writeInput` drops stdin when `stdin.writableLength > 1MB`.
-- Known gap (documented in architecture.md): `safeSend` drops frames when `ws.bufferedAmount > 4MB` —
-  a dropped `d` frame desyncs the emulator (recoverable via Reset/replay).
+- Outbound backpressure (2026-10-21): `safeSend` TERMINATES a socket whose `bufferedAmount > 4MB`
+  (`TERM_MAX_BUFFERED`) — the client reconnects and gets a fresh replay. Deliberately NOT a silent
+  frame drop: a dropped `d` frame desyncs the emulator screen with no recovery path.
+- Known gap (fixed 2026-10-21, kept for context): `safeSend` used to send unconditionally — a slow
+  client could grow an unbounded outbound queue while the shell kept producing output. It now
+  terminates the lagging socket (reconnect = replay resync); the SYNC hub's `safeSend` still drops
+  frames silently (metadata-only loss).
 
 ## Client (`src/ui/terminal.tsx`)
 

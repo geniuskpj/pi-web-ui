@@ -65,6 +65,7 @@ const REPLAY_MAX = 128 * 1024; // ring size; trims to half when exceeded
 const MAX_INPUT = 64 * 1024; // per-frame stdin cap
 const FLUSH_MS = 30; // output coalescing window (readline emits tiny chunks fast)
 const FLUSH_FORCE_BYTES = 32 * 1024;
+const TERM_MAX_BUFFERED = 4 * 1024 * 1024; // per-socket outbound queue cap — CLOSE a lagging client, never drop frames
 const PTY_FALLBACK_MS = 4000; // opt-in bridge exited non-zero this fast → try pipes
 const RESET_RECOVERY_MS = 1500; // exit event lost after taskkill → force respawn
 
@@ -198,6 +199,14 @@ function onlcr(sess, s) {
 
 function safeSend(ws, obj) {
 	if (ws.readyState !== 1) return;
+	// outbound backpressure (P2): a client that stops reading must not grow the
+	// WS send queue forever. CLOSE the lagging socket — the client reconnects and
+	// gets a fresh replay — instead of silently dropping frames (a dropped "d"
+	// frame desyncs the emulator screen with no recovery path).
+	if (ws.bufferedAmount > TERM_MAX_BUFFERED) {
+		try { ws.terminate(); } catch { /* raced closed */ }
+		return;
+	}
 	try {
 		ws.send(JSON.stringify(obj));
 	} catch {

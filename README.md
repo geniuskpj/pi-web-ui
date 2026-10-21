@@ -175,7 +175,10 @@ Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
     ONLCR (no bare `\n` reaches the emulator) → replay → reset → kill (12 checks).
   - Security: `/ws/terminal` inherits the non-loopback token gate AND enforces a strict Origin
     allowlist inside its own size-capped WSS (WS has no CORS — a drive-by page could otherwise
-    dial the socket; DNS-rebinding presents a mismatched Origin/Host pair). Session ids must be
+    dial the socket; DNS-rebinding presents a mismatched Origin/Host pair). 2026-10-21: the same
+    allowlist now gates `/ws/sync` + `/ws/agent` WS upgrades and EVERY `/api/*` route except
+    `/api/health` (Host + Origin must be real, incl. portless-Host and IPv6 normalization) — custom DNS
+    names must be added to `PI_WEB_TERM_ORIGIN` (details: docs/server.md). Session ids must be
     unguessable (≥16 chars, not numeric) — the id is the reattach auth for loopback peers.
     The token remains the trust boundary, exactly like `/api/exec/tool`.
 - **Workspace file endpoints** (picker/attachments): `GET /api/ws/files?path=` (structured

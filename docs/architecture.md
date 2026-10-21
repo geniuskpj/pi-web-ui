@@ -97,7 +97,12 @@ refresh, `?session=` restore.
 - **Blanket gate**: every `/api/*` (except `/api/health`) from a **non-loopback** peer requires the
   token. Loopback peers are trusted unconditionally (OS boundary). Header `x-pi-web-token` by design —
   custom headers cannot be attached cross-origin, so CSRF is structurally impossible for browsers that
-  honor CORS.
+  honor CORS. **Browser-origin gate (2026-10-21, r2)**: loopback trust is NOT a browser boundary (DNS
+  rebinding / `*.nip.io` make an attacker page same-origin over a loopback socket), so **every `/api/*`
+  route except `/api/health`** additionally requires the `Host` header AND the `Origin` header (when
+  present) to name a host in `ALLOWED_HOSTS` (localhost, 127.0.0.1, [::1], hostname, all LAN IPs v4+v6,
+  `PI_WEB_TERM_ORIGIN` extras; portless Host normalized, trailing dots stripped). Non-browser clients
+  send no Origin and are unaffected.
 - **Always-token endpoints** (even loopback): `POST /api/exec/tool` and `GET /api/ws/file` — content
   execution/reading is a secrets oracle; drive-by simple POSTs (text/plain, no preflight) and
   DNS-rebinding are named in the code as the reason. Contrast: `GET /api/pi/keys` (ALL provider keys),
@@ -107,7 +112,9 @@ refresh, `?session=` restore.
   enforces a strict Origin allowlist (real hosts: localhost, 127.0.0.1, hostname, LAN IPs,
   `PI_WEB_TERM_ORIGIN` extras) inside the hub, because WS has no CORS and DNS-rebinding presents a
   mismatched Origin/Host pair; a MISSING Origin is accepted only from loopback. `/ws/sync` and
-  `/ws/agent` have no Origin check (see quirks). Session ids must be unguessable (≥16 chars) — the id
+  `/ws/agent` now validate a PRESENT Origin against the same allowlist at upgrade (browsers always send
+  one; non-browser clients without Origin keep the token gate) — fixed 2026-10-21. Session ids must be
+  unguessable (≥16 chars) — the id
   is the reattach auth for loopback peers (the client may still CHOOSE the id, so Origin remains the
   real gate).
 - **Filesystem**: all fs paths (tools + picker) go through `assertInsideRoots()` (realpath walk, roots =
@@ -141,19 +148,26 @@ refresh, `?session=` restore.
 - `/api/exec/tools`, `/api/pi/key` check the env-derived constant `TOKEN = process.env.PI_WEB_TOKEN`
   with plain `!==` (not `tokenMatches`, not the auto-generated `AUTH_TOKEN`) — an extra layer that only
   activates when `PI_WEB_TOKEN` is set, and weaker (non-timing-safe) than the gate it duplicates.
-- Origin/Host posture: `/api/proxy` AND `/api/debug/state` compare Origin against
-  `new URL(c.req.url).origin` (Host-derived) — under DNS rebinding (or a public DNS name that already
-  points at 127.0.0.1, e.g. `*.nip.io` / `localtest.me` — no rebinding needed) both headers carry the
-  attacker's host and the pair PASSES. A reverse proxy fronting 127.0.0.1 makes every remote client
-  look loopback to `isLoopback()`, disabling the token gate entirely. `/ws/sync` and `/ws/agent` have
-  NO Origin check at all; only `/ws/terminal` compares against a real-host allowlist.
-- `agent-hub.mjs attach()`/`onEvents()` temporarily reassign `this.broadcast` and restore it — not
-  reentrant if two attaches interleave.
-- `safeSend()` (server + terminal) silently drops frames when `bufferedAmount > 4MB` — a dropped
-  terminal `d` frame desyncs the emulator screen (no resync until replay/reset).
+- Origin/Host posture — **FIXED 2026-10-21 (r2: scope = every `/api/*` except `/api/health`)**:
+  the browser-origin gate requires allowlisted Host+Origin on all API routes (an earlier prefix list
+  left `/api/agent/session/:id` — message BODIES — reachable to a rebound page), `/ws/sync` +
+  `/ws/agent` validate a present Origin at upgrade, and `/api/pi/keys` is always-token.
+- `agent-hub.mjs` broadcast handling — **FIXED 2026-10-21**: `attach()` now buffers via a per-session
+  `entry.buffer` hook and `onEvents()` fans out from a per-session subscriber Set — the old global
+  `this.broadcast` swap/restore was not reentrant (overlapping attaches clobbered each other; the first
+  unsubscribe stopped the second subscriber's delivery).
+- Outbound WS backpressure: the SYNC hub's `safeSend` still silently drops frames when
+  `ws.bufferedAmount > 4MB` (data-loss window for cross-device mirror metadata). The TERMINAL hub now
+  CLOSES (terminate) a lagging socket past 4MB instead — the client reconnects and replays (fixed
+  2026-10-21; a dropped terminal `d` frame used to desync the emulator with no recovery path).
 - `main.tsx` fetch monkeypatch matches `url.includes("/api/") || url.includes("/ws/")` (same substring
   test in the WebSocket patch for `?token=`) — ANY url whose string contains those fragments gets the
   token attached (the LLM proxy strips `x-pi-web-token` before forwarding; other cross-origin URLs
   would not).
+- The LLM proxy's SSRF filter (`proxyTargetBlocked` + `dottedFromInet`) is HOSTNAME-pattern based —
+  hardened 2026-10-21 r2 against inet_aton spellings (`127.1`, `2130706433`), IPv4-mapped IPv6 in all
+  forms, expanded IPv6 loopback, trailing dots, 198.18/15 — but a DNS name that RESOLVES to an internal
+  IP (e.g. `localtest.me` as a proxy TARGET) is still reachable (no resolve-and-pin). Redirect hops are
+  revalidated AND strip Authorization on cross-host hops.
 - Editor `send()` busy-waits (25 ms poll loop, ≤1 s) for `isStreaming` to flip as a double-send guard.
 - `LocalStorageBackend` quota handling evicts the largest *other* stored session without asking.

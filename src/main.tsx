@@ -301,7 +301,10 @@ const loadSession = async (sessionId: string): Promise<boolean> => {
 		// dead entry (no local body, no server copy) — prune the metadata so the
 		// list self-heals instead of landing on newSession() on every click
 		try { await ((storage.sessions as any).getBackend()).delete("sessions-metadata", sessionId); } catch { /* noop */ }
-		dlog.warn("[init]", "session not found anywhere:", sessionId);
+		// sanitize before logging: sessionId comes from the ?session= query param
+		// (URL-controlled) and lands in the diagnostics log ring — the diag fallback
+		// view must never become an HTML injection vector
+		dlog.warn("[init]", "session not found anywhere:", String(sessionId).replace(/[^A-Za-z0-9_-]/g, "").slice(0, 24) || "(unparseable)");
 		return false;
 	}
 	// self-heal: the server mirror is missing/stale → push the local copy back
