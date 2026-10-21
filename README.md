@@ -109,6 +109,8 @@ Workspace file attach + image paste are BACK (plan.md §12–14) — see the exp
 | `PI_WEB_BASH` / `PI_WEB_BASH_SHELL` | on / `C:\Git\usr\bin\bash.exe` | bash tool on/off + shell path override |
 | `PI_GIT_HOME` | — | override the Git root (terminal shell env + bridge-provisioning tar fallback) |
 | `PI_WEB_DEBUG` | off | verbose server logging |
+| `PI_WEB_LOG_DIR` | `<PI_WEB_DATA_DIR>/logs` | console tee target — daily `server-YYYYMMDD.log` (ISO timestamps + info/warn/error); broken dir falls back to console-only |
+| `PI_WEB_EXIT_ON_STDIN_CLOSE` | off | run the full graceful-shutdown sequence when the parent closes the server's stdin pipe (pipe-friendly Ctrl+C equivalent; used by tests — on Windows a cross-process `kill(SIGINT)` TerminateProcesses without running handlers) |
 | `PI_WEB_TERM_COLS` / `PI_WEB_TERM_LINES` | `110` / `32` | terminal grid size (stty in the pty tier, COLUMNS/LINES env in the pipe tier) |
 | `PI_WEB_TERM_BRIDGE` | auto | `0`/`pipes` forces the pipe tier; a path uses that exe as an msys-pty-bridge; unset → auto-provision msys2 `util-linux` `script.exe` into `data/bin/script/` (sha256-pinned `util-linux-2.40.2-2` package from repo.msys2.org, 8MB size cap, extracts a 63KB exe — once) |
 | `PI_WEB_TERM_ORIGIN` | auto | extra `host[:port]` entries for the /ws/terminal Origin allowlist (reverse proxies / custom DNS names) |
@@ -268,3 +270,10 @@ Requirements & limits:
   (read/write/edit/bash + pi extensions) run in-process, keys stay in `.pi/auth.json`, every event is
   broadcast to all attached devices, and runs survive browser closes. `?local=1` restores the old
   in-browser loop.
+- **Server logging** (2026-10-21): every `console.log/warn/error` is TEE'D to
+  `<data>/logs/server-YYYYMMDD.log` (daily file, ISO timestamp + level per line, boot marker with
+  pid/port/build). `PI_WEB_LOG_DIR` overrides the directory; a broken dir falls back to console-only.
+- **Graceful shutdown** (2026-10-21): SIGINT/SIGTERM/SIGBREAK run a deliberate, LOGGED sequence —
+  stop the HTTP listener + destroy connections, `terminalHub.closeAll()` (kill-tree every live bash
+  — no orphans), `agentHub.shutdown()` (abort live runs + flush all sessions), drain the worker
+  store, terminate the worker, `[shutdown] complete — bye`. A second signal force-exits.

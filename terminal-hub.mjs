@@ -993,6 +993,20 @@ export function createTerminalHub({
 	return {
 		handleUpgrade,
 		size: () => sessions.size,
+		/** Shutdown hook (SIGINT/SIGTERM / stdin-close): kill every live shell
+		 *  (kill-tree — no orphaned bash/script.exe), close clients + the hub WSS,
+		 *  and stop the TTL sweeper. Returns the number of LIVE shells killed. */
+		closeAll() {
+			clearInterval(sweeper);
+			let killed = 0;
+			for (const s of [...sessions.values()]) {
+				const live = s.phase !== "dead" && s.phase !== "error" && s.proc;
+				try { destroySession(s); } catch { /* already gone */ }
+				if (live) killed++;
+			}
+			try { wss.close(); } catch { /* clients already closed */ }
+			return killed;
+		},
 		list: () =>
 			[...sessions.values()].map((s) => ({
 				id: s.id,

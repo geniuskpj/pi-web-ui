@@ -18,7 +18,8 @@
     "test:security": "node tests/security-gates.test.mjs",
     "test:store": "node tests/session-store.test.mjs",
     "test:ssrf": "node tests/ssrf-depth2.test.mjs",
-    "test:runtime": "node tests/runtime-seq.test.mjs"
+    "test:runtime": "node tests/runtime-seq.test.mjs",
+    "test:shutdown": "node tests/shutdown.test.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.75.3",

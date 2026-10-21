@@ -386,6 +386,24 @@ export class AgentHub {
 		try { this.onRuntimeChange?.(sessionId, { sessionId, status: "idle", seq: Number.MAX_SAFE_INTEGER }); } catch { /* ignore */ }
 	}
 
+	/** Shutdown hook (SIGINT/SIGTERM/stdin-close): abort live runs (agent_end
+	 *  fires → clean stopReason "aborted"), clear preview timers, and flush EVERY
+	 *  session through the worker immediately (empty/model-only sessions are
+	 *  skipped by _writeSession). server.mjs drains the pending store ops before
+	 *  process exit, so no turn is lost. Returns the number of hub sessions. */
+	shutdown() {
+		let n = 0;
+		for (const [id, entry] of this.sessions) {
+			n++;
+			if (entry.previewTimer) { clearTimeout(entry.previewTimer); entry.previewTimer = null; }
+			if (entry.agent.state.isStreaming) {
+				try { entry.agent.abort(); } catch { /* already dead */ }
+			}
+			try { this.persistSession(id, true); } catch { /* best effort */ }
+		}
+		return n;
+	}
+
 	/** Evict idle agents: not streaming, no clients attached, idle > 30min.
 	 *  Flush-before-evict (force-write any pending debounce). */
 	evict() {

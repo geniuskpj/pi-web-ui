@@ -36,6 +36,7 @@ import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { WebSocketServer } from "ws";
 import { Agent as UndiciAgent, fetch as undiciFetch } from "undici";
+import util from "node:util";
 import { AgentHub } from "./agent-hub.mjs";
 import { createTerminalHub } from "./terminal-hub.mjs";
 
@@ -49,6 +50,41 @@ const TOKEN = process.env.PI_WEB_TOKEN || "";
 const DEBUG = process.env.PI_WEB_DEBUG === "1" || process.argv.includes("--debug");
 const BOOT_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 const BUILD_ID = (fs.readdirSync(PUBLIC + "/assets").find((f) => /^app-[A-Z0-9]+\.js$/.test(f)) || "unknown").replace(".js", "");
+
+// --- logging: tee console to <data>/logs/server-YYYYMMDD.log -------------------
+// Every console.log/warn/error lands in BOTH the terminal and a daily log file
+// (timestamps + level). Low volume (only >=400 API lines + hub/terminal events
+// go through console — WS/LLM streams never do), so synchronous appends are
+// fine AND crash-safe: the shutdown sequence is on disk even if exit follows.
+// Override the directory with PI_WEB_LOG_DIR; a broken log dir falls back to
+// console-only (logging must never break the server).
+const LOG_DIR = path.resolve(process.env.PI_WEB_LOG_DIR || path.join(DATA_DIR, "logs"));
+const origConsole = { log: console.log.bind(console), warn: console.warn.bind(console), error: console.error.bind(console) };
+let logFd = null, logDay = "";
+const dayStamp = (d = new Date()) => `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
+function logWrite(level, args) {
+	try {
+		const d = new Date();
+		const day = dayStamp(d);
+		if (logFd === null || day !== logDay) {
+			if (logFd !== null) { try { fs.closeSync(logFd); } catch { /* already closed */ } logFd = null; }
+			fs.mkdirSync(LOG_DIR, { recursive: true });
+			logFd = fs.openSync(path.join(LOG_DIR, `server-${day}.log`), "a");
+			logDay = day;
+		}
+		const text = args.map((a) => (typeof a === "string" ? a : util.inspect(a, { depth: 4, breakLength: 200 }))).join(" ").replace(/\n/g, "\n    ");
+		fs.writeSync(logFd, `${d.toISOString()} [${level}] ${text}\n`);
+	} catch { /* console-only fallback */ }
+}
+console.log = (...a) => { origConsole.log(...a); logWrite("info", a); };
+console.warn = (...a) => { origConsole.warn(...a); logWrite("warn", a); };
+console.error = (...a) => { origConsole.error(...a); logWrite("error", a); };
+function logBootMarker() {
+	try {
+		fs.mkdirSync(LOG_DIR, { recursive: true });
+		fs.appendFileSync(path.join(LOG_DIR, `server-${dayStamp()}.log`), `\n===== pi-web boot ${BOOT_ID} · pid ${process.pid} · node ${process.version} · port ${PORT} · build ${BUILD_ID} · dir ${DATA_DIR} =====\n`);
+	} catch { /* console-only fallback */ }
+}
 
 const dlog = (...a) => { if (DEBUG) console.log("[pi-web:debug]", ...a); };
 
@@ -1952,7 +1988,8 @@ app.get("*", async (c) => {
 });
 
 // --- server + upgrade routing ---------------------------------------------------
-serve({ fetch: app.fetch, port: PORT, hostname: HOST }, (info) => {
+const httpServer = serve({ fetch: app.fetch, port: PORT, hostname: HOST }, (info) => {
+	logBootMarker();
 	console.log(`[pi-web] serving ${PUBLIC}`);
 	console.log(`[pi-web] pi dir: ${PI_DIR}`);
 	console.log(`[pi-web] sessions mirror: ${path.join(DATA_DIR, "sessions")} (worker thread)`);
@@ -1984,3 +2021,50 @@ serve({ fetch: app.fetch, port: PORT, hostname: HOST }, (info) => {
 	}
 	else socket.destroy();
 });
+
+// --- graceful shutdown (Ctrl+C / SIGTERM / stdin close) -------------------------
+// Node's default Ctrl+C just kills everything: active agent runs die mid-write,
+// debounced persists never flush, and the terminal hub's shells (pty bridge +
+// bash.exe) are ORPHANED. This sequence is deliberate and logged:
+//   1. stop the HTTP listener + destroy every connection (keep-alive, SSE, WS)
+//   2. terminalHub.closeAll() — kill-tree every live shell (no orphans)
+//   3. agentHub.shutdown() — abort live runs (clean agent_end) + flush sessions
+//   4. drain the worker store (wait for in-flight JSONL writes), terminate it
+// Windows note: cross-process child.kill('SIGINT') does NOT run handlers
+// (TerminateProcess) — PI_WEB_EXIT_ON_STDIN_CLOSE=1 makes the parent shell
+// closing our stdin the testable/pipe-friendly equivalent.
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+let shuttingDown = false;
+async function shutdown(reason) {
+	if (shuttingDown) { origConsole.error("[shutdown] second signal — exiting immediately"); process.exit(1); }
+	shuttingDown = true;
+	const t0 = Date.now();
+	console.log(`[shutdown] ${reason} received — draining (pid ${process.pid}, boot ${BOOT_ID})`);
+	try { httpServer.close(); } catch { /* never listening */ }
+	try { httpServer.closeAllConnections?.(); } catch { /* old node */ }
+	let shells = -1;
+	try { shells = terminalHub.closeAll(); }
+	catch (err) { console.error("[shutdown] terminal kill failed:", err?.message || err); }
+	console.log(`[shutdown] terminal shells killed: ${shells}`);
+	let hubSessions = -1;
+	try { hubSessions = agentHub.shutdown(); }
+	catch (err) { console.error("[shutdown] agent flush failed:", err?.message || err); }
+	console.log(`[shutdown] agent runs aborted + sessions flushed (${hubSessions} in hub)`);
+	const deadline = Date.now() + 5000;
+	while (storePending.size > 0 && Date.now() < deadline) await sleepMs(25);
+	console.log(`[shutdown] store drained (${storePending.size} ops pending, ${Date.now() - t0}ms)`);
+	try { await sessionWorker.terminate(); } catch { /* already dead */ }
+	console.log(`[shutdown] complete in ${Date.now() - t0}ms — bye`);
+	process.exit(0);
+}
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGBREAK", () => void shutdown("SIGBREAK")); // Windows Ctrl+Break
+if (process.env.PI_WEB_EXIT_ON_STDIN_CLOSE === "1") {
+	// pipe-friendly graceful shutdown: when the parent's write end closes (shell
+	// gone, npm killed, or the shutdown TEST on Windows where cross-process
+	// signals cannot run handlers), drain exactly like Ctrl+C
+	process.stdin.on("end", () => void shutdown("stdin end (parent closed the pipe)"));
+	process.stdin.on("error", () => { /* EPIPE after exit — the end handler fires */ });
+	process.stdin.resume();
+}

@@ -257,8 +257,39 @@ subscribe-first: buffers events via a per-session `entry.buffer` hook while snap
 the old global broadcast swap was not reentrant), then delivers snapshot + buffered (dedup by seq).
 `prompt()` queues ONE follow-up while streaming (depth 2+ rejected). Eviction: idle >30min (flush
 first) or LRU beyond HOT_AGENT_CAP+5 — non-streaming sessions only, so a live run is never evicted.
-`flushAll()` exists for shutdown (note: no SIGINT wiring in server.mjs currently).
+`flushAll()` exists for bulk flush; the shutdown path uses `shutdown()` (abort live runs + immediate
+persist per session) — wired to SIGINT/SIGTERM/SIGBREAK/stdin-close in server.mjs since 2026-10-21.
 `onEvents()` backs the SSE endpoint via the per-session subscriber Set (no swapping).
+
+## Logging + graceful shutdown (2026-10-21)
+
+**Tee logger** (top of server.mjs): `console.log/warn/error` are wrapped — the original prints to
+stdout AND a line lands in `<data>/logs/server-YYYYMMDD.log` (PI_WEB_LOG_DIR overrides) as
+`<ISO ts> [info|warn|error] <formatted args>` (util.inspect depth 4, continuation lines indented).
+The fd is opened once and reopened on day rollover; writes are SYNCHRONOUS (low volume — WS/LLM
+streams never go through console) so the shutdown sequence is on disk even if exit follows.
+`logBootMarker()` appends a `===== pi-web boot <bootId> · pid · node · port · build · dir =====`
+banner. The session worker's console is NOT patched (separate thread, negligible output).
+
+**Graceful shutdown** (`shutdown(reason)` at the bottom): SIGINT/SIGTERM/SIGBREAK handlers + the
+opt-in `PI_WEB_EXIT_ON_STDIN_CLOSE=1` stdin-end trigger (Windows: cross-process signals cannot run
+handlers — TerminateProcess — so the test drives the pipe trigger). Sequence, each step logged:
+
+1. `[shutdown] <reason> received` — stop accepting work: `httpServer.close()` +
+   `closeAllConnections()` (keep-alive, SSE and both WS sets die here).
+2. `terminalHub.closeAll()` — clears the TTL sweeper, `destroySession()`s every terminal session
+   (gen-guard + kill-tree → no orphaned `bash.exe`/`script.exe`), closes the hub WSS; logs the count
+   of LIVE shells killed.
+3. `agentHub.shutdown()` — aborts every streaming agent (clean `agent_end`/stopReason "aborted"),
+   clears preview timers, and immediate-persists EVERY hub session (empty ones are skipped by
+   `_writeSession`).
+4. drain: wait (≤5s) for `storePending` (in-flight worker-store ops) to hit 0, then
+   `sessionWorker.terminate()`.
+5. `[shutdown] complete in <ms>ms — bye` → `process.exit(0)`. A second signal force-exits(1).
+
+Tested by `tests/shutdown.test.mjs`: real terminal shell + worker-store put, stdin-close → exit 0,
+log file assertions (boot marker, `terminal shells killed: 1`, drained, bye), session JSONL
+survived on disk.
 
 ## Upgrade routing (`serve().on("upgrade")`)
 
