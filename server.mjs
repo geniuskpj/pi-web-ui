@@ -970,7 +970,14 @@ const builtinTools = [
 						size += buf.length; chunks.push(buf);
 					}
 				} catch (err) {
-					if (!chunks.length) throw new Error(`body read failed: ${err?.message || err}`);
+					// ALWAYS propagate: a stream error/timeout/abort AFTER the first chunk
+					// must not masquerade as a successful fetch (commit-review: the old
+					// `if (!chunks.length) throw` swallowed mid-body failures and returned
+					// unmarked partial content). The 3MB limit path is separate — it breaks
+					// out of the loop and marks bodyTruncated instead of throwing.
+					if (signal?.aborted) throw new Error("aborted");
+					if (ac.signal.aborted) throw new Error(`fetch timed out after ${toSec}s: ${currentUrl}`);
+					throw new Error(`body read failed after ${size} bytes: ${err?.message || err}`);
 				}
 				const body = Buffer.concat(chunks).toString("utf8");
 				const ct = (upstream.headers.get("content-type") || "").toLowerCase();
@@ -1888,7 +1895,7 @@ function syncConn(ws) {
 				await storeOp("delete", { id });
 				broadcastSessions().catch(() => {});
 			}
-		})().catch((err) => { console.error("[sync] error:", err.message); safeSend(ws, { type: "error", error: err.message }); });
+		})().catch((err) => { console.error("[sync] error:", err.message); safeSend(ws, { type: "error", id: m.id, error: err.message }); });
 	});
 	ws.on("close", () => syncClients.delete(client));
 	ws.on("error", () => syncClients.delete(client));
@@ -1936,7 +1943,7 @@ function agentConn(ws) {
 					// id echoes on the accepted reply so the composer can restore text on a reject
 					agentHub.prompt(currentSession, String(m.content || ""), images?.length ? images : undefined)
 						.then((r) => safeSend(ws, { type: "accepted", id: m.id, ...r }))
-						.catch((err) => safeSend(ws, { type: "error", error: err.message }));
+						.catch((err) => safeSend(ws, { type: "error", id: m.id, error: err.message }));
 					break;
 				}
 				case "steer": {
@@ -1949,7 +1956,7 @@ function agentConn(ws) {
 						: undefined;
 					agentHub.steer(currentSession, String(m.content || ""), images?.length ? images : undefined)
 						.then((r) => safeSend(ws, { type: "accepted", id: m.id, ...r }))
-						.catch((err) => safeSend(ws, { type: "error", error: err.message }));
+						.catch((err) => safeSend(ws, { type: "error", id: m.id, error: err.message }));
 					break;
 				}
 				case "abort":
@@ -1977,7 +1984,7 @@ function agentConn(ws) {
 			}
 		} catch (err) {
 			console.error("[agent-ws] handler error:", err.message);
-			safeSend(ws, { type: "error", error: err.message });
+			safeSend(ws, { type: "error", id: m.id, error: err.message });
 		}
 	});
 	ws.on("close", () => { if (currentSession) { detachAgentClient(currentSession, ws); agentHub.emitRuntime(currentSession); } });

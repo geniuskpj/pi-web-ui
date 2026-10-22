@@ -27,7 +27,17 @@ const has = (name) => args.includes(name);
 const HOST = flag("--host", "127.0.0.1");
 const PORT = Number(flag("--port", 9222));
 const LOAD_MS = Number(flag("--timeout", 15000));
-const URL_ARG = args.find((a) => !a.startsWith("--"));
+// option VALUES must never leak into the positional URL (commit-review: with
+// the old args.find(!startsWith("--")), `--host localhost --port 9222 https://…`
+// picked "localhost" as the URL). Value-flags consume their next argument.
+const VALUE_FLAGS = new Set(["--host", "--port", "--timeout", "--close"]);
+const POSITIONAL = [];
+for (let i = 0; i < args.length; i++) {
+	if (VALUE_FLAGS.has(args[i])) { i++; continue; }
+	if (args[i].startsWith("--")) continue; // value-less flags: --list
+	POSITIONAL.push(args[i]);
+}
+const URL_ARG = POSITIONAL[0];
 
 function httpJson(path, method = "GET") {
 	return new Promise((resolve, reject) => {

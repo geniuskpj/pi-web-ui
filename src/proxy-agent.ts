@@ -140,6 +140,16 @@ export class ProxyAgent {
 			return;
 		}
 		if (msg.type === "error") {
+			// CORRELATED error: the hub echoes the request id on prompt/steer failures
+			// (hub rejection, run error before reply) — settle the pending reply so
+				// the composer restores the cleared draft (commit-review: the old path
+			// recorded the error but left the promise pending forever)
+			if (msg.id && this.pendingReplies.has(msg.id)) {
+				const resolve = this.pendingReplies.get(msg.id)!;
+				this.pendingReplies.delete(msg.id);
+				resolve({ accepted: false, reason: msg.error });
+				return;
+			}
 			this.state.errorMessage = msg.error;
 			console.warn("[proxy-agent] server error:", msg.error);
 		}
@@ -197,6 +207,13 @@ export class ProxyAgent {
 	private replySeq = 0;
 
 	private request(type: "prompt" | "steer", content: string, images?: any[]): Promise<any> {
+		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+			// DEFINITE reject — nothing was transmitted, so the caller can safely
+			// restore the draft (commit-review: a steer started after the close
+			// handler ran used to wait out its timeout and then count as "unknown",
+				// silently dropping the text)
+			return Promise.resolve({ accepted: false, reason: `${type} not sent — agent socket not connected` });
+		}
 		const id = `${Date.now().toString(36)}-${++this.replySeq}`;
 		const p = new Promise<any>((resolve) => {
 			this.pendingReplies.set(id, resolve);
@@ -229,7 +246,10 @@ export class ProxyAgent {
 	pendingPrompt: any = null;
 
 	/** Send a steering message (mid-run): resolves with the hub's accept/reject. */
-	steer(content: string, images?: any[]): Promise<any> {
+	async steer(content: string, images?: any[]): Promise<any> {
+		// brief-disconnect patience (prompt has the same gate) — but never send blind:
+		// request() re-checks and definitely rejects if the socket is still down
+		await this.whenReady(3000);
 		return this.request("steer", content, images);
 	}
 

@@ -148,7 +148,9 @@ Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
   to `data/tmp/fetch/<slug>.md` (7-day prune) so `rg`/`read_file` can extract sections; `raw:true`
   returns the untouched body; body cap 3MB, timeout 20s default/60s max. Test: `npm run test:fetch`.
 - **`cdp-open.mjs` (2026-10-22)**: open a URL in the user's debugged browser — `node cdp-open.mjs
-  <url>` (plus `--list` / `--close <id>`). Exists because every naive path fails: `window.open`
+  <url>` (plus `--list` / `--close <id>`). **Chrome/Edge only** — the whole CDP tooling (cdp_eval,
+  cdp-open, the :9222 target model) targets Chromium browsers; Firefox/Safari are not supported.
+  Exists because every naive path fails: `window.open`
   from cdp_eval is popup-blocked, and Edge's `PUT /json/new?url=` creates the tab but NEVER
   navigates it (verified — the tab stays about:blank). The helper uses `Target.createTarget`
   over the browser-level WS + `Page.navigate` + `Page.loadEventFired` wait (pattern from
