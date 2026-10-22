@@ -83,6 +83,14 @@ export class ProxyAgent {
 			if (gen !== this.generation) return;
 			this.ws = null;
 			this.attached = false;
+			// settle in-flight prompt/steer replies WITHOUT a reject: a dropped
+			// socket mid-run does NOT mean the run/steer died (runs survive
+			// disconnects server-side) — the composer must not restore text we
+			// can't know the fate of. `lost:true` makes the Editor skip the restore.
+			for (const [id, resolve] of [...this.pendingReplies]) {
+				this.pendingReplies.delete(id);
+				resolve({ accepted: false, lost: true, reason: "connection lost" });
+			}
 			this.scheduleRetry();
 		};
 		sock.onerror = () => { try { sock.close(); } catch { /* noop */ } };
@@ -192,7 +200,18 @@ export class ProxyAgent {
 		const id = `${Date.now().toString(36)}-${++this.replySeq}`;
 		const p = new Promise<any>((resolve) => {
 			this.pendingReplies.set(id, resolve);
-			setTimeout(() => { if (this.pendingReplies.delete(id)) resolve({ accepted: false, reason: "steer/prompt reply timeout" }); }, 20000);
+			// TIMING ASYMMETRY (2026-10-22 bug): a STEER reply is immediate (the
+			// hub's _steer is synchronous) → 20s is a transport-loss safety net. A
+			// PROMPT reply arrives at RUN END (hub.prompt awaits the whole run) — the
+			// old shared 20s timeout resolved {accepted:false} mid-run and the
+			// composer restore put the sent text BACK into the input ("my prompt
+			// appears again in text input UI"). Prompt gets NO timer: its entry
+			// settles on the explicit reply or on WS close (see onclose). Same for a
+			// steer that the hub fell back to prompt() with (run ended mid-send).
+			if (type === "steer") {
+				const t = setTimeout(() => { if (this.pendingReplies.delete(id)) resolve({ accepted: false, timedOut: true, reason: "steer reply timeout — check the pending chip / transcript" }); }, 20000);
+				(t as any).unref?.();
+			}
 		});
 		this.sendMsg({ type, id, content, images: images?.length ? images : undefined });
 		return p;

@@ -949,11 +949,18 @@ export function Editor({
 				: (imgs.length ? agent.prompt(outText, imgs) : agent.prompt(outText));
 			void Promise.resolve(dispatch)
 				.then((res: any) => {
-					if (res && res.accepted === false) {
+					// restore ONLY on an explicit hub rejection. A timeout/lost socket is
+					// an UNKNOWN state — the run/steer may be live server-side (runs
+					// survive disconnects; prompt replies arrive at run end), and
+					// restoring would re-send text that's already queued/running
+					// (2026-10-22 bug: prompts reappeared in the composer after 20s).
+					if (res && res.accepted === false && !res.timedOut && !res.lost) {
 						console.warn("[chat] send rejected:", res.reason);
 						onNote(res.reason || "not accepted");
 						setValue((cur) => (cur.trim() ? cur : restoreRaw)); // don't clobber live typing
 						onRestoreAttachments(restoreFiles, restoreImages);
+					} else if (res && (res.timedOut || res.lost)) {
+						console.warn("[chat] send reply unresolved:", res.reason);
 					}
 				})
 				.catch((err: any) => {
@@ -976,6 +983,25 @@ export function Editor({
 	};
 
 	const stop = () => {
+		// pi-TUI parity (interactive-mode restoreQueuedMessagesToEditor({abort:true}):
+		// aborting with a pending steering message RECALLS its text (+ images) into
+		// the composer instead of silently dropping it — the user can modify or
+			// re-send. Depth 1 ⇒ there is at most one pending message to recall.
+		if (pendingSteer) {
+			const text = String(pendingSteer.text || "");
+			(agent as any).cancelSteering?.();
+			const steerImages = pendingSteer.images;
+			if (steerImages && steerImages.length) {
+				for (const im of steerImages) {
+					if (im?.type === "image" && im.data && im.mimeType) onAddImage(`stopped-${Date.now().toString(36)}`, im.data, im.mimeType);
+				}
+			}
+			if (text) {
+				setValue((cur) => (cur.trim() ? cur.replace(/\s*$/, "") + "\n\n" + text : text)); // never clobber a live draft
+				const ta = taRef.current;
+				if (ta) { ta.focus(); try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch { /* older engines */ } }
+			}
+		}
 		agent.abort();
 	};
 
