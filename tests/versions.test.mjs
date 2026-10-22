@@ -15,6 +15,9 @@
 //   5. rewrite of the LAST message captures a 1-message version
 //   6. first-message edit (turn 0) round trips from an empty prefix
 //   7. restore guards: streaming / unknown vid
+//   8. INLINE EDIT COMMIT (editCommit): identical text = NO version + no truncation
+//      (user rule: a version exists only when a DIFFERENT message is saved);
+//      different text = version delta + truncate + re-prompt via the normal path
 import assert from "node:assert/strict";
 import { AgentHub } from "../agent-hub.mjs";
 
@@ -106,5 +109,23 @@ entry.agent.state.isStreaming = false;
 threw = "";
 try { await hub.restoreVersion(S, 999); } catch (e) { threw = e.message; }
 check("restore rejects unknown vid", /not found/.test(threw));
+
+// --- 8) inline edit commit ------------------------------------------------------
+hub.sessions.set(S, hub.sessions.get(S)); // entry exists from above
+entry.agent.state.messages = structuredClone(base);
+const promptCalls = [];
+(entry.agent).prompt = async (content) => { promptCalls.push(content); entry.agent.state.messages.push(user(content)); return { accepted: true, queued: false }; }; // stub the LLM run
+const versionsBefore = (await hub.listVersions(S)).length;
+const rc0 = await hub.editCommit(S, 2, "  q2  ");
+const versionsAfter = (await hub.listVersions(S)).length;
+check("identical text (trimmed) = noop, NO version, NO truncation", rc0?.ok && rc0.noop === true && versionsAfter === versionsBefore && hub.sessions.get(S).agent.state.messages.length === 6 && promptCalls.length === 0, JSON.stringify({ rc0, versionsBefore, versionsAfter }));
+const rc1 = await hub.editCommit(S, 2, "edited q2");
+check("different text captures the version + truncates", rc1?.ok && rc1.version?.turn === 2 && rc1.version?.count === 4 && !rc1.noop, JSON.stringify(rc1?.version && { turn: rc1.version.turn, count: rc1.version.count }));
+check("active = prefix + the edited prompt", hub.sessions.get(S).agent.state.messages.length === 3 && hub.sessions.get(S).agent.state.messages[2]?.content?.[0]?.text === "edited q2");
+check("edited text went through the NORMAL prompt path", promptCalls.length === 1 && promptCalls[0] === "edited q2");
+check("old tail verbatim in the delta", same(rc1.version.messages, base.slice(2)));
+let threw2 = "";
+try { await hub.editCommit(S, 1, "x"); } catch (e) { threw2 = e.message; } // index 1 = assistant message
+check("edit-commit rejects non-user messages", /user messages/.test(threw2), threw2);
 
 console.log(`[versions] ${pass} check(s) passed`);

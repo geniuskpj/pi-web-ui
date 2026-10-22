@@ -25,6 +25,7 @@ import type {
 	ToolResultMessage,
 	UserMessage,
 } from "@earendil-works/pi-ai";
+import { Fragment } from "preact";
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import type { SystemNotificationMessage } from "../llm.js";
 import { getAppStorage } from "../storage.js";
@@ -102,22 +103,70 @@ function formatUsage(u: AssistantMessage["usage"]): string {
 // ----------------------------------------------------------------------------
 // message components
 // ----------------------------------------------------------------------------
-function UserBubble({ message, onOpenFile, index, canMutate, onEditMessage }: { message: UserMessage; onOpenFile?: (path: string) => void; index?: number; canMutate?: boolean; onEditMessage?: (i: number) => void }) {
+function UserBubble({ message, onOpenFile, index, canMutate, onEditMessage, editing, onSaveEdit, onCancelEdit, dimmed }: { message: UserMessage; onOpenFile?: (path: string) => void; index?: number; canMutate?: boolean; onEditMessage?: (i: number) => void; editing?: boolean; onSaveEdit?: (i: number, text: string) => void; onCancelEdit?: () => void; dimmed?: boolean }) {
 	// attached workspace files render as clickable chips → open the explorer
 	// at that file (user request). Images have no path in ImageContent — text
 	// file chips only.
 	const text = textOf(message.content);
 	const files = [...text.matchAll(/^--- file: (.+?) ---$/gm)].map((m) => m[1]);
-	const actions = canMutate && typeof index === "number" && onEditMessage;
+	// INLINE EDIT (llama.cpp-webui parity, user design 2026-10-23): ✎ turns THIS
+	// bubble into a textarea — nothing is sent, no version is made, until the
+	// user saves a DIFFERENT text ("Resubmit"). Esc/cancel reverts. Enter =
+	// newline (an EDITING context — ChatGPT parity); Ctrl/Cmd+Enter submits.
+	const [draft, setDraft] = useState(text);
+	const taRef = useRef<HTMLTextAreaElement | null>(null);
+	const editBtnRef = useRef<HTMLButtonElement | null>(null);
+	useEffect(() => {
+		if (!editing) return;
+		setDraft(text);
+		// focus + cursor at END (arena review: cursor at end, not select-all)
+		const ta = taRef.current;
+		if (ta) {
+			ta.focus();
+			const n = ta.value.length;
+			try { ta.setSelectionRange(n, n); } catch { /* noop */ }
+			autoGrow(ta);
+		}
+	}, [editing]);
+	const autoGrow = (el: HTMLTextAreaElement) => {
+		el.style.height = "0";
+		el.style.height = Math.min(el.scrollHeight, 320) + "px";
+	};
+	const cancel = () => {
+		onCancelEdit?.();
+		// arena review: focus must return to the ✎ trigger (focus-within reveals it)
+		setTimeout(() => editBtnRef.current?.focus(), 0);
+	};
+	const actions = canMutate && typeof index === "number" && onEditMessage && !editing;
 	return (
-		<div class="pw-msg-row pw-user-row">
-			{actions && (
-				<div class="pw-msg-actions">
-					{onEditMessage && <button type="button" class="pw-msg-act" title="Edit — the prompt moves to the composer; the removed turn is saved as a restorable version (🕘)" onClick={() => onEditMessage(index)}>✎</button>}
+		<div class={"pw-msg-row pw-user-row" + (dimmed ? " pw-will-replace" : "")}>
+			{editing ? (
+				<div class="pw-msg pw-user pw-msg-editing">
+					<textarea
+						ref={taRef}
+						class="pw-edit-ta"
+						value={draft}
+						aria-label="Edit message"
+						onInput={(e: any) => { setDraft(e.currentTarget.value); autoGrow(e.currentTarget); }}
+						onKeyDown={(e: any) => {
+							if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); onSaveEdit?.(index!, draft); }
+							else if (e.key === "Escape") { e.preventDefault(); cancel(); }
+						}}
+					/>
+					<div class="pw-edit-actions">
+						<button type="button" class="pw-edit-save" title="Resubmit (Ctrl+Enter) — the old turn (prompt + responses) is saved as a restorable version (🕘), then the edited message re-prompts" onClick={() => onSaveEdit?.(index!, draft)}>Resubmit</button>
+						<button type="button" class="pw-edit-cancel" onClick={cancel}>cancel</button>
+					</div>
 				</div>
-			)}
-			<div class="pw-msg pw-user">
-				<div class="pw-text-plain">{text}</div>
+			) : (
+				<>
+				{actions && (
+					<div class="pw-msg-actions">
+						{onEditMessage && <button ref={editBtnRef} type="button" class="pw-msg-act" aria-label="Edit message" title="Edit message — the old turn becomes a restorable version when you save a different text" onClick={() => onEditMessage(index)}>✎</button>}
+					</div>
+				)}
+				<div class="pw-msg pw-user">
+					<div class="pw-text-plain">{text}</div>
 				{files.length > 0 && onOpenFile && (
 					<div class="pw-user-files">
 						{files.map((f) => (
@@ -127,7 +176,9 @@ function UserBubble({ message, onOpenFile, index, canMutate, onEditMessage }: { 
 						))}
 					</div>
 				)}
-			</div>
+				</div>
+				</>
+			)}
 		</div>
 	);
 }
@@ -203,13 +254,14 @@ function ToolRow({
 }
 
 function AssistantBubble({
-	message,
-	streaming,
-	toolResults,
-	pending,
-	partials,
-	isLast,
-	onRetry,
+    message,
+    streaming,
+    toolResults,
+    pending,
+    partials,
+    isLast,
+    onRetry,
+    dimmed,
 }: {
 	message: AssistantMessage;
 	streaming: boolean;
@@ -218,10 +270,11 @@ function AssistantBubble({
 	partials?: Map<string, string>;
 	isLast?: boolean;
 	onRetry?: () => void;
-}) {
+	dimmed?: boolean;
+	}) {
 	const failed = message.stopReason === "error" || message.stopReason === "aborted";
 	return (
-		<div class={"pw-msg pw-assistant" + (failed ? " pw-failed" : "")}>
+	 <div class={"pw-msg pw-assistant" + (failed ? " pw-failed" : "") + (dimmed ? " pw-will-replace" : "")}>
 			{message.content.map((part, i) => {
 				if (part.type === "thinking") {
 					return <ThinkingBlock key={i} part={part} streaming={streaming} />;
@@ -308,6 +361,10 @@ function MessageView(props: {
 	justUpdated?: boolean; // compaction completed this render — flash the summary block
 	canMutate?: boolean;
 	onEditMessage?: (i: number) => void;
+	editing?: boolean;
+	onSaveEdit?: (i: number, text: string) => void;
+	onCancelEdit?: () => void;
+	dimmed?: boolean;
 	onRetry?: () => void;
 	onOpenFile?: (path: string) => void;
 }) {
@@ -329,20 +386,21 @@ function MessageView(props: {
 				</div>
 			);
 		}
-		return <UserBubble message={message as UserMessage} onOpenFile={props.onOpenFile} index={props.index} canMutate={props.canMutate} onEditMessage={props.onEditMessage} />;
+		return <UserBubble message={message as UserMessage} onOpenFile={props.onOpenFile} index={props.index} canMutate={props.canMutate} onEditMessage={props.onEditMessage} editing={props.editing} onSaveEdit={props.onSaveEdit} onCancelEdit={props.onCancelEdit} dimmed={props.dimmed} />;
 	}
 	if (message.role === "assistant")
-		return (
-			<AssistantBubble
-				message={message as AssistantMessage}
-				streaming={!!props.streaming}
-				toolResults={props.toolResults}
-				pending={props.pending}
-				partials={props.partials}
-				isLast={props.isLast}
-				onRetry={props.onRetry}
-			/>
-		);
+	 return (
+	  <AssistantBubble
+	   message={message as AssistantMessage}
+	   streaming={!!props.streaming}
+	   toolResults={props.toolResults}
+	   pending={props.pending}
+	   partials={props.partials}
+	   isLast={props.isLast}
+	   onRetry={props.onRetry}
+	   dimmed={props.dimmed}
+	  />
+	 );
 	if (message.role === "system-notification") return <NotificationLine message={message as SystemNotificationMessage} />;
 	// toolResult messages render inline inside their assistant toolCall row
 	return null;
@@ -545,24 +603,28 @@ export function ChatView({ agent }: { agent: Agent }) {
 			setCompacting(false);
 		}
 	};
-	// edit-with-versions (user design 2026-10-23, replaces fork/rewrite buttons):
-	// ONE action per user message. ✎ parks the removed tail as a VERSION delta
-	// (server-side, `versions` sidecar keyed by vid/turn), truncates the
-	// transcript to before this message, and prefills the composer. The removed
-	// prompt + response are restorable via the 🕘 versions picker — nothing is
-	// ever lost, and no new sidebar session is created.
-	const userText = (m: any) => (typeof m?.content === "string" ? m.content : (m?.content || []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n"));
-	const editMessage = async (i: number) => {
+	// edit-with-versions (user design 2026-10-23, llama.cpp-webui parity):
+	// ✎ = INLINE edit of the bubble — PURELY LOCAL (no server call, no version,
+	// no refresh). The version delta is captured only when a DIFFERENT text is
+	// saved ("save & resend"), server-side via edit-commit.
+	const [editingIdx, setEditingIdx] = useState<number | null>(null);
+	const editSidRef = useRef<string | null>((agent as any).currentSessionId ?? null);
+	useEffect(() => {
+		const sid = (agent as any).currentSessionId ?? null;
+		if (editSidRef.current !== sid) { editSidRef.current = sid; setEditingIdx(null); } // session switch cancels a pending inline edit
+	});
+	const saveEdit = async (i: number, text: string) => {
 		const msgs = agent.state.messages as any[];
 		const m = msgs[i];
-		if (!m || m.role !== "user" || (agent as any).serverSide !== true) return;
-		const text = userText(m);
+		const orig = typeof m?.content === "string" ? m.content : (m?.content || []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n");
+		if (!m || m.role !== "user") { setEditingIdx(null); return; }
+		if (text.trim() === String(orig).trim()) { setEditingIdx(null); return; } // unchanged → no version (user design)
 		try {
-			const r = await (agent as any).rewrite(i); // server: park tail as version delta, truncate to [0..i)
-			if (!r?.ok) throw new Error(r?.reason || r?.error || "rewrite failed");
-			note(`✎ editing — the removed turn (prompt + ${Math.max(0, (r.version?.count ?? 1) - 1)} response msgs) is saved as version #${r.version?.vid ?? "?"} (🕘 picker). Edit the text and send.`);
-			steerSeq.current += 1;
-			setSteerDraft({ text, seq: steerSeq.current }); // composer prefill
+			const r = await (agent as any).editCommit(i, text);
+			if (!r?.ok) throw new Error(r?.reason || r?.error || "edit failed");
+			note(r?.noop ? "edit cancelled — text unchanged" : `✎ saved — the old turn was parked as version #${r.version?.vid ?? "?"} (🕘 picker); the edited message is on its way`);
+			setEditingIdx(null);
+			window.dispatchEvent(new CustomEvent("pi-composer-focus")); // arena review: focus returns to the composer after save
 		} catch (err: any) {
 			note(err?.message || String(err));
 		}
@@ -799,8 +861,11 @@ export function ChatView({ agent }: { agent: Agent }) {
 			<div class="pw-scroll" ref={scrollRef} onScroll={onScroll} onWheel={unstick} onTouchStart={unstick}>
 				<div class="pw-thread">
 					{state.messages.map((m: any, i: number) => (
+					<Fragment key={keyOf(m)}>
+					{editingIdx !== null && i === editingIdx + 1 && (
+						<div class="pw-edit-divider">messages below will be replaced — the old turn is saved as a restorable version on Resubmit</div>
+					)}
 					<MessageView
-						key={keyOf(m)}
 						message={m}
 						toolResults={toolResults}
 						pending={state.pendingToolCalls}
@@ -808,12 +873,17 @@ export function ChatView({ agent }: { agent: Agent }) {
 						isLast={i === state.messages.length - 1 && !state.streamingMessage}
 						index={i}
 						justUpdated={compactDone && i === summaryIdx}
+						dimmed={editingIdx !== null && i > editingIdx}
 						canMutate={!state.isStreaming && (agent as any).serverSide === true}
-						onEditMessage={editMessage}
+						onEditMessage={(idx: number) => setEditingIdx(idx)}
+						editing={editingIdx === i}
+						onSaveEdit={saveEdit}
+						onCancelEdit={() => setEditingIdx(null)}
 						onRetry={retry}
 						onOpenFile={openFileViewer}
 					/>
-					))}
+					</Fragment>
+				))}
 					{state.streamingMessage ? (
 						<MessageView
 							key="streaming"
@@ -878,7 +948,7 @@ export function ChatView({ agent }: { agent: Agent }) {
 			<UsageBar agent={agent} canCompact={(agent as any).serverSide === true && !state.isStreaming && state.messages.length > 6} compacting={compacting} onCompact={compact} />
 			{(agent as any).serverSide === true && (
 				<div class="pw-versions-bar">
-					<button type="button" class="pw-compact-btn" title="Versions — every ✎ edit saves the removed turn here; restore swaps it back (lossless both ways)" onClick={async () => {
+					<button type="button" class="pw-compact-btn" aria-label="Message versions" title="Versions — every inline edit saves the removed turn here; switching is lossless (the current tail is saved first)" onClick={async () => {
 						const next = !versionsOpen;
 						setVersionsOpen(next);
 						if (next) {
@@ -892,15 +962,15 @@ export function ChatView({ agent }: { agent: Agent }) {
 							: versionsList.length === 0 ? <div class="pw-versions-empty">no saved versions yet — ✎ edit a message to create one</div>
 							: [...versionsList].reverse().map((v: any) => (
 								<div class="pw-versions-row" key={v.vid}>
-									<span class="pw-versions-meta">#{v.vid} · turn {v.turn} · {v.count} msg{v.count === 1 ? "" : "s"} · {new Date(v.at).toLocaleTimeString()} · {v.reason}</span>
-									<button type="button" class="pw-versions-restore" onClick={async () => {
-										try {
-											const r = await (agent as any).restoreVersion(v.vid);
-											if (!r?.ok) throw new Error(r?.reason || r?.error || "restore failed");
-											note(`🕘 restored version #${v.vid} — the replaced tail was saved as a new version (nothing lost)`);
-											setVersionsOpen(false);
-										} catch (err: any) { note(err?.message || String(err)); }
-									}}>restore</button>
+								 <span class="pw-versions-meta">#{v.vid} · turn {v.turn} · {v.count} msg{v.count === 1 ? "" : "s"} · {new Date(v.at).toLocaleTimeString()} · {v.reason}{v.preview ? <span class="pw-versions-preview"> — “{v.preview}”</span> : null}</span>
+								 <button type="button" class="pw-versions-restore" title="Current conversation will be saved as a version before switching (lossless)" onClick={async () => {
+								  try {
+								   const r = await (agent as any).restoreVersion(v.vid);
+								   if (!r?.ok) throw new Error(r?.reason || r?.error || "switch failed");
+								   note(`🕘 switched to version #${v.vid} — the replaced tail was saved as a new version (nothing lost)`);
+								   setVersionsOpen(false);
+								  } catch (err: any) { note(err?.message || String(err)); }
+								 }}>switch to</button>
 								</div>
 							))}
 						</div>
@@ -1029,6 +1099,13 @@ export function Editor({
 			try { ta.setSelectionRange(steerDraft.text.length, steerDraft.text.length); } catch { /* older engines */ }
 		}
 	}, [steerDraft?.seq]);
+
+	// focus returns to the composer after an inline-edit save (arena review #9)
+	useEffect(() => {
+		const onFocus = () => taRef.current?.focus();
+		window.addEventListener("pi-composer-focus", onFocus);
+		return () => window.removeEventListener("pi-composer-focus", onFocus);
+	}, []);
 
 	// auto-grow
 	useLayoutEffect(() => {

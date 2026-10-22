@@ -2103,6 +2103,16 @@ function agentConn(ws) {
 					} catch (err) { safeSend(ws, { type: "error", id: m.id, error: err.message }); }
 					break;
 				}
+				case "edit-commit": {
+					// inline edit save (llama.cpp-webui parity): version-park the old tail,
+					// truncate to the prefix, re-prompt with the edited text
+					if (!currentSession) { safeSend(ws, { type: "error", id: m.id, error: "attach first" }); break; }
+					try {
+						const r = await agentHub.editCommit(currentSession, Number(m.index), String(m.text || ""));
+						safeSend(ws, { type: "edit-committed", id: m.id, ...r });
+					} catch (err) { safeSend(ws, { type: "error", id: m.id, error: err.message }); }
+					break;
+				}
 				case "compact": {
 					// /compact (pi parity): summarize older history, keep the recent tail.
 					// Long (LLM call) — the reply lands when compaction finishes; the hub

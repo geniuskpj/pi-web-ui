@@ -1761,6 +1761,38 @@ html.dark .pw-term-host.wterm {
 }
 .pw-versions-restore:hover { background: rgba(96, 165, 250, 0.14); }
 .pw-versions-empty { padding: 6px 8px; opacity: 0.6; }
+
+/* inline edit (llama.cpp-webui parity): the bubble becomes a textarea until
+   Resubmit — nothing is sent, no version is made, until a DIFFERENT text is
+   saved. Accent border (no glow — arena review: glow competes with the
+   composer focus ring); subtle accent tint via color-mix. */
+.pw-msg-editing { max-width: 75%; padding: 10px 12px; border: 1px solid rgba(96, 165, 250, 0.6); background: color-mix(in oklch, var(--secondary, #f4f4f5) 92%, #60a5fa); }
+.pw-edit-ta {
+	width: 100%; min-height: 60px; max-height: 320px;
+	background: transparent; color: inherit; border: none; outline: none;
+	font: inherit; line-height: 1.6; word-break: break-word;
+	overflow: auto; /* autogrow via JS (arena review) — no resize handle */
+}
+.pw-edit-actions { display: flex; gap: 6px; justify-content: flex-end; margin-top: 6px; }
+.pw-edit-save, .pw-edit-cancel {
+	background: transparent; border-radius: 8px; cursor: pointer; font-size: 12px; padding: 4px 10px;
+}
+.pw-edit-save { border: 1px solid rgba(96, 165, 250, 0.6); color: #93c5fd; }
+.pw-edit-save:hover { background: rgba(96, 165, 250, 0.16); }
+.pw-edit-cancel { border: 1px solid rgba(128, 128, 128, 0.4); color: inherit; opacity: 0.8; }
+.pw-edit-cancel:hover { background: rgba(128, 128, 128, 0.14); }
+/* while editing: everything after the edited message dims (arena review —
+   visible-but-dimmed beats hiding: context stays referenceable) */
+.pw-will-replace { opacity: 0.38; pointer-events: none; transition: opacity 150ms ease; }
+.pw-edit-divider {
+	margin: 6px auto; max-width: 92%; text-align: center;
+	font-size: 11px; opacity: 0.55;
+	border-top: 1px dashed rgba(128, 128, 128, 0.35); padding-top: 6px;
+}
+.pw-versions-preview { opacity: 0.65; }
+@media (prefers-reduced-motion: reduce) {
+	.pw-will-replace, .pw-compact-fresh, .pw-compact-spinner { animation: none !important; transition: none !important; }
+}
 .pw-compact-btn {
 	background: transparent; border: 1px solid rgba(96, 165, 250, 0.4);
 	border-radius: 10px; color: inherit; cursor: pointer;

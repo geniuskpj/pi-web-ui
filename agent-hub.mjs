@@ -665,6 +665,46 @@ export class AgentHub {
 		return await this.versions.list(sessionId);
 	}
 
+	/** INLINE EDIT commit (llama.cpp-webui parity, user design 2026-10-23):
+	 *  save a DIFFERENT text for messages[index]. The old tail (prompt +
+	 *  responses) is parked as a version delta, the transcript is truncated to
+		*  the prefix, and the edited text goes through the NORMAL prompt path (lock,
+	 *  steer conversion, usage) — the response regenerates automatically.
+		*  Identical text = no-op (a version is made only when a different message
+		*  is saved). The ✎ click itself is pure UI — nothing reaches the server
+		*  until this commit. */
+	async editCommit(sessionId, index, text) {
+		const entry = await this._ensureEntry(sessionId);
+		if (!entry) throw new Error("no live session");
+		if (entry.compacting) throw new Error("compaction in progress");
+		if (entry.agent.state.isStreaming) throw new Error("cannot edit while a run is streaming — stop it first");
+		const msgs = entry.agent.state.messages;
+		const i = Math.max(0, Math.min(Math.floor(Number(index)) || 0, msgs.length - 1));
+		if (!msgs[i] || msgs[i].role !== "user") throw new Error("can only edit user messages");
+		const contentText = (m) => (typeof m?.content === "string" ? m.content : (m?.content || []).filter((b) => b?.type === "text").map((b) => b.text || "").join("\n"));
+		if (String(text).trim() === contentText(msgs[i]).trim()) return { ok: true, noop: true };
+		let version = null;
+		if (this.versions) {
+			try {
+				version = await this.versions.append(sessionId, {
+					turn: i,
+					firstId: msgs[i]?.id || null,
+					count: msgs.length - i,
+					reason: "edit",
+					messages: JSON.parse(JSON.stringify(msgs.slice(i))),
+				});
+			} catch { /* best-effort */ }
+		}
+		entry.agent.state.messages = msgs.slice(0, i);
+		entry.mutateEpoch = (entry.mutateEpoch || 0) + 1;
+		entry.pendingPrompt = null; entry.pendingPromptMessage = null; entry.followUpCount = 0; entry.runtime.pendingPrompts = 0;
+		this.emitRuntime(sessionId); this.emitSteering(sessionId);
+		await this.persistSession(sessionId, true);
+		this.broadcastState(sessionId);
+		const r = await this.prompt(sessionId, String(text || ""));
+		return { ok: true, version, ...r };
+	}
+
 	/** RESTORE a version: swap the saved tail back into the active transcript.
 	 *  The CURRENT tail from the same cut point is captured FIRST as its own
 		*  delta (reason "switch-away") — switching versions is lossless in both

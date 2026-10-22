@@ -99,8 +99,16 @@ async function versionsAppend(id, record) {
 }
 
 async function versionsList(id) {
-	// meta only — never ship the message bodies for a list
-	return (await readVersions(id)).map((r) => ({ vid: r.vid, at: r.at, turn: r.turn, firstId: r.firstId, count: r.count, reason: r.reason }));
+	// meta only — never ship the message bodies for a list. preview = first text
+	// of the record's first message (80 chars) so the picker rows are readable
+	// (arena review: users distinguish versions by content, not ids)
+	const previewOf = (r) => {
+		const m = (r.messages || [])[0];
+		if (!m) return "";
+		const t = typeof m.content === "string" ? m.content : (m.content || []).filter((b) => b?.type === "text").map((b) => b.text || "").join(" ");
+		return String(t).replace(/\s+/g, " ").trim().slice(0, 80);
+	};
+	return (await readVersions(id)).map((r) => ({ vid: r.vid, at: r.at, turn: r.turn, firstId: r.firstId, count: r.count, reason: r.reason, preview: previewOf(r) }));
 }
 
 async function versionsGet(id, vid) {

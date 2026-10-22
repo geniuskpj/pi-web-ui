@@ -288,6 +288,15 @@ export class ProxyAgent {
 		return this.sendAwait({ type: "restore-version", vid }, 30000);
 	}
 
+	/** INLINE EDIT commit (llama.cpp-webui parity): save a DIFFERENT text for
+	 *  messages[index] — server parks the old tail as a version delta, truncates,
+		*  and re-prompts through the normal path. No-op on identical text. */
+	async editCommit(index: number, text: string): Promise<any> {
+		const ready = await this.whenReady(8000);
+		if (!ready) throw new Error("Agent WS not connected");
+		return this.sendAwait({ type: "edit-commit", index, text }, 30000);
+	}
+
 	async prompt(input: any, images?: any[]): Promise<any> {
 		const ready = await this.whenReady(8000);
 		if (!ready) throw new Error("Agent WS not connected");
