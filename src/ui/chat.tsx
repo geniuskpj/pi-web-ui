@@ -848,13 +848,36 @@ export function ChatView({ agent }: { agent: Agent }) {
 		}
 	};
 	const switchVersion = async (vid: number) => {
-		try {
-			const r = await (agent as any).restoreVersion(vid);
-			if (!r?.ok) throw new Error(r?.reason || r?.error || "switch failed");
-			note(`🕘 switched to version #${vid} — the replaced tail was saved as a new version (nothing lost)`);
-			setVersionsOpen(false);
-		} catch (err: any) { note(err?.message || String(err)); }
+	 try {
+	  const r = await (agent as any).restoreVersion(vid);
+	  if (!r?.ok) throw new Error(r?.reason || r?.error || "switch failed");
+	   note(`🕘 switched to version #${vid} — the replaced tail was saved as a new version (nothing lost)`);
+	   setVersionsOpen(false);
+	 } catch (err: any) { note(err?.message || String(err)); }
 	};
+	// STRANDED-SESSION BANNER (2026-10-23 mobile incident): the tab's URL/bookmark
+	// can pin a session whose conversation CONTINUED under a new id (server-restart
+	// reseed / migration) with an identical title — the device then shows a dead
+	// transcript ending in aborted/error and "nothing syncs". When the last turn
+	// ended aborted/error, ask the server for a newer same-title session and offer
+	 // the jump.
+	const [continuation, setContinuation] = useState<any | null>(null);
+	const lastStop = state.messages.length ? (state.messages[state.messages.length - 1] as any)?.stopReason : undefined;
+	useEffect(() => {
+	 if (state.isStreaming || (lastStop !== "aborted" && lastStop !== "error")) { setContinuation(null); return; }
+	 let alive = true;
+	 (async () => {
+	  try {
+	   const sid = (agent as any).currentSessionId;
+	   if (!sid) return;
+	   const r = await fetch(`/api/agent/continuation/${encodeURIComponent(sid)}`);
+	   if (!r.ok) return;
+	   const j = await r.json();
+	   if (alive) setContinuation(j?.continuation || null);
+	  } catch { /* offline — no banner */ }
+	 })();
+	 return () => { alive = false; };
+	}, [lastStop, state.isStreaming]);
 	const compactSid = useRef<string | null>(null);
 	const compactSettled = useRef(false); // compact() reply path already handled it
 	useEffect(() => {
@@ -899,6 +922,12 @@ export function ChatView({ agent }: { agent: Agent }) {
 		<div class="pw-chat">
 			<div class="pw-scroll" ref={scrollRef} onScroll={onScroll} onWheel={unstick} onTouchStart={unstick}>
 				<div class="pw-thread">
+				 {continuation && (
+				  <div class="pw-continuation">
+				   <span>⏹ This session ended — the conversation continues in a newer session ({continuation.messageCount ?? "?"} msgs)</span>
+				   <button type="button" class="pw-continuation-open" onClick={() => { setContinuation(null); window.dispatchEvent(new CustomEvent("pi-open-session", { detail: continuation.id })); }}>open it</button>
+				  </div>
+				 )}
 					{state.messages.map((m: any, i: number) => (
 					<Fragment key={keyOf(m)}>
 					{editingIdx !== null && i === editingIdx + 1 && (

@@ -2191,6 +2191,33 @@ app.post("/api/agent/thinking", async (c) => {
 		return c.json({ ok: true });
 	} catch (err) { return c.json({ error: err.message }, 500); }
 });
+// STRANDED-SESSION LOOKUP (2026-10-23 mobile incident): a device can stay pinned
+// (via URL/bookmark) to a session whose conversation CONTINUED under a new id —
+// server-restart reseed, client migration, etc. — with an identical title. When
+// the opened transcript ends aborted/error, the client asks here whether a newer
+// same-title session with MORE messages continues it.
+app.get("/api/agent/continuation/:id", async (c) => {
+	try {
+		const id = c.req.param("id");
+		let meta = null;
+		const entry = agentHub.sessions.get(id);
+		if (entry) {
+			meta = { title: entry.title, createdAt: entry.createdAt, messageCount: entry.agent.state.messages.length };
+		}
+		if (!meta?.title) {
+			const m = await storeOp("meta", { id });
+			if (m?.metadata) meta = { title: m.metadata.title, createdAt: m.metadata.createdAt, messageCount: m.metadata.messageCount ?? 0 };
+		}
+		if (!meta?.title) return c.json({ continuation: null });
+		const all = await storeOp("list", {});
+		const cands = (all || []).filter((s) => s && s.id !== id && s.title === meta.title
+			&& new Date(s.createdAt || 0) > new Date(meta.createdAt || 0)
+			&& (s.messageCount || 0) > (meta.messageCount || 0));
+		cands.sort((a, b) => String(b.lastModified || "").localeCompare(String(a.lastModified || "")));
+		const best = cands[0] || null;
+		return c.json({ continuation: best ? { id: best.id, title: best.title, messageCount: best.messageCount, lastModified: best.lastModified } : null });
+	} catch (err) { return c.json({ error: err.message }, 500); }
+});
 app.get("/api/agent/session/:id", async (c) => {
 	try {
 		const id = c.req.param("id");
@@ -2303,7 +2330,12 @@ const httpServer = serve({ fetch: app.fetch, port: PORT, hostname: HOST }, (info
 }).on("upgrade", (req, socket, head) => {
 	const { pathname } = new URL(req.url, "http://localhost");
 	// /ws/* carries session metadata + agent streams — token-gate non-loopback peers
-	if (!isLoopback(req) && !authorized(req)) { socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n"); socket.destroy(); return; }
+	// (rejections are LOGGED — silent 401/403 upgrades made the 2026-10-23 mobile
+	// stranding incident needlessly hard to diagnose)
+	if (!isLoopback(req) && !authorized(req)) {
+		console.log(`[ws] 401 upgrade rejected: ${pathname} host=${req.headers.host} token=${requestToken(req) ? "present" : "missing"}`);
+		socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n"); socket.destroy(); return;
+	}
 	// browser-origin allowlist for sync/agent (P1): browsers ALWAYS send Origin on
 	// WS handshakes and WS has no CORS — a rebinding page presents an attacker
 	// Origin over a loopback socket (token-gated paths never fire for loopback).
@@ -2312,7 +2344,10 @@ const httpServer = serve({ fetch: app.fetch, port: PORT, hostname: HOST }, (info
 	if ((pathname === "/ws/sync" || pathname === "/ws/agent") && req.headers.origin) {
 		let oh = null;
 		try { oh = new URL(String(req.headers.origin)).host.toLowerCase(); } catch { oh = null; }
-		if (!oh || !ALLOWED_HOSTS.has(oh)) { socket.write("HTTP/1.1 403 Forbidden\r\n\r\n"); socket.destroy(); return; }
+		if (!oh || !ALLOWED_HOSTS.has(oh)) {
+			console.log(`[ws] 403 upgrade rejected: ${pathname} origin=${String(req.headers.origin)} (not in Host allowlist)`);
+			socket.write("HTTP/1.1 403 Forbidden\r\n\r\n"); socket.destroy(); return;
+		}
 	}
 	if (pathname === "/ws/sync") wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 	else if (pathname === "/ws/agent") wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
