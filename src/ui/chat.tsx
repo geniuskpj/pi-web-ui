@@ -562,9 +562,11 @@ export function ChatView({ agent }: { agent: Agent }) {
 			if (i === msgs.length - 1) {
 				const r = await (agent as any).rewrite(i); // drop this user msg + anything after (nothing after by definition)
 				if (!r?.ok) throw new Error(r?.reason || r?.error || "rewrite failed");
+				note(`✎ ready to edit — the removed turn is gone from this session${r.backupPath ? " but a pre-rewrite backup was saved on the server" : ""}. Edit the text and send.`);
 			} else {
 				const r = await (agent as any).fork(i); // copy prefix EXCLUDING this message — the original keeps everything
 				if (!r?.ok || !r?.newSessionId) throw new Error(r?.reason || r?.error || "fork failed");
+				note(`✎ branched — editing in “${r.title || "fork"}” (⑂-marked, in the sidebar). The original session keeps the full history.`);
 				window.dispatchEvent(new CustomEvent("pi-open-session", { detail: r.newSessionId }));
 			}
 			steerSeq.current += 1;
@@ -578,8 +580,9 @@ export function ChatView({ agent }: { agent: Agent }) {
 		try {
 			const r = await (agent as any).fork(i + 1); // include this message
 			if (!r?.ok || !r?.newSessionId) throw new Error(r?.reason || r?.error || "fork failed");
-			window.dispatchEvent(new CustomEvent("pi-open-session", { detail: r.newSessionId }));
-			note("forked — original session untouched");
+			// STAY in this session (user report: navigating away made the original
+			// "disappear" — it was just a same-titled fork they couldn't tell apart).
+			note(`⑂ forked — “${r.title || "new session"}” created in the sidebar with the transcript up to this message. You are still in the original: everything after it (incl. the response) stays here.`);
 		} catch (err: any) {
 			note(err?.message || String(err));
 		}

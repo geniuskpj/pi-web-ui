@@ -159,7 +159,7 @@ export class AgentHub {
 		return undefined;
 	}
 
-	getSession(sessionId, { modelId, thinkingLevel, messages } = {}) {
+	getSession(sessionId, { modelId, thinkingLevel, title, messages } = {}) {
 		this.discarded.delete(sessionId); // explicit re-open undeletes
 		let entry = this.sessions.get(sessionId);
 		if (!entry) {
@@ -202,6 +202,7 @@ export class AgentHub {
 				pendingPrompt: null, // steering UI payload {text, images, queuedAt} while held
 				pendingPromptMessage: null, // the exact AgentMessage — consumed on message_end
 			};
+			if (title) entry.title = title; // sticky-title source (mirror metadata)
 			this.sessions.set(sessionId, entry);
 
 			agent.subscribe((event) => {
@@ -526,12 +527,14 @@ export class AgentHub {
 						entry = this.getSession(sessionId, {
 							modelId: stored.metadata?.modelId,
 							thinkingLevel: stored.metadata?.thinkingLevel,
+							title: stored.metadata?.title,
 							messages: stored.messages,
 						});
 					} else {
 						entry.agent.state.messages = normalizeRestoredMessages(stored.messages);
 						if (stored.metadata?.modelId) { const m = this._getModel(stored.metadata.modelId); if (m) entry.agent.state.model = m; }
 						if (stored.metadata?.thinkingLevel) entry.agent.state.thinkingLevel = stored.metadata.thinkingLevel;
+						if (stored.metadata?.title) entry.title = stored.metadata.title;
 					}
 				}
 			} catch { /* store miss → the caller's guards handle it */ }
@@ -556,6 +559,7 @@ export class AgentHub {
 		// already renamed by the old logic, e.g. 656aacb0).
 		const titleIsBad = !entry.title || entry.title === "Session" || entry.title === "Fork" || /^## Conversation summary \(auto-compacted\)/.test(entry.title);
 		if (!titleIsBad) title = entry.title;
+		entry.title = title; // STICKY: remember it so later persists never re-derive (entry.title was never stored before → sticky never engaged)
 		const metadata = {
 			id: sessionId,
 			version: 1, // mirror format: linear messages (pi's tree format is v3 — see docs/session-format.md)
@@ -595,9 +599,15 @@ export class AgentHub {
 			messages,
 		});
 		forked.forkedFrom = sessionId; // lineage in the JSONL header (pi's parentSession)
+		// DISTINGUISHABLE TITLE (user report 2026-10-23): the fork used to inherit
+		// the identical derived title — two same-named sessions in the sidebar and
+		// the user "couldn't find the original". The fork gets the source title +
+		// " ⑂" (stripped of a previous suffix on re-forks).
+		const baseTitle = String(entry.title || "").replace(/ ⑂$/, "");
+		if (baseTitle && baseTitle !== "Session" && baseTitle !== "Fork") forked.title = baseTitle + " ⑂";
 		if (n === 0) await this.persist(newId, JSON.stringify(this._buildMetadata(newId)) + "\n");
 		else await this.persistSession(newId, true);
-		return { ok: true, newSessionId: newId, copied: n };
+		return { ok: true, newSessionId: newId, copied: n, title: forked.title || this._buildMetadata(newId).title };
 	}
 
 	/** REWRITE (linear-model message edit): truncate the transcript to
@@ -616,6 +626,11 @@ export class AgentHub {
 		if (entry.agent.state.isStreaming) throw new Error("cannot rewrite while a run is streaming — stop it first");
 		const msgs = entry.agent.state.messages;
 		const n = Math.max(0, Math.min(Math.floor(Number(keepCount)) || 0, msgs.length));
+		// PRE-REWRITE BACKUP (user report: "with rewrite I couldn't see the previous
+		// version"): the linear mirror is truncated IN PLACE — the dropped tail was
+		// unrecoverable. Same gzip mirror backup as compaction (31-day prune).
+		let backupPath = null;
+		if (this.backupMirror) { try { backupPath = await this.backupMirror(sessionId); } catch { /* best-effort */ } }
 		entry.agent.state.messages = msgs.slice(0, n);
 		entry.mutateEpoch = (entry.mutateEpoch || 0) + 1;
 		entry.pendingPrompt = null;
@@ -626,7 +641,7 @@ export class AgentHub {
 		this.emitSteering(sessionId);
 		await this.persistSession(sessionId, true);
 		this.broadcastState(sessionId);
-		return { ok: true, kept: n };
+		return { ok: true, kept: n, backupPath };
 	}
 
 	/** COMPACT (pi /compact parity): summarize older history, replace the span
