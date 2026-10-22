@@ -7,6 +7,7 @@
 //   - every connected device (laptop/phone) is a viewer/controller via /ws/agent
 // Clients can disconnect at any time — long jobs keep running server-side.
 import { Agent } from "@earendil-works/pi-agent-core";
+import crypto from "node:crypto";
 
 const HOT_AGENT_CAP = 10;
 const IDLE_EVICT_MS = 30 * 60 * 1000;
@@ -88,10 +89,13 @@ export function normalizeRestoredMessages(messages, stats) {
 }
 
 export class AgentHub {
-	constructor({ modelsStore, getAuth, persist, broadcast, getTools, getSystemPrompt, defaultModelId, onRuntimeChange }) {
+	constructor({ modelsStore, getAuth, persist, broadcast, getTools, getSystemPrompt, defaultModelId, onRuntimeChange, loadMessages }) {
 		this.modelsStore = modelsStore;
 		this.getAuth = getAuth;
 		this.persist = persist; // async (id, data, metadata) — worker store (atomic)
+		// optional store READ accessor (server.mjs wires storeOp("get")): lets
+		// forkSession self-hydrate a cold session (hub restart, no attach yet)
+		this.loadMessages = loadMessages || null; // async (id) → {messages, metadata} | null
 		this.broadcast = broadcast; // (sessionId, msg) — send to attached clients
 		// server-side toolset (2026-10-21): the SAME builtin+extension tools the exec
 		// bridge exposes — executed IN THIS PROCESS by the server-side agent loop, so
@@ -298,6 +302,7 @@ export class AgentHub {
 		const title = firstUser ? extractPreviewText(firstUser.content) || "Session" : "Session";
 		const metadata = {
 			id: sessionId,
+			version: 1, // mirror format: linear messages (pi's tree format is v3 — see docs/session-format.md)
 			title,
 			modelId: state.model?.id ?? "",
 			thinkingLevel: state.thinkingLevel,
@@ -305,6 +310,7 @@ export class AgentHub {
 			lastModified: now,
 			messageCount: state.messages.length,
 		};
+		if (entry.forkedFrom) metadata.forkedFrom = entry.forkedFrom; // lineage (pi header: parentSession)
 		if (!entry.createdAt) entry.createdAt = now;
 		const lines = [JSON.stringify(metadata)];
 		// FULL message objects (2026-10-22): the old {role, content, timestamp}
@@ -459,6 +465,87 @@ export class AgentHub {
 			pendingToolCalls: state.pendingToolCalls instanceof Set ? [...state.pendingToolCalls] : [],
 			pendingPrompt: entry.pendingPrompt ?? null,
 		};
+	}
+
+	/** Full-state frame to all attached clients: fork/rewrite mutate the transcript
+	 *  OUTSIDE the normal event stream, so clients must resynchronize wholesale
+	 *  (the client's "state" handler replaces state.messages verbatim). Buffered
+	 *  during attach snapshot builds like agent events. */
+	broadcastState(sessionId) {
+		const entry = this.sessions.get(sessionId);
+		if (!entry) return;
+		const payload = { type: "state", sessionId, ...this.getState(sessionId) };
+		if (entry.buffer) entry.buffer.push(payload);
+		else this.broadcast(sessionId, payload);
+	}
+
+	/** FORK (llama.cpp webui parity — forkConversation): clone messages[0..keepCount)
+	 *  into a NEW session and persist it immediately; the original is untouched.
+	 *  Usage fields travel with the copied messages (full-fidelity mirrors since
+		*  2026-10-22), so the fork's UsageBar totals show the INHERITED spend —
+	 *  correct: those tokens were spent. Cold sessions hydrate from the store
+	 *  first, so forking works right after a restart. */
+	async forkSession(sessionId, keepCount) {
+		let entry = this.sessions.get(sessionId);
+		// self-hydrate: after a hub restart the entry may not exist yet (attach is
+		// what normally loads the store) — pull the mirror directly so fork works
+		// on any persisted session
+		if ((!entry || entry.agent.state.messages.length === 0) && this.loadMessages) {
+			try {
+				const stored = await this.loadMessages(sessionId);
+				if (stored?.messages?.length) {
+					entry = this.getSession(sessionId, {
+						modelId: stored.metadata?.modelId,
+						thinkingLevel: stored.metadata?.thinkingLevel,
+						messages: stored.messages,
+					});
+				}
+			} catch { /* store miss → fall through to the entry (or the n<1 guard) */ }
+		}
+		if (!entry) throw new Error("no live session");
+		if (entry.agent.state.isStreaming) throw new Error("cannot fork while a run is streaming — stop it first");
+		const msgs = entry.agent.state.messages;
+		const n = Math.max(0, Math.min(Math.floor(Number(keepCount)) || 0, msgs.length));
+		if (n < 1) throw new Error("fork needs at least one message to copy");
+		const messages = msgs.slice(0, n).map((m) => {
+			const copy = { ...m };
+			if (Array.isArray(copy.content)) copy.content = JSON.parse(JSON.stringify(copy.content)); // detach block refs
+			return copy;
+		});
+		const newId = crypto.randomUUID();
+		const forked = this.getSession(newId, {
+			modelId: entry.agent.state.model?.id,
+			thinkingLevel: entry.agent.state.thinkingLevel,
+			messages,
+		});
+		forked.forkedFrom = sessionId; // lineage in the JSONL header (pi's parentSession)
+		this.persistSession(newId, true); // immediate — the client navigates right away
+		return { ok: true, newSessionId: newId, copied: n };
+	}
+
+	/** REWRITE (linear-model message edit): truncate the transcript to
+	 *  messages[0..keepCount) IN PLACE — the caller re-prompts with the edited
+	 *  text. Idle only (Stop first). The client's UsageBar is message-derived, so
+	 *  token totals and the context estimate shrink automatically; a forced
+	 *  persist refreshes the session list's messageCount. Queued steering is
+	 *  dropped (a truncation invalidates it) and other devices resynchronize via
+	 *  broadcastState. */
+	rewriteSession(sessionId, keepCount) {
+		const entry = this.sessions.get(sessionId);
+		if (!entry) throw new Error("no live session");
+		if (entry.agent.state.isStreaming) throw new Error("cannot rewrite while a run is streaming — stop it first");
+		const msgs = entry.agent.state.messages;
+		const n = Math.max(0, Math.min(Math.floor(Number(keepCount)) || 0, msgs.length));
+		entry.agent.state.messages = msgs.slice(0, n);
+		entry.pendingPrompt = null;
+		entry.pendingPromptMessage = null;
+		entry.followUpCount = 0;
+		entry.runtime.pendingPrompts = 0;
+		this.emitRuntime(sessionId);
+		this.emitSteering(sessionId);
+		this.persistSession(sessionId, true);
+		this.broadcastState(sessionId);
+		return { ok: true, kept: n };
 	}
 
 	/** Runtime for an existing entry — idle included, seq-stamped (the client's

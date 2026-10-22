@@ -133,6 +133,8 @@ Non-zero exits are NOT errors (`exit <code>` + details.exitCode); spawn-fail/tim
 No `ls` builtin — bash covers listing (mirrors pi's default tool set; an unadvertised-but-registered
 tool gets used without steering is the stated rationale).
 
+**forkSession/rewriteSession** (2026-10-22, message fork/rewrite): `forkSession(id, keepCount)` clones messages[0..keepCount) into a NEW session (new uuid, `forkedFrom` lineage in the mirror header, immediate persist, self-hydrates cold sessions via the `loadMessages` store accessor) — the original is untouched; `rewriteSession(id, keepCount)` truncates in place (idle only, drops queued steering, forced persist, `broadcastState()` so every attached device resyncs via a full state frame). The client UsageBar is message-derived: forks inherit copied usage, rewrites drop removed usage — no counter migration needed. Mirror metadata now carries `version:1` + optional `forkedFrom` (pi's own session format is a v3 id/parentId TREE — session-format.md — which the linear mirror intentionally does not adopt; the UI preserves abandoned paths by forking before editing non-tail messages). WS: `{type:"fork"|"rewrite", id, keepCount}` → `{type:"forked"|"rewritten", id, …}`.
+
 **fetch**: server-side GET for web pages (2026-10-22). Same SSRF machinery as the LLM proxy:
 `proxyTargetBlocked(hostname)` depth-1, `llmAgent` dispatcher (its `connect.lookup = proxyLookup`
 validates EVERY resolved address, depth-2), and a manual redirect loop (≤5 hops) that re-checks

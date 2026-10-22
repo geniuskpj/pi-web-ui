@@ -21,6 +21,7 @@
     "test:runtime": "node tests/runtime-seq.test.mjs",
     "test:steer": "node tests/steering.e2e.mjs",
     "test:fetch": "node tests/fetch-tool.test.mjs",
+    "test:fork": "node tests/fork-rewrite.test.mjs",
     "test:shutdown": "node tests/shutdown.test.mjs"
   },
   "dependencies": {

@@ -1708,6 +1708,20 @@ html.dark .pw-term-host.wterm {
 .pw-resume-banner { display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: #2563eb; color: #fff; font-size: 13px; flex-shrink: 0; }
 .pw-resume-banner .pw-resume-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pw-resume-btn { background: rgba(255, 255, 255, 0.2); border: none; color: #fff; padding: 4px 12px; border-radius: 6px; cursor: pointer; font-weight: 600; }
+.pw-user-row { position: relative; }
+/* fork/rewrite hover actions on user messages (llama.cpp-webui parity) */
+.pw-msg-actions {
+	position: absolute; left: -6px; top: 4px; transform: translateX(-100%);
+	display: flex; gap: 4px; opacity: 0; transition: opacity 0.15s;
+}
+.pw-user-row:hover .pw-msg-actions, .pw-msg-actions:focus-within { opacity: 1; }
+.pw-msg-act {
+	background: transparent; border: 1px solid rgba(128, 128, 128, 0.35);
+	border-radius: 6px; color: inherit; cursor: pointer;
+	font-size: 12px; line-height: 1; padding: 4px 7px;
+}
+.pw-msg-act:hover { border-color: #60a5fa; background: rgba(96, 165, 250, 0.14); }
+
 .pw-resume-close { background: transparent; border: none; color: #fff; cursor: pointer; opacity: 0.8; font-size: 14px; }
 .pw-sess-runtime { font-size: 11px; color: #4ade80; margin-top: 2px; }
 .pw-sess-runtime-error { color: #f87171; }

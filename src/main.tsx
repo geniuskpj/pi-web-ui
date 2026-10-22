@@ -415,6 +415,12 @@ const loadSession = async (sessionId: string): Promise<boolean> => {
 const loadSessionById = async (sessionId: string) => {
 	if (!(await loadSession(sessionId))) newSession();
 };
+// fork/rewrite navigation: ChatView's ⑂/✎ actions dispatch pi-open-session with
+// the target session id (forked clone; original stays put)
+window.addEventListener("pi-open-session", (e: Event) => {
+	const id = (e as CustomEvent).detail;
+	if (typeof id === "string" && id) void loadSessionById(id);
+});
 const deleteSessionById = (deletedSessionId: string) => {
 	deletedSessionIds.add(deletedSessionId);
 	if (saveTimer) {

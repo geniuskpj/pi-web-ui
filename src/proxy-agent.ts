@@ -133,7 +133,9 @@ export class ProxyAgent {
 			this.notifyListeners({ type: "steering", pending: this.pendingPrompt });
 			return;
 		}
-		if (msg.type === "accepted" && msg.id && this.pendingReplies.has(msg.id)) {
+		// generic correlated reply: accepted / forked / rewritten (any frame with an
+		// id we're waiting on settles its request)
+		if (msg.id && this.pendingReplies.has(msg.id)) {
 			const resolve = this.pendingReplies.get(msg.id)!;
 			this.pendingReplies.delete(msg.id);
 			resolve(msg);
@@ -214,24 +216,42 @@ export class ProxyAgent {
 				// silently dropping the text)
 			return Promise.resolve({ accepted: false, reason: `${type} not sent — agent socket not connected` });
 		}
+		return this.sendAwait({ type, content, images: images?.length ? images : undefined }, type === "steer" ? 20000 : 0);
+	}
+
+	/** Generic correlated send: registers a reply slot keyed by id and waits for
+	 *  the hub's reply frame ({type:"accepted"|"forked"|"rewritten"|"error"}).
+		*  timeoutMs 0 = no timer (prompt replies arrive at run end). */
+	private sendAwait(msg: AnyRecord, timeoutMs = 0): Promise<any> {
+		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+			return Promise.resolve({ ok: false, reason: "agent socket not connected" });
+		}
 		const id = `${Date.now().toString(36)}-${++this.replySeq}`;
 		const p = new Promise<any>((resolve) => {
 			this.pendingReplies.set(id, resolve);
-			// TIMING ASYMMETRY (2026-10-22 bug): a STEER reply is immediate (the
-			// hub's _steer is synchronous) → 20s is a transport-loss safety net. A
-			// PROMPT reply arrives at RUN END (hub.prompt awaits the whole run) — the
-			// old shared 20s timeout resolved {accepted:false} mid-run and the
-			// composer restore put the sent text BACK into the input ("my prompt
-			// appears again in text input UI"). Prompt gets NO timer: its entry
-			// settles on the explicit reply or on WS close (see onclose). Same for a
-			// steer that the hub fell back to prompt() with (run ended mid-send).
-			if (type === "steer") {
-				const t = setTimeout(() => { if (this.pendingReplies.delete(id)) resolve({ accepted: false, timedOut: true, reason: "steer reply timeout — check the pending chip / transcript" }); }, 20000);
+			if (timeoutMs > 0) {
+				const t = setTimeout(() => { if (this.pendingReplies.delete(id)) resolve({ ok: false, timedOut: true, reason: "reply timeout" }); }, timeoutMs);
 				(t as any).unref?.();
 			}
 		});
-		this.sendMsg({ type, id, content, images: images?.length ? images : undefined });
+		this.ws.send(JSON.stringify({ ...msg, id }));
 		return p;
+	}
+
+	/** FORK: clone the transcript prefix (messages[0..keepCount)) into a NEW
+	 *  session — resolves {ok, newSessionId, copied}. Original stays untouched. */
+	async fork(keepCount: number): Promise<any> {
+		const ready = await this.whenReady(8000);
+		if (!ready) throw new Error("Agent WS not connected");
+		return this.sendAwait({ type: "fork", keepCount }, 10000);
+	}
+
+	/** REWRITE: truncate the CURRENT session to messages[0..keepCount) — idle
+	 *  only. Resolves {ok, kept}. Other devices resync via the hub's state frame. */
+	async rewrite(keepCount: number): Promise<any> {
+		const ready = await this.whenReady(8000);
+		if (!ready) throw new Error("Agent WS not connected");
+		return this.sendAwait({ type: "rewrite", keepCount }, 10000);
 	}
 
 	async prompt(input: any, images?: any[]): Promise<any> {

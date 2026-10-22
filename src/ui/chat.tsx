@@ -102,14 +102,21 @@ function formatUsage(u: AssistantMessage["usage"]): string {
 // ----------------------------------------------------------------------------
 // message components
 // ----------------------------------------------------------------------------
-function UserBubble({ message, onOpenFile }: { message: UserMessage; onOpenFile?: (path: string) => void }) {
+function UserBubble({ message, onOpenFile, index, canMutate, onEditMessage, onForkMessage }: { message: UserMessage; onOpenFile?: (path: string) => void; index?: number; canMutate?: boolean; onEditMessage?: (i: number) => void; onForkMessage?: (i: number) => void }) {
 	// attached workspace files render as clickable chips → open the explorer
 	// at that file (user request). Images have no path in ImageContent — text
 	// file chips only.
 	const text = textOf(message.content);
 	const files = [...text.matchAll(/^--- file: (.+?) ---$/gm)].map((m) => m[1]);
+	const actions = canMutate && typeof index === "number" && (onEditMessage || onForkMessage);
 	return (
 		<div class="pw-msg-row pw-user-row">
+			{actions && (
+				<div class="pw-msg-actions">
+					{onEditMessage && <button type="button" class="pw-msg-act" title="Edit — rewrite from this message (forks first when it is not the last message)" onClick={() => onEditMessage(index)}>✎</button>}
+					{onForkMessage && <button type="button" class="pw-msg-act" title="Fork — copy the transcript up to here into a new session" onClick={() => onForkMessage(index)}>⑂</button>}
+				</div>
+			)}
 			<div class="pw-msg pw-user">
 				<div class="pw-text-plain">{text}</div>
 				{files.length > 0 && onOpenFile && (
@@ -298,11 +305,15 @@ function MessageView(props: {
 	pending?: ReadonlySet<string>;
 	partials?: Map<string, string>;
 	isLast?: boolean;
+	index?: number;
+	canMutate?: boolean;
+	onEditMessage?: (i: number) => void;
+	onForkMessage?: (i: number) => void;
 	onRetry?: () => void;
 	onOpenFile?: (path: string) => void;
 }) {
 	const { message } = props;
-	if (message.role === "user") return <UserBubble message={message as UserMessage} onOpenFile={props.onOpenFile} />;
+	if (message.role === "user") return <UserBubble message={message as UserMessage} onOpenFile={props.onOpenFile} index={props.index} canMutate={props.canMutate} onEditMessage={props.onEditMessage} onForkMessage={props.onForkMessage} />;
 	if (message.role === "assistant")
 		return (
 			<AssistantBubble
@@ -493,6 +504,43 @@ export function ChatView({ agent }: { agent: Agent }) {
 	const cancelSteer = () => {
 		(agent as any).cancelSteering?.();
 	};
+	// fork/rewrite (llama.cpp-webui parity): per-user-message ✎ / ⑂. Server-side
+	// only. ✎ EDIT: tail message → in-place rewrite (truncate to the prefix,
+	// prefill the composer); older message → FORK first (pi's "the branch you
+	// leave survives", as a separate session) then prefill. ⑂ FORK: copy the
+	// prefix INCLUDING this message into a new session and navigate there.
+	const userText = (m: any) => (typeof m?.content === "string" ? m.content : (m?.content || []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n"));
+	const editMessage = async (i: number) => {
+		const msgs = agent.state.messages as any[];
+		const m = msgs[i];
+		if (!m || m.role !== "user" || (agent as any).serverSide !== true) return;
+		const text = userText(m);
+		try {
+			if (i === msgs.length - 1) {
+				const r = await (agent as any).rewrite(i); // drop this user msg + anything after (nothing after by definition)
+				if (r?.ok === false) throw new Error(r?.reason || "rewrite failed");
+			} else {
+				const r = await (agent as any).fork(i); // copy prefix EXCLUDING this message — the original keeps everything
+				if (r?.ok === false || !r?.newSessionId) throw new Error(r?.reason || "fork failed");
+				window.dispatchEvent(new CustomEvent("pi-open-session", { detail: r.newSessionId }));
+			}
+			steerSeq.current += 1;
+			setSteerDraft({ text, seq: steerSeq.current }); // composer prefill (survives the session switch)
+		} catch (err: any) {
+			note(err?.message || String(err));
+		}
+	};
+	const forkMessage = async (i: number) => {
+		if ((agent as any).serverSide !== true) return;
+		try {
+			const r = await (agent as any).fork(i + 1); // include this message
+			if (r?.ok === false || !r?.newSessionId) throw new Error(r?.reason || "fork failed");
+			window.dispatchEvent(new CustomEvent("pi-open-session", { detail: r.newSessionId }));
+			note("forked — original session untouched");
+		} catch (err: any) {
+			note(err?.message || String(err));
+		}
+	};
 	const attachNoteTimer = useRef<any>(null);
 	const note = (msg: string) => {
 		setAttachNote(msg);
@@ -666,16 +714,20 @@ export function ChatView({ agent }: { agent: Agent }) {
 			<div class="pw-scroll" ref={scrollRef} onScroll={onScroll} onWheel={unstick} onTouchStart={unstick}>
 				<div class="pw-thread">
 					{state.messages.map((m: any, i: number) => (
-						<MessageView
-							key={keyOf(m)}
-							message={m}
-							toolResults={toolResults}
-							pending={state.pendingToolCalls}
-							partials={partials.current}
-							isLast={i === state.messages.length - 1 && !state.streamingMessage}
-							onRetry={retry}
-							onOpenFile={openFileViewer}
-						/>
+					<MessageView
+						key={keyOf(m)}
+						message={m}
+						toolResults={toolResults}
+						pending={state.pendingToolCalls}
+						partials={partials.current}
+						isLast={i === state.messages.length - 1 && !state.streamingMessage}
+						index={i}
+						canMutate={!state.isStreaming && (agent as any).serverSide === true}
+						onEditMessage={editMessage}
+						onForkMessage={forkMessage}
+						onRetry={retry}
+						onOpenFile={openFileViewer}
+					/>
 					))}
 					{state.streamingMessage ? (
 						<MessageView

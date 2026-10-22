@@ -1733,6 +1733,9 @@ const agentHub = new AgentHub({
 	// tool objects the exec bridge exposes run IN-PROCESS; the system prompt and
 	// pi settings.json default model mirror what the browser path used
 	getTools: () => [...builtinTools, ...extensionTools],
+	// store READ accessor: forkSession self-hydrates cold sessions (hub restart,
+	// no attach yet) straight from the JSONL mirror
+	loadMessages: async (id) => { try { const j = await storeOp("get", { id }); return j?.messages?.length ? { messages: j.messages, metadata: j.metadata } : null; } catch { return null; } },
 	getSystemPrompt: () => effectiveSystemPrompt(),
 	defaultModelId: piDefaultModelId(),
 	onRuntimeChange: (sessionId, rt) => sendRuntime(sessionId, rt), // runtime deltas → tiny frame to ALL devices, bypasses all caches/throttles (fable5)
@@ -1962,6 +1965,26 @@ function agentConn(ws) {
 				case "abort":
 					if (currentSession) agentHub.abort(currentSession);
 					break;
+				case "fork": {
+					// llama.cpp-webui-style fork: clone the transcript prefix into a NEW
+					// session (original untouched); the client navigates to the new id
+					if (!currentSession) { safeSend(ws, { type: "error", id: m.id, error: "attach first" }); break; }
+					try {
+						const r = await agentHub.forkSession(currentSession, Number(m.keepCount));
+						safeSend(ws, { type: "forked", id: m.id, ...r });
+					} catch (err) { safeSend(ws, { type: "error", id: m.id, error: err.message }); }
+					break;
+				}
+				case "rewrite": {
+					// linear-model message edit: truncate the transcript to the prefix;
+					// all attached devices resynchronize via the hub's broadcastState
+					if (!currentSession) { safeSend(ws, { type: "error", id: m.id, error: "attach first" }); break; }
+					try {
+						const r = agentHub.rewriteSession(currentSession, Number(m.keepCount));
+						safeSend(ws, { type: "rewritten", id: m.id, ...r });
+					} catch (err) { safeSend(ws, { type: "error", id: m.id, error: err.message }); }
+					break;
+				}
 				case "steering-cancel": {
 					// ✎/✕ on the pending-steering chip: pull the held message back (edit
 					// pre-fills the composer client-side; cancel just drops it)
