@@ -1,34 +1,35 @@
 # Commit Review
 
-**Scope:** `baff665..df1b4f4` (including the report, hardening, and server-side agent commits)  
-**Review date:** 2026-10-21
+**Commit:** `aa1f503` — Fix post-restart 400s: persist full messages, re-link orphan toolResults
+**Review date:** 2026-10-22
 
 ## Findings
 
-### P2 — Proxy target checks do not validate resolved IP addresses
+### P2 — Mixed linked and orphaned tool results can corrupt restored tool-call history
 
-**File:** [server.mjs](./server.mjs#L1297)  
+**File:** [agent-hub.mjs](./agent-hub.mjs#L49)
 **Confidence:** High
 
-`proxyTargetBlocked()` rejects private and loopback IP literals and selected local hostnames, but ordinary DNS hostnames are allowed without checking their resolved addresses. `handleProxy()` passes those hostnames to `undiciFetch()` directly; the same hostname-only check is repeated for redirects. A hostname that resolves to a private, loopback, or link-local address can therefore reach an internal destination despite the new SSRF checks.
+The repair loop advances `k` only when it assigns an ID to an orphan result. It does not advance past tool calls already represented by linked results in the same consecutive result group. For an assistant message containing calls `a` and `b`, followed by a linked result for `a` and an orphan result for `b`, the orphan is assigned `a` as well. The later `matched` check sees `a` but not `b`, so it removes call `b` from the assistant message while retaining both results with the duplicate ID. This leaves a mismatched transcript and can send duplicate `tool_call_id` values to the provider.
 
-**Recommendation:** Resolve each destination before connecting, reject disallowed addresses, and pin the validated address for that request. Repeat this for every redirect hop and ensure the connection cannot perform a second, unvalidated DNS lookup.
+The existing regression test covers all-linked and all-orphan groups, but not a mixed group. A targeted probe reproduced the result IDs `["a", "a"]` and showed that call `b` is removed.
 
-### P2 — Runtime updates can be discarded as stale
+**Recommendation:** When assigning an orphan, skip call IDs already matched by preceding results in this group (or align each result to its call position while validating existing IDs). Add a mixed linked/orphan regression case that asserts both unique result IDs and preservation of both calls.
 
-**Files:** [agent-hub.mjs](./agent-hub.mjs#L104), [session-sync.ts](./src/session-sync.ts#L76)  
+### P3 — The one-time mirror repair can misreport and miss repairs
+
+**File:** [tests/repair-mirror-toolcalls.mjs](./tests/repair-mirror-toolcalls.mjs#L38)
 **Confidence:** High
 
-`entry.seq` advances for agent events, while runtime-only changes (for example, queued-prompt state and attach/detach client counts) emit using the existing sequence. The client rejects any runtime frame whose sequence is less than or equal to the current one, so these updates are dropped once it has received a frame for that sequence. This can leave runtime UI details stale.
+The script has two reporting/coverage gaps:
 
-**Recommendation:** Give runtime deltas their own monotonically increasing sequence, or otherwise permit same-agent-sequence updates while still preventing older runtime frames from overwriting newer state.
+- `normalizeRestoredMessages()` drops tool results it cannot link. The script then calculates `stillOrphan` from that filtered array and reports `orphans - stillOrphan` as “re-linked.” An unmatchable result that was discarded is therefore reported as successfully re-linked, with zero unmatchable results. A targeted probe confirmed this outcome.
+- The `if (!orphans) continue` fast path skips files that have dangling assistant `toolCall` blocks but no orphan `toolResult`s. Those calls are not removed from the on-disk mirror by the one-time repair, despite the normalizer being intended to clean up dangling calls as well.
+
+**Recommendation:** Track re-linked, discarded, and dangling counts from the original records and normalized output separately. Run normalization whenever either orphan results or dangling calls are present, and make the report distinguish data dropped from data repaired.
 
 ## Verification
 
-- `npm run typecheck` — passed.
-- `npm run test:security` — passed (31 checks).
-- `npm run test:edit` — passed (7 checks).
-- `npm run test:store` — passed (7 checks).
-- `git diff --check` — passed.
-
-No files were changed as part of the reviewed commits. This report is a separate review artifact.
+- `node tests/restore-toolcall.test.mjs` — passed (13 checks).
+- Targeted mixed-result probe — reproduced duplicate result IDs and loss of the second tool call.
+- Targeted migration-count probe — confirmed a dropped orphan result is counted as re-linked.
