@@ -1708,6 +1708,24 @@ html.dark .pw-term-host.wterm {
 .pw-resume-banner { display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: #2563eb; color: #fff; font-size: 13px; flex-shrink: 0; }
 .pw-resume-banner .pw-resume-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pw-resume-btn { background: rgba(255, 255, 255, 0.2); border: none; color: #fff; padding: 4px 12px; border-radius: 6px; cursor: pointer; font-weight: 600; }
+.pw-compact-note {
+	margin: 8px auto; max-width: 92%;
+	border: 1px dashed rgba(96, 165, 250, 0.45);
+	border-radius: 8px;
+	background: rgba(96, 165, 250, 0.06);
+	padding: 8px 12px;
+	font-size: 12px;
+}
+.pw-compact-head { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.4px; opacity: 0.65; margin-bottom: 4px; }
+.pw-compact-body { white-space: pre-wrap; word-break: break-word; max-height: 140px; overflow-y: auto; }
+.pw-compact-btn {
+	background: transparent; border: 1px solid rgba(96, 165, 250, 0.4);
+	border-radius: 10px; color: inherit; cursor: pointer;
+	font-size: 11px; padding: 2px 10px; margin-left: 8px;
+}
+.pw-compact-btn:hover:not(:disabled) { background: rgba(96, 165, 250, 0.14); }
+.pw-compact-btn:disabled { opacity: 0.5; cursor: default; }
+
 .pw-user-row { position: relative; }
 /* fork/rewrite hover actions on user messages (llama.cpp-webui parity) */
 .pw-msg-actions {

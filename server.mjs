@@ -37,6 +37,7 @@ import { Worker } from "node:worker_threads";
 import { WebSocketServer } from "ws";
 import { Agent as UndiciAgent, fetch as undiciFetch } from "undici";
 import util from "node:util";
+import { Agent } from "@earendil-works/pi-agent-core";
 import { AgentHub } from "./agent-hub.mjs";
 import { createTerminalHub } from "./terminal-hub.mjs";
 import { stripBoilerplate } from "./lib/hp2.mjs";
@@ -1339,6 +1340,34 @@ app.get("/api/debug/state", (c) => {
 	});
 });
 
+// --- /compact summarization prompt (pi SUMMARIZATION_PROMPT parity) ----------
+const COMPACT_SECTIONS = [
+	"## Goal",
+	"## Constraints & Preferences",
+	"## Progress",
+	"### Done",
+	"### In Progress",
+	"### Blocked",
+	"## Key Decisions",
+	"## Next Steps",
+	"## Critical Context",
+].join("\n");
+
+function buildSummarizationPrompt(serialized, previousSummary) {
+	const parts = [];
+	if (previousSummary) parts.push("The conversation was already compacted once. The PREVIOUS SUMMARY below covers the older span — fold its still-relevant content into the new summary.", "", "## Previous summary", previousSummary, "");
+	parts.push(
+		"Summarize the following conversation transcript as a checkpoint for continuing the work with full context. In the transcript, [User] = the human, [Assistant] = you, [Tool result] = tool output. Your summary REPLACES the summarized portion of the conversation — include everything needed to continue seamlessly.",
+		"",
+		"Produce exactly these sections:",
+		COMPACT_SECTIONS,
+		"",
+		"## Conversation transcript",
+		"",
+		serialized,
+	);
+	return parts.join("\n");
+}
 // --- LLM proxy (pi-web-ui ProxyTab format, undici-hardened) -------------------
 const PROXY_MOUNT = "/api/proxy";
 const MAX_INBOUND = 25 * 1024 * 1024;
@@ -1736,6 +1765,38 @@ const agentHub = new AgentHub({
 	// store READ accessor: forkSession self-hydrates cold sessions (hub restart,
 	// no attach yet) straight from the JSONL mirror
 	loadMessages: async (id) => { try { const j = await storeOp("get", { id }); return j?.messages?.length ? { messages: j.messages, metadata: j.metadata } : null; } catch { return null; } },
+	// /compact (pi parity): the summarization LLM call runs through a THROWAWAY
+	// Agent — reuses the whole conversion/retry pipeline; no tools, thinkingLevel
+	// off. Structured checkpoint format mirrors pi's SUMMARIZATION_PROMPT.
+	summarize: async ({ model, serialized, previousSummary, signal }) => {
+		const summaryAgent = new Agent({
+			initialState: {
+				model,
+				thinkingLevel: "off",
+				systemPrompt: "You are a conversation-summarization assistant. Produce exactly the structured summary requested — no preamble, no commentary.",
+				messages: [{ role: "user", content: [{ type: "text", text: buildSummarizationPrompt(serialized, previousSummary) }] }],
+				tools: [],
+			},
+			getApiKey: async (p) => { const auth = readJsonSafe("auth.json") || {}; const e = auth[p]; return typeof e === "string" ? e : e?.key; },
+		});
+		if (signal) { try { signal.addEventListener("abort", () => summaryAgent.abort(), { once: true }); } catch { /* noop */ } }
+		await summaryAgent.prompt("Produce the structured summary now.");
+		const last = [...summaryAgent.state.messages].reverse().find((m) => m.role === "assistant");
+		return (last?.content || []).filter((c) => c.type === "text").map((c) => c.text || "").join("");
+	},
+	// pre-compact safety copy: pi keeps raw entries in its tree file; our linear
+	// mirror is REWRITTEN by compaction, so park the pre-compact file in
+	// data/tmp/precompact (7-day prune) — the nothing-erased guarantee
+	backupMirror: async (id) => {
+		const src = path.join(DATA_DIR, "sessions", id + ".jsonl");
+		if (!fs.existsSync(src)) return null;
+		const dir = path.join(DATA_DIR, "tmp", "precompact");
+		fs.mkdirSync(dir, { recursive: true });
+		for (const f of fs.readdirSync(dir)) { try { if (Date.now() - fs.statSync(path.join(dir, f)).mtimeMs > 7 * 86400_000) fs.unlinkSync(path.join(dir, f)); } catch { /* raced */ } }
+		const dst = path.join(dir, id + "-" + Date.now().toString(36) + ".jsonl");
+		fs.copyFileSync(src, dst);
+		return dst;
+	},
 	getSystemPrompt: () => effectiveSystemPrompt(),
 	defaultModelId: piDefaultModelId(),
 	onRuntimeChange: (sessionId, rt) => sendRuntime(sessionId, rt), // runtime deltas → tiny frame to ALL devices, bypasses all caches/throttles (fable5)
@@ -1982,6 +2043,17 @@ function agentConn(ws) {
 					try {
 						const r = agentHub.rewriteSession(currentSession, Number(m.keepCount));
 						safeSend(ws, { type: "rewritten", id: m.id, ...r });
+					} catch (err) { safeSend(ws, { type: "error", id: m.id, error: err.message }); }
+					break;
+				}
+				case "compact": {
+					// /compact (pi parity): summarize older history, keep the recent tail.
+					// Long (LLM call) — the reply lands when compaction finishes; the hub
+					// rejects prompts/steers with "compaction in progress" meanwhile.
+					if (!currentSession) { safeSend(ws, { type: "error", id: m.id, error: "attach first" }); break; }
+					try {
+						const r = await agentHub.compactSession(currentSession, { keepRecentTokens: Number(m.keepRecentTokens) || 20000 });
+						safeSend(ws, { type: "compacted", id: m.id, ...r });
 					} catch (err) { safeSend(ws, { type: "error", id: m.id, error: err.message }); }
 					break;
 				}

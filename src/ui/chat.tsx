@@ -313,7 +313,22 @@ function MessageView(props: {
 	onOpenFile?: (path: string) => void;
 }) {
 	const { message } = props;
-	if (message.role === "user") return <UserBubble message={message as UserMessage} onOpenFile={props.onOpenFile} index={props.index} canMutate={props.canMutate} onEditMessage={props.onEditMessage} onForkMessage={props.onForkMessage} />;
+	if (message.role === "user") {
+		if ((message as any).isCompactionSummary) {
+			// compaction summary (pi CompactionEntry parity): rendered as a subdued
+			// context block, NOT as a user bubble — it is synthetic history
+			const text = textOf((message as UserMessage).content).replace(/^## Conversation summary \(auto-compacted\)\n\n?/, "");
+			return (
+				<div class="pw-msg-row">
+					<div class="pw-compact-note">
+						<div class="pw-compact-head">⤓ compacted context</div>
+						<div class="pw-compact-body">{text}</div>
+					</div>
+				</div>
+			);
+		}
+		return <UserBubble message={message as UserMessage} onOpenFile={props.onOpenFile} index={props.index} canMutate={props.canMutate} onEditMessage={props.onEditMessage} onForkMessage={props.onForkMessage} />;
+	}
 	if (message.role === "assistant")
 		return (
 			<AssistantBubble
@@ -420,7 +435,7 @@ function contextUsage(messages: any[], model: any): { pct: number; used: number;
 	return null;
 }
 
-function UsageBar({ agent }: { agent: Agent }) {
+function UsageBar({ agent, canCompact, compacting, onCompact }: { agent: Agent; canCompact?: boolean; compacting?: boolean; onCompact?: () => void }) {
 	const state = agent.state;
 	const info = contextUsage(state.messages, state.model);
 	// session totals (parity with the old renderStats footer)
@@ -451,8 +466,13 @@ function UsageBar({ agent }: { agent: Agent }) {
 					{info && `${formatTokenCount(info.used)} / ${formatTokenCount(info.total)} tok`}
 				</span>
 				<span class="pw-totals">
-					{hasTotals ? `↑${formatTokenCount(tIn)} ↓${formatTokenCount(tOut)}${tCost >= 0.00005 ? ` · $${tCost.toFixed(4)}` : ""}` : ""}
+					{hasTotals ? `↑${formatTokenCount(tIn)} ↓${formatTokenCount(tOut)}${tCost >= 0.00005 ? ` · ${tCost.toFixed(4)}` : ""}` : ""}
 				</span>
+				{canCompact && onCompact && (
+					<button type="button" class="pw-compact-btn" disabled={compacting} title="Compact — summarize older history, keep the recent tail (pi /compact parity)" onClick={onCompact}>
+						{compacting ? "compacting…" : "⤓ compact"}
+					</button>
+				)}
 			</div>
 		</div>
 	);
@@ -503,6 +523,21 @@ export function ChatView({ agent }: { agent: Agent }) {
 	};
 	const cancelSteer = () => {
 		(agent as any).cancelSteering?.();
+	};
+	// compact (pi /compact parity): summarize older history, keep the recent tail
+	const [compacting, setCompacting] = useState(false);
+	const compact = async () => {
+		if (compacting || (agent as any).serverSide !== true) return;
+		setCompacting(true);
+		try {
+			const r = await (agent as any).compact(20000);
+			if (!r?.ok) throw new Error(r?.reason || r?.error || "compact failed");
+			note(`compacted — ${r.summarized} messages summarized, ${r.kept} kept${r.backupPath ? " · pre-compact backup saved" : ""}`);
+		} catch (err: any) {
+			note(err?.message || String(err));
+		} finally {
+			setCompacting(false);
+		}
 	};
 	// fork/rewrite (llama.cpp-webui parity): per-user-message ✎ / ⑂. Server-side
 	// only. ✎ EDIT: tail message → in-place rewrite (truncate to the prefix,
@@ -790,7 +825,7 @@ export function ChatView({ agent }: { agent: Agent }) {
 					setImages(imgs);
 				}}
 			/>
-			<UsageBar agent={agent} />
+			<UsageBar agent={agent} canCompact={(agent as any).serverSide === true && !state.isStreaming && state.messages.length > 6} compacting={compacting} onCompact={compact} />
 			<FilePickerDialog
 				open={picker.open}
 				initialFile={picker.initialFile}

@@ -88,14 +88,42 @@ export function normalizeRestoredMessages(messages, stats) {
 	return changed ? linked : messages;
 }
 
+// ---- compaction (pi /compact parity) ---------------------------------------
+// Serialization: [User]/[Assistant]/[Assistant tool calls]/[Tool result (name)]
+// plain text so the model treats it as MATERIAL to summarize, not a conversation
+// to continue. Thinking blocks are OMITTED (pi: replayed thinking is often not
+// in the live context — including it could make the request bigger than what it
+// summarizes). Tool results truncated to 2000 chars with a marker (they are the
+// biggest context contributors).
+const serializeConversation = (messages) => {
+	const textOf = (content) => (typeof content === "string" ? content : (Array.isArray(content) ? content.filter((b) => b?.type === "text").map((b) => b.text || "").join("\n") : ""));
+	const out = [];
+	for (const m of messages) {
+		if (m.role === "user") out.push("[User]: " + textOf(m.content));
+		else if (m.role === "assistant") {
+			const t = textOf(m.content).trim();
+			if (t) out.push("[Assistant]: " + t);
+			const calls = (Array.isArray(m.content) ? m.content : []).filter((b) => b?.type === "toolCall").map((b) => `${b.name}(${JSON.stringify(b.arguments || {})})`).join("; ");
+			if (calls) out.push("[Assistant tool calls]: " + calls);
+		} else if (m.role === "toolResult") {
+			let t = textOf(m.content);
+			if (t.length > 2000) t = t.slice(0, 2000) + `\n[… ${t.length - 2000} chars truncated]`;
+			out.push(`[Tool result${m.toolName ? " (" + m.toolName + ")" : ""}]: ` + t);
+		}
+	}
+	return out.join("\n\n");
+};
+
 export class AgentHub {
-	constructor({ modelsStore, getAuth, persist, broadcast, getTools, getSystemPrompt, defaultModelId, onRuntimeChange, loadMessages }) {
+	constructor({ modelsStore, getAuth, persist, broadcast, getTools, getSystemPrompt, defaultModelId, onRuntimeChange, loadMessages, summarize, backupMirror }) {
 		this.modelsStore = modelsStore;
 		this.getAuth = getAuth;
 		this.persist = persist; // async (id, data, metadata) — worker store (atomic)
 		// optional store READ accessor (server.mjs wires storeOp("get")): lets
 		// forkSession self-hydrate a cold session (hub restart, no attach yet)
 		this.loadMessages = loadMessages || null; // async (id) → {messages, metadata} | null
+		this.summarize = summarize || null; // async ({model, serialized, previousSummary, signal}) → summary text
+		this.backupMirror = backupMirror || null; // async (id) → backup path | null (pre-compact safety copy)
 		this.broadcast = broadcast; // (sessionId, msg) — send to attached clients
 		// server-side toolset (2026-10-21): the SAME builtin+extension tools the exec
 		// bridge exposes — executed IN THIS PROCESS by the server-side agent loop, so
@@ -326,6 +354,7 @@ export class AgentHub {
 	 *  the whole run to END). Depth 1: one pending message, editable/cancellable
 	 *  from any device. */
 	_steer(entry, sessionId, content, images) {
+		if (entry.compacting) return { accepted: false, queued: false, reason: "compaction in progress — try again shortly" };
 		if (entry.followUpCount >= 1) {
 			return { accepted: false, queued: false, reason: "A steering message is already pending — cancel or edit it first." };
 		}
@@ -371,6 +400,7 @@ export class AgentHub {
 		const prev = entry.promptLock || Promise.resolve();
 		const run = async () => {
 			if ((entry.mutateEpoch || 0) !== epochAtCall) return { accepted: false, queued: false, reason: "session was rewritten while this prompt was queued — dropped" };
+			if (entry.compacting) return { accepted: false, queued: false, reason: "compaction in progress — try again shortly" };
 			if (entry.agent.state.isStreaming) {
 				return this._steer(entry, sessionId, content, images);
 			}
@@ -535,6 +565,7 @@ export class AgentHub {
 	async forkSession(sessionId, keepCount) {
 		const entry = await this._ensureEntry(sessionId);
 		if (!entry) throw new Error("no live session");
+		if (entry.compacting) throw new Error("compaction in progress");
 		if (entry.agent.state.isStreaming) throw new Error("cannot fork while a run is streaming — stop it first");
 		const msgs = entry.agent.state.messages;
 		const n = Math.max(0, Math.min(Math.floor(Number(keepCount)) || 0, msgs.length));
@@ -563,6 +594,7 @@ export class AgentHub {
 	async rewriteSession(sessionId, keepCount) {
 		const entry = await this._ensureEntry(sessionId);
 		if (!entry) throw new Error("no live session");
+		if (entry.compacting) throw new Error("compaction in progress");
 		if (entry.agent.state.isStreaming) throw new Error("cannot rewrite while a run is streaming — stop it first");
 		const msgs = entry.agent.state.messages;
 		const n = Math.max(0, Math.min(Math.floor(Number(keepCount)) || 0, msgs.length));
@@ -577,6 +609,56 @@ export class AgentHub {
 		await this.persistSession(sessionId, true);
 		this.broadcastState(sessionId);
 		return { ok: true, kept: n };
+	}
+
+	/** COMPACT (pi /compact parity): summarize older history, replace the span
+	 *  with a single flagged summary message, keep the recent tail. Algorithm
+	 *  mirrors pi's compaction.md: cut point = walk BACKWARDS accumulating token
+	 *  estimates (chars/4) until keepRecentTokens (default 20k); never split an
+	 *  assistant toolCall from its toolResult (cut advances past toolResults);
+	 *  the span STARTS AFTER any previous compaction summary (iterative folding —
+	 *  messages that survived an earlier compaction are folded into the next
+	 *  summary). The mirror is linear (pi keeps raw entries in-file; we do not),
+	 *  so a pre-compact BACKUP of the mirror is written via backupMirror before
+	 *  the replace. Usage note: the summary message carries NO usage — the
+	 *  UsageBar totals drop to the kept tail (the summarization call itself is a
+	 *  side call, deliberately not billed to the transcript). Guards: idle only,
+	 *  one compaction at a time; prompt/steer/fork/rewrite reject while
+	 *  entry.compacting is set. */
+	async compactSession(sessionId, { keepRecentTokens = 20000, signal } = {}) {
+		const entry = await this._ensureEntry(sessionId);
+		if (!entry) throw new Error("no live session");
+		if (entry.agent.state.isStreaming) throw new Error("cannot compact while a run is streaming — stop it first");
+		if (entry.compacting) throw new Error("compaction already in progress");
+		if (!this.summarize) throw new Error("no summarizer configured");
+		const msgs = entry.agent.state.messages;
+		const est = (m) => Math.ceil((typeof m.content === "string" ? m.content : JSON.stringify(m.content)).length / 4);
+		let kept = 0, i = msgs.length - 1;
+		while (i >= 0 && kept < keepRecentTokens) { kept += est(msgs[i]); i--; }
+		let cut = i + 1;
+		while (cut < msgs.length && msgs[cut].role === "toolResult") cut++; // never split call/result
+		const prevIdx = msgs.findIndex((m) => m.isCompactionSummary);
+		const from = prevIdx >= 0 ? prevIdx + 1 : 0;
+		if (cut - from < 2) throw new Error("nothing substantial to compact");
+		entry.compacting = true;
+		try {
+			const serialized = serializeConversation(msgs.slice(from, cut));
+			const prevText = (m) => (typeof m.content === "string" ? m.content : (m.content || []).filter((b) => b?.type === "text").map((b) => b.text || "").join("\n"));
+			const previousSummary = prevIdx >= 0 ? prevText(msgs[prevIdx]) : "";
+			let backupPath = null;
+			if (this.backupMirror) { try { backupPath = await this.backupMirror(sessionId); } catch { /* best-effort */ } }
+			const summary = await this.summarize({ model: entry.agent.state.model, serialized, previousSummary, signal });
+			if (!summary || !String(summary).trim()) throw new Error("summarizer returned empty output");
+			const summaryMsg = { role: "user", isCompactionSummary: true, content: [{ type: "text", text: "## Conversation summary (auto-compacted)\n\n" + String(summary).trim() }], timestamp: Date.now() };
+			const keptMsgs = msgs.slice(cut).map((m) => { const c = { ...m }; if (Array.isArray(c.content)) c.content = JSON.parse(JSON.stringify(c.content)); return c; });
+			entry.agent.state.messages = [summaryMsg, ...keptMsgs];
+			entry.mutateEpoch = (entry.mutateEpoch || 0) + 1;
+			entry.pendingPrompt = null; entry.pendingPromptMessage = null; entry.followUpCount = 0; entry.runtime.pendingPrompts = 0;
+			this.emitRuntime(sessionId); this.emitSteering(sessionId);
+			await this.persistSession(sessionId, true);
+			this.broadcastState(sessionId);
+			return { ok: true, summarized: cut - from, kept: msgs.length - cut, summaryChars: String(summary).trim().length, backupPath };
+		} finally { entry.compacting = false; }
 	}
 
 	/** Runtime for an existing entry — idle included, seq-stamped (the client's

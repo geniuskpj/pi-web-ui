@@ -254,6 +254,15 @@ export class ProxyAgent {
 		return this.sendAwait({ type: "rewrite", keepCount }, 10000);
 	}
 
+	/** COMPACT (pi /compact parity): summarize older history, keep the recent
+	 *  tail. LONG (an LLM call) — the reply lands when compaction finishes; the
+	 *  hub rejects prompts/steers with "compaction in progress" meanwhile. */
+	async compact(keepRecentTokens = 20000): Promise<any> {
+		const ready = await this.whenReady(8000);
+		if (!ready) throw new Error("Agent WS not connected");
+		return this.sendAwait({ type: "compact", keepRecentTokens }, 180000);
+	}
+
 	async prompt(input: any, images?: any[]): Promise<any> {
 		const ready = await this.whenReady(8000);
 		if (!ready) throw new Error("Agent WS not connected");
