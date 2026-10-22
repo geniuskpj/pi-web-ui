@@ -71,14 +71,43 @@ const strippedTurn = (callId, toolName, text) => fullTurn(callId, toolName, text
 		...strippedTurn("call-C", "bash", ""),
 	];
 	// strip the second turn's ids too (two toolResults after one 2-call assistant)
-	const fixed = normalizeRestoredMessages(msgs);
+	const stats = { relinked: 0, dropped: 0, danglingStripped: 0 };
+	const fixed = normalizeRestoredMessages(msgs, stats);
 	const ids = fixed.filter((m) => m.role === "toolResult").map((m) => m.toolCallId);
 	check("re-linked all orphan ids in order", JSON.stringify(ids) === JSON.stringify(["call-A", "call-B", "call-C"]), JSON.stringify(ids));
+	check("stats.relinked counts every assignment", stats.relinked === 3, JSON.stringify(stats));
 	const names = fixed.filter((m) => m.role === "toolResult").map((m) => m.toolName);
 	check("toolName backfilled from toolCall", JSON.stringify(names) === JSON.stringify(["read_file", "bash", "bash"]), JSON.stringify(names));
 	// content untouched otherwise
 	const asst = fixed.find((m) => m.role === "assistant" && m.content.some((b) => b.type === "text" && b.text === "two calls"));
 	check("assistant content preserved", asst?.content.length === 3);
+}
+
+// 2b) commit-review P2 — MIXED group: linked result for call a + orphan for call b.
+// The orphan must get b (first UNCLAIMED id), never a duplicate of a.
+{
+	const mixed = [
+		{ role: "user", content: [{ type: "text", text: "q" }], timestamp: 0 },
+		{ role: "assistant", content: [tc("a", "bash"), tc("b", "read_file")], timestamp: 1 },
+		{ role: "toolResult", toolCallId: "a", toolName: "bash", content: [{ type: "text", text: "linked" }], timestamp: 2 },
+		{ role: "toolResult", content: [{ type: "text", text: "orphan" }], timestamp: 3 },
+	];
+	const stats = { relinked: 0, dropped: 0, danglingStripped: 0 };
+	const fixed = normalizeRestoredMessages(mixed, stats);
+	const ids = fixed.filter((m) => m.role === "toolResult").map((m) => m.toolCallId);
+	check("mixed group: unique ids [a,b]", JSON.stringify(ids) === JSON.stringify(["a", "b"]), JSON.stringify(ids));
+	const callIds = fixed.find((m) => m.role === "assistant").content.filter((b) => b.type === "toolCall").map((b) => b.id);
+	check("mixed group: BOTH calls preserved", JSON.stringify(callIds) === JSON.stringify(["a", "b"]), JSON.stringify(callIds));
+	check("mixed group: relinked=1 dropped=0", stats.relinked === 1 && stats.dropped === 0, JSON.stringify(stats));
+	// reversed order — linked result claims b FIRST, orphan must take a
+	const rev = normalizeRestoredMessages([
+		{ role: "user", content: [{ type: "text", text: "q" }], timestamp: 0 },
+		{ role: "assistant", content: [tc("a", "bash"), tc("b", "bash")], timestamp: 1 },
+		{ role: "toolResult", toolCallId: "b", content: [{ type: "text", text: "linked" }], timestamp: 2 },
+		{ role: "toolResult", content: [{ type: "text", text: "orphan" }], timestamp: 3 },
+	]);
+	const rids = rev.filter((m) => m.role === "toolResult").map((m) => m.toolCallId);
+	check("reversed mixed group: [b,a] — no duplicate", JSON.stringify(rids) === JSON.stringify(["b", "a"]), JSON.stringify(rids));
 }
 
 // 3) a toolCall with NO following toolResult is stripped (both-direction 400 guard);
@@ -109,6 +138,15 @@ const strippedTurn = (callId, toolName, text) => fullTurn(callId, toolName, text
 	]);
 	const empty = fixed2.find((m) => m.role === "assistant" && m.content?.[0]?.type === "text");
 	check("emptied assistant gets placeholder text", empty?.content[0]?.text === "(tool call interrupted by error)", JSON.stringify(empty?.content));
+	// commit-review P3: exact drop accounting — an unmatchable orphan is DROPPED,
+	// never reported as re-linked
+	const stats3 = { relinked: 0, dropped: 0, danglingStripped: 0 };
+	normalizeRestoredMessages([
+		{ role: "user", content: [{ type: "text", text: "q" }], timestamp: 0 },
+		{ role: "assistant", content: [{ type: "text", text: "mid" }], timestamp: 1 },
+		{ role: "toolResult", content: [{ type: "text", text: "unmatchable" }], timestamp: 2 },
+	], stats3);
+	check("stats: dropped=1 relinked=0 for unmatchable orphan", stats3.relinked === 0 && stats3.dropped === 1, JSON.stringify(stats3));
 }
 
 // 4) idempotency + fast path

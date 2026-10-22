@@ -28,12 +28,16 @@ function extractPreviewText(content, maxLen = 120) {
  *  "missing field tool_call_id"), permanently, because the failed run appended
  *  an empty assistant message that every retry kept in the history.
  *
- *  Re-links each orphan toolResult to the preceding assistant's toolCall blocks
- *  IN ORDER (pi-agent-core emits toolResults in toolCall order), backfills
- *  toolName, and strips toolCalls that still got no result (openai-completions
- *  also 400s on tool_calls without a following tool message). Idempotent:
- *  already-linked messages pass through untouched. */
-export function normalizeRestoredMessages(messages) {
+ *  Re-links each orphan toolResult to an unclaimed toolCall of the preceding
+ *  assistant (call order, skipping ids already claimed by linked results in the
+ *  same group — commit-review P2: a linked "a" + orphan group with calls [a,b]
+ *  must yield b, never a duplicate), backfills toolName, and strips toolCalls
+ *  that still got no result (openai-completions also 400s on tool_calls without
+ *  a following tool message). Idempotent: already-linked messages pass through
+ *  untouched. Optional `stats` object collects exact repair counts:
+ *  { relinked, dropped, danglingStripped } (commit-review P3 — dropped orphans
+ *  must not be reported as re-linked). */
+export function normalizeRestoredMessages(messages, stats) {
 	if (!Array.isArray(messages)) return messages;
 	const out = messages.map((m) => (Array.isArray(m?.content) ? { ...m, content: [...m.content] } : { ...m }));
 	let changed = false;
@@ -42,35 +46,44 @@ export function normalizeRestoredMessages(messages) {
 		if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
 		const calls = m.content.filter((b) => b?.type === "toolCall");
 		if (!calls.length) continue;
-		// consume the toolResults that directly follow this assistant (they answer
-		// its toolCalls in order); stop at the next non-toolResult message
-		let j = i + 1;
-		let k = 0;
-		while (j < out.length && out[j].role === "toolResult") {
-			const tr = out[j];
-			if (!tr.toolCallId && k < calls.length) {
-				out[j] = { ...tr, toolCallId: calls[k].id, toolName: tr.toolName ?? calls[k].name };
-				k++;
+		// bounds of the consecutive toolResult group that follows this assistant
+		let end = i + 1;
+		while (end < out.length && out[end].role === "toolResult") end++;
+		// pass 1 — ids already claimed by linked results in this group are trusted
+		const claimed = new Set();
+		for (let t = i + 1; t < end; t++) if (out[t].toolCallId) claimed.add(out[t].toolCallId);
+		// pass 2 — each orphan gets the first UNCLAIMED call id (call order)
+		for (let t = i + 1; t < end; t++) {
+			if (out[t].toolCallId) continue;
+			let c = 0;
+			while (c < calls.length && claimed.has(calls[c].id)) c++;
+			if (c < calls.length) {
+				out[t] = { ...out[t], toolCallId: calls[c].id, toolName: out[t].toolName ?? calls[c].name };
+				claimed.add(calls[c].id);
 				changed = true;
+				if (stats) stats.relinked++;
 			}
-			j++;
 		}
-		const matched = new Set(out.slice(i + 1, j).map((t) => t.toolCallId).filter(Boolean));
-		if (calls.some((c) => !matched.has(c.id))) {
-			// dangling toolCall — an assistant tool_call with no tool answer is ALSO
-			// a provider 400; drop the block (same repair prompt() does, but for
-			// every message, not just the last assistant)
-			const kept = m.content.filter((b) => b?.type !== "toolCall" || matched.has(b.id));
+		// pass 3 — drop assistant toolCalls with no result in the group (dangling
+		// tool_call is ALSO a provider 400)
+		if (calls.some((c) => !claimed.has(c.id))) {
+			const dangling = calls.filter((c) => !claimed.has(c.id)).length;
+			const kept = m.content.filter((b) => b?.type !== "toolCall" || claimed.has(b.id));
 			if (kept.length === 0) kept.push({ type: "text", text: "(tool call interrupted by error)" });
 			out[i] = { ...m, content: kept };
 			changed = true;
+			if (stats) stats.danglingStripped += dangling;
 		}
 	}
 	// toolResults that still have no id (not directly after their assistant) cannot
 	// be converted — role:"tool" without tool_call_id is a provider 400. Drop them;
 	// losing one orphan tool output beats a permanently dead session.
+	const orphansBefore = out.filter((m) => m.role === "toolResult" && !m.toolCallId).length;
 	const linked = out.filter((m) => !(m.role === "toolResult" && !m.toolCallId));
-	if (linked.length !== out.length) changed = true;
+	if (linked.length !== out.length) {
+		changed = true;
+		if (stats) stats.dropped += orphansBefore;
+	}
 	return changed ? linked : messages;
 }
 
