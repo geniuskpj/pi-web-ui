@@ -252,7 +252,16 @@ dangling toolCalls (Anthropic/OpenAI validity) and inlines composer images for q
 `/ws/agent` attach ALWAYS ensures the hub session exists (fresh sessions have no store entry —
 `setThinkingLevel` was a crash on `entry.agent` before 2026-10-21). Events: every event seq-stamped +
 broadcast to `/ws/agent` clients;
-user-message ends persist immediately, others debounced 400ms with a 2s maxWait. `_writeSession`
+user-message ends persist immediately, others debounced 400ms with a 2s maxWait. **Steering** (2026-10-22):
+`prompt()` checks `isStreaming` BEFORE the promptLock (the lock serializes whole runs — the old in-lock
+queued path was effectively dead) and holds a mid-run send via `agent.steer()`: pi-agent-core injects
+it at the next turn boundary (after the current thinking/toolcall completes). Depth 1
+(`followUpCount`); pending state lives on the entry (`pendingPrompt` UI payload + the exact message
+object for reference-equality consumption tracking), is part of every state snapshot, and deltas go
+to all devices via `emitSteering()` (`{type:"steering"}` frames, buffered during attach like agent
+events). `cancelSteering()` clears pi's queue + entry tracking (✎ edit = cancel + client-side
+composer prefill; ✕ = cancel). A pending message survives abort/error and injects at the next run's
+start (pi's initial steering poll). `_writeSession`
 persists FULL message objects (2026-10-22 — the old `{role, content, timestamp}` projection stripped
 toolResult.toolCallId, so after a restart the rehydrated history produced `role:"tool"` messages
 without `tool_call_id` and nvidia NIM 400'd every prompt, permanently; error/stopReason/usage now

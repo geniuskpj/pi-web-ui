@@ -467,6 +467,32 @@ export function ChatView({ agent }: { agent: Agent }) {
 	// header button or a bash tool row's "↗ terminal")
 	const [termOpen, setTermOpen] = useState(false);
 	const [termCmd, setTermCmd] = useState<string | null>(null);
+	// steering: a message sent mid-run, held server-side until the current
+	// thinking/toolcall completes. Rendered as a pending chip above the composer
+	// with ✎ edit (pull back into the composer) and ✕ cancel.
+	const [steerDraft, setSteerDraft] = useState<{ text: string; seq: number } | null>(null);
+	const steerSeq = useRef(0);
+	const pendingSteer = (agent as any).pendingPrompt as { text: string; images?: any[]; queuedAt?: number } | null;
+	const editSteer = () => {
+		if (!pendingSteer) return;
+		// revert the pending message into the composer: text pre-fills, inline
+		// images re-attach; the hub drops its copy (cancelSteering)
+		steerSeq.current += 1;
+		setSteerDraft({ text: pendingSteer.text || "", seq: steerSeq.current });
+		const steerImages = pendingSteer.images;
+		if (steerImages && steerImages.length) {
+			setImages((prev) => [
+				...prev,
+				...steerImages
+					.filter((im: any) => im?.type === "image" && im.data && im.mimeType)
+					.map((im: any, k: number) => ({ name: `steered-${k + 1}`, data: im.data, mimeType: im.mimeType, preview: `data:${im.mimeType};base64,${im.data}` })),
+			]);
+		}
+		(agent as any).cancelSteering?.();
+	};
+	const cancelSteer = () => {
+		(agent as any).cancelSteering?.();
+	};
 	const attachNoteTimer = useRef<any>(null);
 	const note = (msg: string) => {
 		setAttachNote(msg);
@@ -662,18 +688,30 @@ export function ChatView({ agent }: { agent: Agent }) {
 						/>
 					) : null}
 					{state.isStreaming && !state.streamingMessage && <div class="pw-thinking-hint">thinking…</div>}
-				</div>
-			</div>
-			<TerminalPanel
-				open={termOpen}
-				command={termCmd}
-				onCommandDone={() => setTermCmd(null)}
-				onClose={() => setTermOpen(false)}
-			/>
-			<Editor
-				agent={agent}
-				onSent={forceStick}
-				onPickModel={() => window.dispatchEvent(new CustomEvent("pi-open-model-selector"))}
+					</div>
+					</div>
+					{pendingSteer && (
+					<div class="pw-steer-chip" role="status">
+					<span class="pw-steer-ico">⏩</span>
+					<span class="pw-steer-body">
+					 <span class="pw-steer-label">steering — sends after the current step</span>
+					 <span class="pw-steer-text">{pendingSteer.text}</span>
+					</span>
+					<button type="button" class="pw-steer-btn" title="Edit — pull back into the composer" onClick={editSteer}>✎</button>
+					<button type="button" class="pw-steer-btn pw-steer-cancel" title="Cancel steering message" onClick={cancelSteer}>✕</button>
+					</div>
+					)}
+					<TerminalPanel
+					open={termOpen}
+					command={termCmd}
+					onCommandDone={() => setTermCmd(null)}
+					onClose={() => setTermOpen(false)}
+					/>
+					<Editor
+					agent={agent}
+					onSent={forceStick}
+					steerDraft={steerDraft}
+					onPickModel={() => window.dispatchEvent(new CustomEvent("pi-open-model-selector"))}
 				textFiles={textFiles}
 				images={images}
 				attachNote={attachNote}
@@ -723,6 +761,7 @@ export function Editor({
 	agent,
 	onSent,
 	onPickModel,
+	steerDraft,
 	textFiles,
 	images,
 	attachNote,
@@ -738,6 +777,7 @@ export function Editor({
 	agent: Agent;
 	onSent?: () => void;
 	onPickModel?: () => void;
+	steerDraft?: { text: string; seq: number } | null;
 	textFiles: Array<{ path: string; content: string }>;
 	images: Array<{ name: string; data: string; mimeType: string; preview: string }>;
 	attachNote: string;
@@ -758,6 +798,11 @@ export function Editor({
 		}
 	});
 	const [streaming, setStreaming] = useState(agent.state.isStreaming);
+	// hub-side pending steering message (chip up ⇒ Steer hidden/Enter blocked —
+	// depth 1; grok review P2: a second mid-run send would be REJECTED and a
+	// fire-and-forget send would silently destroy the typed text)
+	const [pendingSteer, setPendingSteer] = useState<any>((agent as any).pendingPrompt ?? null);
+	const serverSide = !!(agent as any).serverSide; // local (?local=1) loop has no steering
 	const taRef = useRef<HTMLTextAreaElement>(null);
 	const composing = useRef(false);
 	const sending = useRef(false);
@@ -775,6 +820,9 @@ export function Editor({
 			if (ev.type === "agent_end") {
 				agent.waitForIdle().then(() => setStreaming(agent.state.isStreaming));
 			}
+			if (ev.type === "steering" || ev.type === "state-snapshot") {
+				setPendingSteer((agent as any).pendingPrompt ?? null);
+			}
 			setStreaming(agent.state.isStreaming);
 		});
 	}, [agent]);
@@ -788,6 +836,18 @@ export function Editor({
 			/* quota */
 		}
 	}, [value]);
+
+	// steering ✎: pull the pending message back into the composer (text pre-fills,
+	// focus moves here so the user can modify or send immediately)
+	useEffect(() => {
+		if (!steerDraft || typeof steerDraft.text !== "string") return;
+		setValue(steerDraft.text);
+		const ta = taRef.current;
+		if (ta) {
+			ta.focus();
+			try { ta.setSelectionRange(steerDraft.text.length, steerDraft.text.length); } catch { /* older engines */ }
+		}
+	}, [steerDraft?.seq]);
 
 	// auto-grow
 	useLayoutEffect(() => {
@@ -835,7 +895,16 @@ export function Editor({
 	const send = async () => {
 		const text = value.trim();
 		const hasAttachments = textFiles.length > 0 || images.length > 0;
-		if ((!text && !hasAttachments) || agent.state.isStreaming || sending.current) return;
+		// server-side agent: a send DURING a run becomes a steering message (held
+		// until the current thinking/toolcall completes) — allowed. The local
+		// in-browser loop throws on concurrent prompts, so it still blocks.
+		if ((!text && !hasAttachments) || sending.current) return;
+		if (agent.state.isStreaming && !serverSide) return;
+		const steering = serverSide && (agent.state.isStreaming || !!pendingSteer);
+		if (steering && pendingSteer) {
+			onNote("steering message already pending — cancel or edit it first");
+			return;
+		}
 		// WS payload cap: /ws/agent frames over 25MB kill the socket — cap total
 		// image bytes (raw ≈ base64×0.75) at 12MB (grok r3: 4×8MB ≈ 42MB base64)
 		const imageBytes = images.reduce((n, im) => n + Math.floor((im.data?.length || 0) * 0.75), 0);
@@ -873,15 +942,29 @@ export function Editor({
 			const restoreFiles = textFiles;
 			const restoreImages = images;
 			onClearAttachments();
-			void (imgs.length ? agent.prompt(outText, imgs) : agent.prompt(outText))
-				.catch((err) => {
+			// steering path awaits the hub's accept/reject: a rejected steer (depth 1
+			// lost a race with another device, hub timeout) must NOT destroy the text
+			const dispatch = steering && typeof (agent as any).steer === "function"
+				? (agent as any).steer(outText, imgs.length ? imgs : undefined)
+				: (imgs.length ? agent.prompt(outText, imgs) : agent.prompt(outText));
+			void Promise.resolve(dispatch)
+				.then((res: any) => {
+					if (res && res.accepted === false) {
+						console.warn("[chat] send rejected:", res.reason);
+						onNote(res.reason || "not accepted");
+						setValue((cur) => (cur.trim() ? cur : restoreRaw)); // don't clobber live typing
+						onRestoreAttachments(restoreFiles, restoreImages);
+					}
+				})
+				.catch((err: any) => {
 					console.error("[chat] send failed:", err);
 					setValue((cur) => (cur.trim() ? cur : restoreRaw)); // don't clobber live typing
 					onRestoreAttachments(restoreFiles, restoreImages); // attachments too (grok p7)
 				});
 			// grok P2 review: hold the double-send guard until the run has ACTUALLY
 			// started (isStreaming flips asynchronously) — a fast Enter/Enter would
-			// otherwise slip a second prompt() through the pre-stream gap
+			// otherwise slip a second prompt() through the pre-stream gap. A send that
+			// went out WHILE streaming (steering) skips the wait — it's already running.
 			const t0 = Date.now();
 			while (!agent.state.isStreaming && Date.now() - t0 < 1000) {
 				await new Promise((r) => setTimeout(r, 25));
@@ -902,7 +985,8 @@ export function Editor({
 		if (composing.current || (e as any).isComposing || e.keyCode === 229) return;
 		if (!e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
 			e.preventDefault();
-			if (!streaming) send();
+			// streaming + server-side ⇒ Enter STEERS (held until the step completes)
+			if (!streaming || (agent as any).serverSide) send();
 		}
 	};
 
@@ -964,6 +1048,11 @@ export function Editor({
 					<ModelPill model={agent.state.model} onPickModel={() => onPickModel?.()} />
 					<EffortPill agent={agent} />
 					<div class="pw-spacer" />
+					{streaming && serverSide && !pendingSteer && (value.trim() || textFiles.length || images.length) ? (
+						<button type="button" class="pw-send pw-steer-send" title="Steer — hold until the current step completes, then send" onClick={() => void send()}>
+							⏩ Steer
+						</button>
+					) : null}
 					<button type="button" class="pw-send" onClick={() => void (streaming ? stop() : send())} disabled={!streaming && !value.trim() && !textFiles.length && !images.length}>
 						{streaming ? "Stop" : "Send"}
 					</button>

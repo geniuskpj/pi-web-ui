@@ -166,6 +166,8 @@ export class AgentHub {
 				persistMaxTimer: null,
 				userPersisted: false,
 				followUpCount: 0,
+				pendingPrompt: null, // steering UI payload {text, images, queuedAt} while held
+				pendingPromptMessage: null, // the exact AgentMessage — consumed on message_end
 			};
 			this.sessions.set(sessionId, entry);
 
@@ -211,10 +213,19 @@ export class AgentHub {
 						entry.runtime.lastText = t.length > 120 ? "…" + t.slice(-119) : t;
 						this.emitRuntime(sessionId);
 					}
+				} else if (event.type === "message_end" && event.message?.role === "user" && entry.pendingPromptMessage && event.message === entry.pendingPromptMessage) {
+					// the steered message was just injected at a turn boundary — clear the
+					// pending chip everywhere (reference equality: pi re-emits the SAME object)
+					entry.pendingPromptMessage = null;
+					entry.pendingPrompt = null;
+					entry.followUpCount = 0;
+					entry.runtime.pendingPrompts = 0;
+					this.emitRuntime(sessionId);
+					this.emitSteering(sessionId);
 				} else if (event.type === "agent_end") {
 					if (entry.previewTimer) { clearTimeout(entry.previewTimer); entry.previewTimer = null; }
 					const lastA = [...entry.agent.state.messages].reverse().find((m) => m.role === "assistant");
-					entry.runtime = { status: lastA?.stopReason === "error" ? "error" : "idle", startedAt: null, turn: 0, currentTool: null, lastText: null, pendingPrompts: 0 };
+					entry.runtime = { status: lastA?.stopReason === "error" ? "error" : "idle", startedAt: null, turn: 0, currentTool: null, lastText: null, pendingPrompts: entry.pendingPrompt ? 1 : 0 };
 					this.emitRuntime(sessionId); // explicit idle/error delta — the terminal state is never lost
 				}
 				const payload = { type: "agent-event", sessionId, seq: entry.seq, event };
@@ -254,6 +265,7 @@ export class AgentHub {
 			thinkingLevel: entry.agent.state.thinkingLevel,
 			isStreaming: entry.agent.state.isStreaming,
 			seq: entry.seq,
+			pendingPrompt: entry.pendingPrompt ?? null,
 		};
 		entry.buffer = null; // stop buffering BEFORE delivering (synchronous — no interleave)
 		deliver({ type: "state", sessionId, ...state });
@@ -311,28 +323,58 @@ export class AgentHub {
 		});
 	}
 
+	/** Queue a mid-run send as STEERING: held in pi-agent-core's steering queue
+	 *  and injected at the next turn boundary — after the current
+	 *  thinking/toolcall completes, before the next assistant response
+	 *  (getSteeringMessages drains after each turn_end; followUp() would wait for
+	 *  the whole run to END). Depth 1: one pending message, editable/cancellable
+	 *  from any device. */
+	_steer(entry, sessionId, content, images) {
+		if (entry.followUpCount >= 1) {
+			return { accepted: false, queued: false, reason: "A steering message is already pending — cancel or edit it first." };
+		}
+		entry.followUpCount += 1;
+		const msg = {
+			role: "user",
+			content: images?.length ? [{ type: "text", text: content }, ...images] : content,
+			timestamp: Date.now(),
+		};
+		entry.pendingPromptMessage = msg; // reference — consumed on message_end
+		entry.pendingPrompt = { text: content, images: images || [], queuedAt: msg.timestamp };
+		entry.agent.steer(msg);
+		entry.runtime.pendingPrompts = (entry.runtime.pendingPrompts || 0) + 1;
+		this.emitRuntime(sessionId); // other devices see "running · +1 queued"
+		this.emitSteering(sessionId); // pending chip on every attached device
+		return { accepted: true, queued: true };
+	}
+
+	/** Public steer entry (WS {type:"steer"}): the client says "hold this". If no
+	 *  run is live (stale chip / the run just ended), deliver as a normal prompt
+	 *  instead of parking a message that would only run at the NEXT run's start.
+	 *  Async: server.mjs chains .then on the reply. */
+	async steer(sessionId, content, images) {
+		const entry = this.sessions.get(sessionId);
+		if (!entry) return { accepted: false, queued: false, reason: "no live session" };
+		if (!entry.agent.state.isStreaming) return this.prompt(sessionId, content, images);
+		return this._steer(entry, sessionId, content, images);
+	}
+
 	async prompt(sessionId, content, images) {
 		const entry = this.getSession(sessionId);
+		// NOTE: no fast path here — "prompt" means "start a run". A send while a run
+		// is streaming arrives as hub.steer() (the client says so); a prompt that
+		// races a run just starting takes the lock and the in-lock check below
+		// converts it to a steer. The old fast path here misrouted post-Stop sends
+		// (client idle, server still unwinding) into leftover steers that never ran
+		// (grok review P1).
 		// per-session mutex: two devices prompting an IDLE session concurrently
 		// would both pass the isStreaming check and race agent.prompt (which
-		// throws on concurrent prompts). Serialized; queued path handles streaming.
+		// throws on concurrent prompts). Serialized; the in-lock steer path
+		// handles a run that started while this call waited.
 		const prev = entry.promptLock || Promise.resolve();
 		const run = async () => {
 			if (entry.agent.state.isStreaming) {
-				// follow-up queue depth 1 (reject a third+ concurrent ask explicitly)
-				if (entry.followUpCount >= 1) {
-					return { accepted: false, queued: false, reason: "A message is already queued — wait for it to finish." };
-				}
-				entry.followUpCount += 1;
-				// followUp() takes an AgentMessage — inline images as content parts
-				entry.agent.followUp({
-					role: "user",
-					content: images?.length ? [{ type: "text", text: content }, ...images] : content,
-					timestamp: Date.now(),
-				});
-				entry.runtime.pendingPrompts = (entry.runtime.pendingPrompts || 0) + 1;
-				this.emitRuntime(sessionId); // other devices see "running · +1 queued"
-				return { accepted: true, queued: true };
+				return this._steer(entry, sessionId, content, images);
 			}
 			// repair dangling toolCalls (no matching toolResult) — ONLY when idle: a
 			// mid-run repair would strip the live in-flight toolCall and corrupt the
@@ -415,6 +457,7 @@ export class AgentHub {
 			isStreaming: state.isStreaming,
 			streamingMessage: state.streamingMessage ?? null,
 			pendingToolCalls: state.pendingToolCalls instanceof Set ? [...state.pendingToolCalls] : [],
+			pendingPrompt: entry.pendingPrompt ?? null,
 		};
 	}
 
@@ -425,6 +468,35 @@ export class AgentHub {
 		const entry = this.sessions.get(sessionId);
 		if (!entry) return null;
 		return { ...entry.runtime, sessionId, seq: entry.seq };
+	}
+
+	/** Steering pending-state delta: broadcast to all attached /ws/agent clients
+	 *  (and buffered during attach snapshot builds, same as agent events). The
+	 *  pending payload is also part of every state snapshot, so a missed frame
+	 *  self-heals on the next attach. */
+	emitSteering(sessionId) {
+		const entry = this.sessions.get(sessionId);
+		if (!entry) return;
+		const payload = { type: "steering", sessionId, pending: entry.pendingPrompt ?? null };
+		if (entry.buffer) entry.buffer.push(payload);
+		else this.broadcast(sessionId, payload);
+	}
+
+	/** Cancel a pending steering message (✕ in the UI): clear pi's steering queue
+	 *  AND the entry tracking, then tell every device. "Edit" = cancel here + the
+	 *  client prefills its composer with the pending text it already has. Returns
+	 *  false when nothing was pending (or the session isn't live). */
+	cancelSteering(sessionId) {
+		const entry = this.sessions.get(sessionId);
+		if (!entry || !entry.pendingPrompt) return false;
+		try { entry.agent.clearSteeringQueue(); } catch { /* already drained */ }
+		entry.pendingPromptMessage = null;
+		entry.pendingPrompt = null;
+		entry.followUpCount = 0;
+		entry.runtime.pendingPrompts = 0;
+		this.emitRuntime(sessionId);
+		this.emitSteering(sessionId);
+		return true;
 	}
 
 	/** Sink for runtime deltas: the server wires this to a {type:"runtime"} frame

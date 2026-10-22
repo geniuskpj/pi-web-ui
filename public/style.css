@@ -1734,3 +1734,30 @@ html.dark .pw-term-host.wterm {
 .pw-alive-current { outline: 1px solid rgba(37, 99, 235, 0.5); border-radius: 6px; }
 .pw-alive-link { background: none; border: none; color: #60a5fa; cursor: pointer; padding: 0; font-size: inherit; text-decoration: underline; }
 .pw-alive-foot { padding: 6px 14px; font-size: 11px; opacity: 0.55; border-top: 1px solid rgba(128, 128, 128, 0.2); }
+
+/* --- steering: pending message chip (held until the current step completes) --- */
+.pw-steer-chip {
+	display: flex; align-items: center; gap: 10px;
+	margin: 0 14px 6px; padding: 7px 10px;
+	border: 1px solid rgba(250, 179, 63, 0.45);
+	border-left: 3px solid #fab347;
+	border-radius: 8px;
+	background: rgba(250, 179, 63, 0.09);
+	font-size: 12px;
+}
+.pw-steer-ico { flex-shrink: 0; font-size: 14px; }
+.pw-steer-body { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.pw-steer-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.4px; opacity: 0.65; }
+.pw-steer-text {
+	white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+	max-width: 100%; font-weight: 500;
+}
+.pw-steer-btn {
+	flex-shrink: 0; background: transparent; border: 1px solid rgba(128, 128, 128, 0.35);
+	border-radius: 6px; color: inherit; cursor: pointer;
+	font-size: 12px; line-height: 1; padding: 5px 8px;
+}
+.pw-steer-btn:hover { border-color: #fab347; background: rgba(250, 179, 63, 0.15); }
+.pw-steer-cancel:hover { border-color: #f87171; background: rgba(248, 113, 113, 0.15); }
+.pw-send.pw-steer-send { background: rgba(250, 179, 63, 0.16); border-color: rgba(250, 179, 63, 0.55); }
+.pw-send.pw-steer-send:hover { background: rgba(250, 179, 63, 0.28); }

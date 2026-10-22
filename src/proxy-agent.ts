@@ -111,12 +111,26 @@ export class ProxyAgent {
 			this.state.streamingMessage = msg.streamingMessage || undefined;
 			this.state.pendingToolCalls = new Set(msg.pendingToolCalls || []);
 			if (!msg.isStreaming) this.state.streamingMessage = undefined;
+			// steering: a message held mid-run (sent after the current step completes)
+			this.pendingPrompt = (msg as any).pendingPrompt ?? null;
 			this.notifyListeners({ type: "state-snapshot" });
 			const cbs = this.readyCallbacks.splice(0);
 			cbs.forEach((cb) => cb(this.attached));
 			return;
 		}
 		if (msg.type === "agent-event" && msg.event) { this.applyEvent(msg.event); return; }
+		if (msg.type === "steering") {
+			// pending chip delta — queued / consumed at a turn boundary / cancelled
+			this.pendingPrompt = msg.pending ?? null;
+			this.notifyListeners({ type: "steering", pending: this.pendingPrompt });
+			return;
+		}
+		if (msg.type === "accepted" && msg.id && this.pendingReplies.has(msg.id)) {
+			const resolve = this.pendingReplies.get(msg.id)!;
+			this.pendingReplies.delete(msg.id);
+			resolve(msg);
+			return;
+		}
 		if (msg.type === "error") {
 			this.state.errorMessage = msg.error;
 			console.warn("[proxy-agent] server error:", msg.error);
@@ -168,11 +182,41 @@ export class ProxyAgent {
 		});
 	}
 
-	async prompt(input: any, images?: any[]): Promise<void> {
+	/** Correlate {type:"accepted"} replies to steer/prompt requests so the
+	 *  composer can restore text when the hub REJECTS (depth-1 steer, grok P2 —
+	 *  a fire-and-forget send would silently destroy the typed text). */
+	private pendingReplies = new Map<string, (r: any) => void>();
+	private replySeq = 0;
+
+	private request(type: "prompt" | "steer", content: string, images?: any[]): Promise<any> {
+		const id = `${Date.now().toString(36)}-${++this.replySeq}`;
+		const p = new Promise<any>((resolve) => {
+			this.pendingReplies.set(id, resolve);
+			setTimeout(() => { if (this.pendingReplies.delete(id)) resolve({ accepted: false, reason: "steer/prompt reply timeout" }); }, 20000);
+		});
+		this.sendMsg({ type, id, content, images: images?.length ? images : undefined });
+		return p;
+	}
+
+	async prompt(input: any, images?: any[]): Promise<any> {
 		const ready = await this.whenReady(8000);
 		if (!ready) throw new Error("Agent WS not connected");
 		const content = typeof input === "string" ? input : String(input?.content || "");
-		this.sendMsg({ type: "prompt", content, images: images?.length ? images : undefined });
+		return this.request("prompt", content, images);
+	}
+
+	/** Steering: the hub holds the message while a run is in progress (pending
+	 *  chip) and injects it after the current thinking/toolcall completes. */
+	pendingPrompt: any = null;
+
+	/** Send a steering message (mid-run): resolves with the hub's accept/reject. */
+	steer(content: string, images?: any[]): Promise<any> {
+		return this.request("steer", content, images);
+	}
+
+	/** Pull a pending steering message back (edit) or drop it (cancel). */
+	cancelSteering(): void {
+		this.sendMsg({ type: "steering-cancel" });
 	}
 
 	abort(): void {

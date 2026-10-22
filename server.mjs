@@ -1823,12 +1823,35 @@ function agentConn(ws) {
 					const images = Array.isArray(m.images)
 						? m.images.filter((im) => im && im.type === "image" && typeof im.data === "string" && typeof im.mimeType === "string").slice(0, 4)
 						: undefined;
-					agentHub.prompt(currentSession, String(m.content || ""), images?.length ? images : undefined).then((r) => safeSend(ws, { type: "accepted", ...r })).catch((err) => safeSend(ws, { type: "error", error: err.message }));
+					// id echoes on the accepted reply so the composer can restore text on a reject
+					agentHub.prompt(currentSession, String(m.content || ""), images?.length ? images : undefined)
+						.then((r) => safeSend(ws, { type: "accepted", id: m.id, ...r }))
+						.catch((err) => safeSend(ws, { type: "error", error: err.message }));
+					break;
+				}
+				case "steer": {
+					// mid-run send: the client explicitly asks to HOLD this message until
+					// the current thinking/toolcall completes (grok review P1: a prompt
+					// here would misroute post-Stop sends into leftover steers)
+					if (!currentSession) { safeSend(ws, { type: "error", error: "attach first" }); break; }
+					const images = Array.isArray(m.images)
+						? m.images.filter((im) => im && im.type === "image" && typeof im.data === "string" && typeof im.mimeType === "string").slice(0, 4)
+						: undefined;
+					agentHub.steer(currentSession, String(m.content || ""), images?.length ? images : undefined)
+						.then((r) => safeSend(ws, { type: "accepted", id: m.id, ...r }))
+						.catch((err) => safeSend(ws, { type: "error", error: err.message }));
 					break;
 				}
 				case "abort":
 					if (currentSession) agentHub.abort(currentSession);
 					break;
+				case "steering-cancel": {
+					// ✎/✕ on the pending-steering chip: pull the held message back (edit
+					// pre-fills the composer client-side; cancel just drops it)
+					const ok = currentSession ? agentHub.cancelSteering(currentSession) : false;
+					safeSend(ws, { type: "steering-cancelled", ok });
+					break;
+				}
 				case "set-model": {
 					if (!currentSession) break;
 					const ok = agentHub.setModel(currentSession, String(m.modelId || ""));

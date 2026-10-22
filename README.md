@@ -52,7 +52,7 @@ claims without the raw source). Start with `architecture.md` — index + reading
 
 | Concern | File | Notes |
 |---|---|---|
-| Chat panel (message list, streaming, editor, stop, retry) | `src/ui/chat.tsx` | plain text while streaming, markdown on message_end; tool rows keyed by toolCallId; UI-only partials map |
+| Chat panel (message list, streaming, editor, stop, retry) | `src/ui/chat.tsx` | plain text while streaming, markdown on message_end; tool rows keyed by toolCallId; UI-only partials map; **steering**: send mid-run → held as a pending chip (✎ pull back to composer / ✕ cancel), injected after the current step completes |
 | Markdown + highlight + XSS | `src/ui/markdown.ts` | marked (GFM) + highlight.js lib/common + DOMPurify (style/id/name forbidden); memoized |
 | LLM connectivity (proxy + keys) | `src/ui/proxy-stream.ts` | vendored proxy-utils + build patches: clone-before-proxy, localStorage-first settings, key resolver w/ bounded server race |
 | Session list dialog | `src/ui/session-list.tsx` | server mirror + local metadata merge, load/delete |
@@ -267,6 +267,7 @@ Requirements & limits:
   state via `sessionSync.syncHealthy()`). Running sessions also pin in the full session list with a
   live preview line, and a "Resume" banner appears after reopening the app. No polling, no event
   deltas to detached devices, runtime is memory-only (restart ⇒ all idle).
+- **Steering (2026-10-22)**: a message sent WHILE a run is in progress no longer blocks (the old editor rejected it) and no longer waits for the run to END (the old hub queued it via `followUp()`, whose in-lock `isStreaming` check was effectively dead — the promptLock serializes whole runs, so the queued path only fired for simultaneous sends). Flow: the editor's guard lifts for server-side agents (⏩ Steer button / Enter), the hub's `prompt()` checks `isStreaming` BEFORE the promptLock and holds the message via `agent.steer()` — pi-agent-core injects it at the next turn boundary (after the current thinking/toolcall completes, before the next assistant response). The pending message shows as an amber chip on EVERY attached device (`{type:"steering"}` frames + `pendingPrompt` in the state snapshot) with ✎ edit (cancel + prefill the composer, images re-attach) and ✕ cancel (`steering-cancel` → `agent.clearSteeringQueue()`). Depth 1; an unconsumed pending message survives an abort/error and is injected at the next run's start (pi semantics). Test: `npm run test:steer` (real server + LLM, 8 checks).
 - **Server-side agents** (`src/proxy-agent.ts`, `/ws/agent`): now the **DEFAULT chat path** — tools
   (read/write/edit/bash + pi extensions) run in-process, keys stay in `.pi/auth.json`, every event is
   broadcast to all attached devices, and runs survive browser closes. `?local=1` restores the old
