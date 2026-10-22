@@ -20,6 +20,60 @@ function extractPreviewText(content, maxLen = 120) {
 	return "";
 }
 
+/** Repair toolResult identity that the OLD mirror format dropped (pre-2026-10-22
+ *  _writeSession wrote only {role, content, timestamp}, losing the top-level
+ *  toolCallId/toolName). After a restart the hub hydrated such mirrors and the
+ *  openai-completions converter emitted role:"tool" messages WITHOUT
+ *  tool_call_id (and duplicated them) → provider 400 (nvidia NIM:
+ *  "missing field tool_call_id"), permanently, because the failed run appended
+ *  an empty assistant message that every retry kept in the history.
+ *
+ *  Re-links each orphan toolResult to the preceding assistant's toolCall blocks
+ *  IN ORDER (pi-agent-core emits toolResults in toolCall order), backfills
+ *  toolName, and strips toolCalls that still got no result (openai-completions
+ *  also 400s on tool_calls without a following tool message). Idempotent:
+ *  already-linked messages pass through untouched. */
+export function normalizeRestoredMessages(messages) {
+	if (!Array.isArray(messages)) return messages;
+	const out = messages.map((m) => (Array.isArray(m?.content) ? { ...m, content: [...m.content] } : { ...m }));
+	let changed = false;
+	for (let i = 0; i < out.length; i++) {
+		const m = out[i];
+		if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
+		const calls = m.content.filter((b) => b?.type === "toolCall");
+		if (!calls.length) continue;
+		// consume the toolResults that directly follow this assistant (they answer
+		// its toolCalls in order); stop at the next non-toolResult message
+		let j = i + 1;
+		let k = 0;
+		while (j < out.length && out[j].role === "toolResult") {
+			const tr = out[j];
+			if (!tr.toolCallId && k < calls.length) {
+				out[j] = { ...tr, toolCallId: calls[k].id, toolName: tr.toolName ?? calls[k].name };
+				k++;
+				changed = true;
+			}
+			j++;
+		}
+		const matched = new Set(out.slice(i + 1, j).map((t) => t.toolCallId).filter(Boolean));
+		if (calls.some((c) => !matched.has(c.id))) {
+			// dangling toolCall — an assistant tool_call with no tool answer is ALSO
+			// a provider 400; drop the block (same repair prompt() does, but for
+			// every message, not just the last assistant)
+			const kept = m.content.filter((b) => b?.type !== "toolCall" || matched.has(b.id));
+			if (kept.length === 0) kept.push({ type: "text", text: "(tool call interrupted by error)" });
+			out[i] = { ...m, content: kept };
+			changed = true;
+		}
+	}
+	// toolResults that still have no id (not directly after their assistant) cannot
+	// be converted — role:"tool" without tool_call_id is a provider 400. Drop them;
+	// losing one orphan tool output beats a permanently dead session.
+	const linked = out.filter((m) => !(m.role === "toolResult" && !m.toolCallId));
+	if (linked.length !== out.length) changed = true;
+	return changed ? linked : messages;
+}
+
 export class AgentHub {
 	constructor({ modelsStore, getAuth, persist, broadcast, getTools, getSystemPrompt, defaultModelId, onRuntimeChange }) {
 		this.modelsStore = modelsStore;
@@ -72,7 +126,9 @@ export class AgentHub {
 				initialState: {
 					model,
 					thinkingLevel: level,
-					messages: messages || [],
+					// re-link toolResults that lost toolCallId in an old mirror (2026-10-22:
+					// nvidia NIM 400s on tool messages without tool_call_id after restart)
+					messages: messages ? normalizeRestoredMessages(messages) : [],
 					...(systemPrompt ? { systemPrompt } : {}),
 					tools: this.getTools(), // read/write/edit/bash + pi extensions — in-process
 				},
@@ -226,9 +282,15 @@ export class AgentHub {
 		};
 		if (!entry.createdAt) entry.createdAt = now;
 		const lines = [JSON.stringify(metadata)];
+		// FULL message objects (2026-10-22): the old {role, content, timestamp}
+		// projection stripped toolResult.toolCallId/toolName — after a restart the
+		// rehydrated history produced tool messages without tool_call_id → provider
+		// 400 on the first prompt ("missing field tool_call_id", nvidia NIM).
+		// stopReason/errorMessage/usage also survive now, so the UI renders errors
+		// and tool rows correctly after reload.
 		for (const m of state.messages) {
-			const out = { role: m.role, content: m.content };
-			if (m.timestamp) out.timestamp = m.timestamp;
+			const out = { ...m };
+			if (!out.timestamp) out.timestamp = Date.now();
 			lines.push(JSON.stringify(out));
 		}
 		this.persist(sessionId, lines.join("\n") + "\n").catch((err) => {

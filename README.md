@@ -93,6 +93,7 @@ Workspace file attach + image paste are BACK (plan.md §12–14) — see the exp
 | Saves lost during WS reconnect | push no-op'd on closed socket | pending-push queue flushed on open |
 | Renamed session kept old position | updateTitle didn't bump lastModified | bumped + server sync push |
 | Deleted session resurrected | save debounce + pagehide flush | `deletedSessionIds` guard + timer clear + id clear before nav |
+| Every prompt 400'd after a server restart ("400 status code (no body)", nvidia NIM `missing field tool_call_id`) | `_writeSession` persisted only `{role, content, timestamp}` — `toolResult.toolCallId` was stripped from the JSONL mirror; after a reboot the rehydrated history converted to `role:"tool"` messages without `tool_call_id` (and pi-ai duplicated them), and the failed run's empty assistant message kept every retry broken | persist FULL message objects; `normalizeRestoredMessages()` re-links orphan toolResults by order on restore (strip dangling toolCalls, drop unmatchable orphans); one-time mirror repair `node tests/repair-mirror-toolcalls.mjs`; regression `tests/restore-toolcall.test.mjs` |
 | IDB hangs | wedged LevelDB | LocalStorageBackend replacement |
 
 ## Configuration

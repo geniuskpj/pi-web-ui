@@ -252,7 +252,14 @@ dangling toolCalls (Anthropic/OpenAI validity) and inlines composer images for q
 `/ws/agent` attach ALWAYS ensures the hub session exists (fresh sessions have no store entry —
 `setThinkingLevel` was a crash on `entry.agent` before 2026-10-21). Events: every event seq-stamped +
 broadcast to `/ws/agent` clients;
-user-message ends persist immediately, others debounced 400ms with a 2s maxWait. `attach()` =
+user-message ends persist immediately, others debounced 400ms with a 2s maxWait. `_writeSession`
+persists FULL message objects (2026-10-22 — the old `{role, content, timestamp}` projection stripped
+toolResult.toolCallId, so after a restart the rehydrated history produced `role:"tool"` messages
+without `tool_call_id` and nvidia NIM 400'd every prompt, permanently; error/stopReason/usage now
+survive restarts too). `getSession` runs restored messages through `normalizeRestoredMessages()` —
+re-links orphan toolResults to the preceding assistant's toolCall blocks in order, strips still-
+unmatched toolCalls, drops unmatchable orphans (idempotent; one-time bulk repair:
+`node tests/repair-mirror-toolcalls.mjs`). `attach()` =
 subscribe-first: buffers events via a per-session `entry.buffer` hook while snapshotting (2026-10-21 —
 the old global broadcast swap was not reentrant), then delivers snapshot + buffered (dedup by seq).
 `prompt()` queues ONE follow-up while streaming (depth 2+ rejected). Eviction: idle >30min (flush
