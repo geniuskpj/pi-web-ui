@@ -1944,6 +1944,22 @@ function syncConn(ws) {
 					jsonl = JSON.stringify(meta) + "\n" + messages.map((x) => JSON.stringify(x)).join("\n") + "\n";
 				}
 				if (jsonl) {
+					// NON-REGRESSION GUARD (2026-10-22 lost-message postmortem): the client's
+					// localStorage copy can be FROZEN by the ~5MB quota (stale metadata +
+					// stale messages) — a stale push used to OVERWRITE the hub's
+					// authoritative mirror and permanently drop newer turns (the mirror
+					// carried stale metadata while holding newer messages). A client put may
+					// only move the mirror FORWARD (>= current messageCount). Hub-initiated
+					// shrinks (rewrite/compact) bypass this path — the hub persists directly.
+					try {
+						const cur = await storeOp("meta", { id });
+						const curCount = cur?.messageCount ?? cur?.metadata?.messageCount ?? 0;
+						const incomingCount = (m.data && Array.isArray(m.data.messages)) ? m.data.messages.length : Math.max(0, jsonl.split("\n").length - 2);
+						if (cur && incomingCount < curCount) {
+							safeSend(ws, { type: "put-rejected", id, reason: `stale client copy (${incomingCount} < ${curCount} messages) — server mirror kept` });
+							return; // (not break — we're inside a try inside the case block)
+						}
+					} catch { /* meta probe failure → allow (fail open for new sessions) */ }
 					await storeOp("put", { id, jsonl });
 					broadcastSessions().catch(() => {});
 					pushWatched(id).catch(() => {});

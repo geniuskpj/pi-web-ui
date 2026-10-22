@@ -271,10 +271,16 @@ export class AgentHub {
 				const subs = this.subscribers.get(sessionId);
 				if (subs) for (const cb of [...subs]) { try { cb({ type: "agent-event", event }); } catch { /* listener error — drop */ } }
 				entry.lastActivity = Date.now();
-				// persistence triggers: user message immediately; everything else debounced
+				// persistence triggers: user message immediately; everything else debounced —
+				// EXCEPT agent_end: the turn boundary flushes NOW (2026-10-22 postmortem:
+				// the final reply of a turn was lost when the server was hard-killed while
+				// the 400ms-debounced 5MB put was still in flight; a turn boundary is the
+				// one point users cannot afford to lose)
 				if (event.type === "message_end" && event.message?.role === "user") {
 					this.persistSession(sessionId, true);
-				} else if (event.type === "message_end" || event.type === "agent_end") {
+				} else if (event.type === "agent_end") {
+					this.persistSession(sessionId, true);
+				} else if (event.type === "message_end") {
 					this.persistSession(sessionId, false);
 				}
 			});
