@@ -306,6 +306,7 @@ function MessageView(props: {
 	partials?: Map<string, string>;
 	isLast?: boolean;
 	index?: number;
+	justUpdated?: boolean; // compaction completed this render — flash the summary block
 	canMutate?: boolean;
 	onEditMessage?: (i: number) => void;
 	onForkMessage?: (i: number) => void;
@@ -323,7 +324,7 @@ function MessageView(props: {
 			const text = textOf((message as UserMessage).content).replace(/^## Conversation summary \(auto-compacted\)\n\n?/, "");
 			return (
 				<div class="pw-msg-row">
-					<details class="pw-compact-note">
+					<details class={"pw-compact-note" + (props.justUpdated ? " pw-compact-fresh" : "")} open={props.justUpdated || undefined}>
 						<summary class="pw-compact-head">⤓ compacted context — older messages summarized here · recent turns kept below (click to view)</summary>
 						<div class="pw-compact-body">{text}</div>
 					</details>
@@ -532,10 +533,14 @@ export function ChatView({ agent }: { agent: Agent }) {
 	const compact = async () => {
 		if (compacting || (agent as any).serverSide !== true) return;
 		setCompacting(true);
+		setCompactDone(false);
 		try {
 			const r = await (agent as any).compact(20000);
 			if (!r?.ok) throw new Error(r?.reason || r?.error || "compact failed");
-			note(`compacted — ${r.summarized} messages summarized, ${r.kept} kept · summary ~${Math.round((r.summaryChars || 0) / 4).toLocaleString()} tokens${r.backupPath ? " · pre-compact backup saved" : ""}`);
+			compactSettled.current = true;
+			setCompactDone(true);
+			note(`⤓ compacted — ${r.summarized} messages summarized, ${r.kept} kept · summary ~${Math.round((r.summaryChars || 0) / 4).toLocaleString()} tokens — the compacted-context block at the top was UPDATED${r.backupPath ? " · pre-compact backup saved" : ""}`);
+			setTimeout(() => setCompactDone(false), 12000); // success banner auto-hides
 		} catch (err: any) {
 			note(err?.message || String(err));
 		} finally {
@@ -763,26 +768,46 @@ export function ChatView({ agent }: { agent: Agent }) {
 	const showCompact = compacting || !!(state as any).compacting;
 	const [compactStarted, setCompactStarted] = useState(0);
 	const [, setCompactTick] = useState(0);
+	const [compactDone, setCompactDone] = useState(false);
+	const compactSid = useRef<string | null>(null);
+	const compactSettled = useRef(false); // compact() reply path already handled it
 	useEffect(() => {
 		if (!showCompact) return;
+		compactSettled.current = false;
+		compactSid.current = (agent as any).currentSessionId ?? null; // session-gate the transition
 		setCompactStarted((s) => s || Date.now());
 		const t = setInterval(() => setCompactTick((x) => x + 1), 1000); // elapsed ticker
 		return () => clearInterval(t);
 	}, [showCompact]);
-	// completion note even when the client await timed out (the banner clears via
-	// the server state frame — make that transition visible)
+	// transition true→false: completion or session switch. The state frame of a
+	// DIFFERENT session also flips compacting:false — gate on session id so
+	// clicking another session no longer prints a bogus "compaction finished"
+	// (user report 2026-10-23).
 	const wasCompacting = useRef(false);
 	useEffect(() => {
 		if (showCompact) { wasCompacting.current = true; return; }
-		if (wasCompacting.current) {
-			wasCompacting.current = false;
-			note("compaction finished — transcript updated (older history folded into the summary at the top)");
-		}
+		if (!wasCompacting.current) return;
+		wasCompacting.current = false;
+		setCompactStarted(0); // next run starts the ticker from 0
+		const same = (agent as any).currentSessionId === compactSid.current;
+		compactSid.current = null;
+		setCompactDone(false);
+		if (!same || compactSettled.current) return;
+		// reply path didn't settle (client await timed out / other device pressed)
+		note("⤓ compaction ended — the compacted-context block at the top was refreshed");
 	}, [showCompact]);
+	const scrollToSummary = () => {
+		const el = scrollRef.current?.querySelector(".pw-compact-note") as HTMLDetailsElement | null;
+		if (el) {
+			try { el.open = true; } catch { /* noop */ }
+			el.scrollIntoView({ block: "start", behavior: "smooth" });
+		}
+	};
 	const toolResults = new Map<string, ToolResultMessage>();
 	for (const m of state.messages) {
 		if (m.role === "toolResult") toolResults.set((m as ToolResultMessage).toolCallId, m as ToolResultMessage);
 	}
+	const summaryIdx = state.messages.findIndex((m: any) => m?.isCompactionSummary);
 
 	return (
 		<div class="pw-chat">
@@ -797,6 +822,7 @@ export function ChatView({ agent }: { agent: Agent }) {
 						partials={partials.current}
 						isLast={i === state.messages.length - 1 && !state.streamingMessage}
 						index={i}
+						justUpdated={compactDone && i === summaryIdx}
 						canMutate={!state.isStreaming && (agent as any).serverSide === true}
 						onEditMessage={editMessage}
 						onForkMessage={forkMessage}
@@ -866,13 +892,19 @@ export function ChatView({ agent }: { agent: Agent }) {
 				}}
 			/>
 			<UsageBar agent={agent} canCompact={(agent as any).serverSide === true && !state.isStreaming && state.messages.length > 6} compacting={compacting} onCompact={compact} />
-			{showCompact && (
+				{compactDone ? (
+				<div class="pw-compact-progress pw-compact-done" role="status">
+					<span aria-hidden="true">✓</span>
+					<span>Context compacted — the compacted-context summary at the top was just updated.</span>
+					<button type="button" class="pw-compact-view" onClick={scrollToSummary}>⤒ view summary</button>
+				</div>
+				) : showCompact ? (
 				<div class="pw-compact-progress" role="status">
 					<span class="pw-compact-spinner" aria-hidden="true">⤓</span>
 					<span>Compacting context… summarizing older history into a checkpoint. The recent tail stays verbatim; this can take minutes on long sessions (the page may be left open).</span>
 					<span class="pw-compact-elapsed">{compactStarted ? `${Math.floor((Date.now() - compactStarted) / 60000)}:${String(Math.floor(((Date.now() - compactStarted) / 1000) % 60)).padStart(2, "0")} elapsed` : "starting…"}</span>
 				</div>
-			)}
+				) : null}
 			<FilePickerDialog
 				open={picker.open}
 				initialFile={picker.initialFile}

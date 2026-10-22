@@ -676,12 +676,14 @@ export class AgentHub {
 			entry.pendingPrompt = null; entry.pendingPromptMessage = null; entry.followUpCount = 0; entry.runtime.pendingPrompts = 0;
 			this.emitRuntime(sessionId); this.emitSteering(sessionId);
 			await this.persistSession(sessionId, true);
-			this.broadcastState(sessionId);
 			ok = true;
 			return { ok: true, summarized: cut - from, kept: msgs.length - cut, summaryChars: String(summary).trim().length, backupPath };
 		} finally {
+			// clear BEFORE the final broadcast: the success path used to broadcast
+			// while entry.compacting was still true, so every device's banner kept
+			// ticking forever (no further state frame until the next turn)
 			entry.compacting = false;
-			if (!ok) this.broadcastState(sessionId); // failure: clear the banner everywhere
+			this.broadcastState(sessionId); // final frame: new messages + compacting:false (success AND failure)
 		}
 	}
 

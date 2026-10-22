@@ -26,6 +26,12 @@ export class ProxyAgent {
 	private listeners = new Set<Listener>();
 	private ws: WebSocket | null = null;
 	private sessionId: string;
+	/** Current session id for UI gating (compact-completion must not fire across
+	 *  session switches — the state frame of the NEW session also flips
+	 *  compacting:false, which used to print a bogus "compaction finished"). */
+	get currentSessionId(): string {
+		return this.sessionId;
+	}
 	private enabled = false;
 	private attached = false;
 	private retryCount = 0;

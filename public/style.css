@@ -1732,6 +1732,17 @@ html.dark .pw-term-host.wterm {
 .pw-compact-spinner { display: inline-block; animation: pw-compact-pulse 1.1s ease-in-out infinite; font-weight: 700; }
 @keyframes pw-compact-pulse { 0%, 100% { opacity: 0.35; transform: translateY(-1px); } 50% { opacity: 1; transform: translateY(1px); } }
 .pw-compact-elapsed { margin-left: auto; font-variant-numeric: tabular-nums; opacity: 0.85; flex: none; }
+
+/* completion: green done-banner + the updated summary block flashes 3× so the
+   user can SEE that the compacted context changed ("silently updated" report) */
+.pw-compact-done { background: rgba(74, 222, 128, 0.10); border-top-color: rgba(74, 222, 128, 0.4); color: #86efac; }
+.pw-compact-view {
+	background: transparent; border: 1px solid rgba(134, 239, 172, 0.5); color: #86efac;
+	border-radius: 6px; cursor: pointer; font-size: 11.5px; padding: 2px 8px; flex: none;
+}
+.pw-compact-view:hover { background: rgba(134, 239, 172, 0.14); }
+@keyframes pw-compact-flash { 0%, 100% { background: rgba(96, 165, 250, 0.06); } 50% { background: rgba(96, 165, 250, 0.30); } }
+.pw-compact-fresh { animation: pw-compact-flash 1s ease-in-out 3; border-color: #60a5fa; }
 .pw-compact-btn {
 	background: transparent; border: 1px solid rgba(96, 165, 250, 0.4);
 	border-radius: 10px; color: inherit; cursor: pointer;
