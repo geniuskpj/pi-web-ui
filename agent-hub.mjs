@@ -262,6 +262,11 @@ export class AgentHub {
 					this.emitSteering(sessionId);
 				} else if (event.type === "agent_end") {
 					if (entry.previewTimer) { clearTimeout(entry.previewTimer); entry.previewTimer = null; }
+					// phantom-streaming guard (killstop test 2026-10-23): after ABORT pi's
+					// state.isStreaming stayed true indefinitely — any device attaching in
+					// that window saw a frozen "streaming" transcript that never updates
+					// (no further events come). The terminal event is ground truth.
+					if (entry.agent.state.isStreaming) entry.agent.state.isStreaming = false;
 					const lastA = [...entry.agent.state.messages].reverse().find((m) => m.role === "assistant");
 					entry.runtime = { status: lastA?.stopReason === "error" ? "error" : "idle", startedAt: null, turn: 0, currentTool: null, lastText: null, pendingPrompts: entry.pendingPrompt ? 1 : 0 };
 					this.emitRuntime(sessionId); // explicit idle/error delta — the terminal state is never lost
