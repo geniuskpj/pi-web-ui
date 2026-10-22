@@ -635,20 +635,23 @@ export function ChatView({ agent }: { agent: Agent }) {
 		if (editSidRef.current !== sid) { editSidRef.current = sid; setEditingIdx(null); } // session switch cancels a pending inline edit
 	});
 	const saveEdit = async (i: number, text: string) => {
-		const msgs = agent.state.messages as any[];
-		const m = msgs[i];
-		const orig = typeof m?.content === "string" ? m.content : (m?.content || []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n");
-		if (!m || m.role !== "user") { setEditingIdx(null); return; }
-		if (text.trim() === String(orig).trim()) { setEditingIdx(null); return; } // unchanged → no version (user design)
-		try {
-			const r = await (agent as any).editCommit(i, text);
-			if (!r?.ok) throw new Error(r?.reason || r?.error || "edit failed");
-			note(r?.noop ? "edit cancelled — text unchanged" : `✎ saved — the old turn was parked as version #${r.version?.vid ?? "?"} (🕘 picker); the edited message is on its way`);
-			setEditingIdx(null);
-			window.dispatchEvent(new CustomEvent("pi-composer-focus")); // arena review: focus returns to the composer after save
-		} catch (err: any) {
-			note(err?.message || String(err));
-		}
+	 const msgs = agent.state.messages as any[];
+	 const m = msgs[i];
+	 const orig = typeof m?.content === "string" ? m.content : (m?.content || []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n");
+	 if (!m || m.role !== "user") { setEditingIdx(null); return; }
+	 if (text.trim() === String(orig).trim()) { setEditingIdx(null); return; } // unchanged → no version (user design)
+	 setEditingIdx(null); // close the editor IMMEDIATELY — the reply must never
+	 // gate the UI (hub.prompt resolves at run end; the old await left the editor
+	 // open + the region dimmed while the response streamed invisibly)
+	 try {
+	  const r = await (agent as any).editCommit(i, text);
+	  if (!r?.ok) throw new Error(r?.reason || r?.error || "edit failed");
+	  note(`✎ saved — the old turn was parked as version #${r.version?.vid ?? "?"} (🕘 picker); the edited message is on its way`);
+	  forceStick(); // the response streams at the bottom — follow it
+	  window.dispatchEvent(new CustomEvent("pi-composer-focus")); // focus returns to the composer after save
+	 } catch (err: any) {
+	  note(err?.message || String(err));
+	 }
 	};
 	const attachNoteTimer = useRef<any>(null);
 	const note = (msg: string) => {

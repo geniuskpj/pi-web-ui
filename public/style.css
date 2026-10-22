@@ -1798,10 +1798,12 @@ html.dark .pw-term-host.wterm {
 	border-top: 1px solid rgba(128, 128, 128, 0.2);
 }
 .pw-edit-save, .pw-edit-cancel { border-radius: 6px; cursor: pointer; font-size: 13px; padding: 5px 12px; }
-.pw-edit-save { background: var(--accent, #60a5fa); color: #0a0a0a; border: 1px solid transparent; }
+/* fixed colors — var(--accent)/var(--primary) flip between themes and left the
+   label unreadable (user report: black font invisible on dark) */
+.pw-edit-save { background: #60a5fa; color: #0b1220; border: 1px solid transparent; }
 .pw-edit-save:hover { filter: brightness(1.1); }
-.pw-edit-cancel { background: transparent; border: none; color: var(--muted-foreground, #888); }
-.pw-edit-cancel:hover { background: rgba(128, 128, 128, 0.14); color: inherit; }
+.pw-edit-cancel { background: transparent; border: none; color: inherit; opacity: 0.75; }
+.pw-edit-cancel:hover { background: rgba(128, 128, 128, 0.14); opacity: 1; }
 /* while editing: everything after the edited message dims (arena review —
    visible-but-dimmed beats hiding: context stays referenceable) */
 .pw-will-replace { opacity: 0.38; pointer-events: none; transition: opacity 150ms ease; }
@@ -1905,5 +1907,6 @@ html.dark .pw-term-host.wterm {
 }
 .pw-steer-btn:hover { border-color: #fab347; background: rgba(250, 179, 63, 0.15); }
 .pw-steer-cancel:hover { border-color: #f87171; background: rgba(248, 113, 113, 0.15); }
-.pw-send.pw-steer-send { background: rgba(250, 179, 63, 0.16); border-color: rgba(250, 179, 63, 0.55); }
+.pw-send.pw-steer-send { background: rgba(250, 179, 63, 0.16); border-color: rgba(250, 179, 63, 0.55); color: #8a5a00; }
+html.dark .pw-send.pw-steer-send { color: #fbbf24; }
 .pw-send.pw-steer-send:hover { background: rgba(250, 179, 63, 0.28); }

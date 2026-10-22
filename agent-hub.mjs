@@ -439,7 +439,19 @@ export class AgentHub {
 
 	abort(sessionId) {
 		const entry = this.sessions.get(sessionId);
-		if (entry) entry.agent.abort();
+		if (!entry) return;
+		// STOP = stop EVERYTHING (user report 2026-10-23: with a pending steer the
+		// chat "was not stopped" — the queued message survived the abort and injected
+		// into the next run). Clear pi's steering queue + the hub's pending payload
+		// on explicit abort; all devices resync via the steering frame below.
+		try { entry.agent.clearSteeringQueue?.(); } catch { /* older core */ }
+		if (entry.pendingPrompt || entry.pendingPromptMessage) {
+			entry.pendingPrompt = null;
+			entry.pendingPromptMessage = null;
+			entry.runtime.pendingPrompts = 0;
+			this.emitSteering(sessionId);
+		}
+		try { entry.agent.abort(); } catch { /* already dead */ }
 	}
 
 	setModel(sessionId, modelId) {
@@ -701,8 +713,15 @@ export class AgentHub {
 		this.emitRuntime(sessionId); this.emitSteering(sessionId);
 		await this.persistSession(sessionId, true);
 		this.broadcastState(sessionId);
-		const r = await this.prompt(sessionId, String(text || ""));
-		return { ok: true, version, ...r };
+		// DO NOT await the run: hub.prompt() resolves at RUN END (promptLock holds
+		// through the whole stream) — awaiting it delayed the edit-committed reply
+		// by minutes, the client's await timed out, and the editor stayed open with
+		// the region dimmed while the response streamed invisibly (user report:
+		// "ui is not updated / had to press send again"). Reply immediately; the
+		// streamed response arrives as normal agent events on every device.
+		const pr = this.prompt(sessionId, String(text || ""));
+		pr.catch((err) => console.error(`[hub] edit-commit prompt failed for ${sessionId}:`, err?.message || err));
+		return { ok: true, version, accepted: true };
 	}
 
 	/** RESTORE a version: swap the saved tail back into the active transcript.
