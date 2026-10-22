@@ -81,6 +81,10 @@ sessions.setBackend(backend);
 const storage = new AppStorage(settings, providerKeys, sessions, customProviders, backend);
 setAppStorage(storage); // session-sync, pi-import, and the Preact UI
 (window as any).__app = { storage, getAgent: () => agent, backend };
+// boot scavenger (grok design B, step 4): drop frozen/poison/over-cap session
+// bodies from the quota era and mark them bodyLocation:'server' — after first
+// paint, so the session list never waits on storage
+setTimeout(() => { void SessionsStore.scavengeBodies(sessions); }, 3000);
 
 // ============================================================================
 // SESSION HELPERS
@@ -114,6 +118,11 @@ const saveSession = async () => {
 	if (!shouldSaveSession(state.messages)) return;
 	try {
 		const now = new Date().toISOString();
+		// SERVER-FIRST (grok design B): the WS push is the DURABLE copy — never gate
+		// it on the local save (a 5MB+ body overflows the origin quota and used to
+			// skip the push entirely). The local write below is a cache + may omit the
+		// body (bodyLocation:server) — the metadata write always succeeds.
+		sessionSync.push(currentSessionId);
 		await storage.sessions.save(
 			{
 				id: currentSessionId,
@@ -135,7 +144,6 @@ const saveSession = async () => {
 				preview: generateTitle(state.messages),
 			},
 		);
-		sessionSync.push(currentSessionId);
 	} catch (err) {
 		dlog.error("[init] save session failed:", err);
 	}
@@ -373,7 +381,9 @@ const loadSession = async (sessionId: string): Promise<boolean> => {
 			if (j.exists && Array.isArray(j.messages) && j.messages.length > 0) server = j;
 		}
 	} catch { /* offline — local is enough */ }
-	const localWin = !server || (!!local && local.messages.length >= server.messages.length);
+	// SERVER WINS TIES (grok design B): the old length>= rule let a frozen/poison
+	// local copy win restores. Local only when strictly more complete AND newer.
+	const localWin = !server || (!!local && (local.messages.length > server.messages.length || (local.messages.length === server.messages.length && String(local.lastModified || "") >= String((server as any).metadata?.lastModified || server.lastModified || ""))));
 	const snap: any = localWin ? local : server;
 	if (!snap) {
 		// dead entry (no local body, no server copy) — prune the metadata so the

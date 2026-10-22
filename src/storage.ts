@@ -125,14 +125,72 @@ export class SessionsStore extends Store {
 	static getMetadataConfig() {
 		return { name: "sessions-metadata", indices: [{ name: "lastModified", keyPath: "lastModified" }] };
 	}
+	/** SERVER-FIRST OVERFLOW (grok design B, 2026-10-22 quota postmortem):
+	 *  Chromium charges ~10 MiB/origin for localStorage in UTF-16 — a 5MB-char
+	 *  transcript body alone fills the ENTIRE origin and every other key starts
+	 *  throwing QuotaExceededError (metadata froze → stale restores). Policy:
+	 *  metadata ALWAYS stays local (instant session list); the BODY only when it
+	 *  fits the per-body cap. Above the cap → bodyLocation:'server' — the JSONL
+	 *  mirror is the durable copy, loadSession fetches it, and get() reports a
+	 *  cache MISS (deliberately not "data loss"). The backend's setItem choke
+	 *  point evicts the largest body + retries once; isPersisted() detects the
+	 *  memory-only degraded case. */
+	static PER_BODY_CAP = 512 * 1024; // serialized chars (~1 MiB charged UTF-16)
 	async save(data: AnyRecord, metadata: AnyRecord): Promise<void> {
+		let bodyChars = 0;
+		try { bodyChars = JSON.stringify(data).length; } catch { bodyChars = Infinity; } // stringify blowup → treat as oversize
+		const md = { ...metadata, sizeChars: bodyChars, bodyLocation: bodyChars > SessionsStore.PER_BODY_CAP ? "server" : "local" };
+		if (md.bodyLocation === "server") {
+			// never write the fat body — drop any stale local copy, metadata only.
+			// The WS push to the mirror happens in main.tsx BEFORE this call.
+			await this.getBackend().delete("sessions", data.id);
+			await this.getBackend().set("sessions-metadata", data.id, md);
+			return;
+		}
 		await this.getBackend().transaction(["sessions", "sessions-metadata"], "readwrite", async (tx: any) => {
 			await tx.set("sessions", data.id, data);
-			await tx.set("sessions-metadata", metadata.id, metadata);
+			await tx.set("sessions-metadata", data.id, md);
 		});
+		if (!(this.getBackend() as any).isPersisted("sessions", data.id)) {
+			// quota degraded the body to memory-only — it will NOT survive a reload;
+			// mark it server-held so restore never trusts the missing local copy
+			md.bodyLocation = "server";
+			await this.getBackend().set("sessions-metadata", data.id, md);
+		}
+	}
+	/** Boot-time scavenger: drop bodies that are unparsable, over-cap, or
+	 *  incomplete (length ≠ metadata.messageCount — stale after a hub-side
+	 *  compact/rewrite), and mark them bodyLocation:'server'. This is how a
+	 *  frozen/poison local body from the quota era stops winning restores. */
+	static async scavengeBodies(store: SessionsStore): Promise<void> {
+		const backend = store.getBackend() as any;
+		try {
+			for (const md of await store.getAllMetadata()) {
+				let body: any = null;
+				try { body = await backend.get("sessions", md.id); } catch { body = null; }
+				const complete = body && Array.isArray(body.messages) && (md.messageCount === undefined || body.messages.length === md.messageCount);
+				let chars = 0;
+				if (body) { try { chars = JSON.stringify(body).length; } catch { chars = Infinity; } }
+				if (!complete || chars > SessionsStore.PER_BODY_CAP) {
+					if (body) await backend.delete("sessions", md.id);
+					if (md.bodyLocation !== "server") {
+						md.bodyLocation = "server";
+						await backend.set("sessions-metadata", md.id, md);
+					}
+				}
+			}
+		} catch (err) {
+			console.warn("[storage] session body scavenger failed:", err);
+		}
 	}
 	async get(id: string): Promise<AnyRecord | null> {
-		return this.getBackend().get("sessions", id);
+		const data = await this.getBackend().get("sessions", id);
+		if (!data) return null;
+		// server-held body → cache MISS (the mirror is authoritative; loadSession
+		// fetches it). Deliberately NOT data loss.
+		const md = await this.getMetadata(id);
+		if (md?.bodyLocation === "server") return null;
+		return data;
 	}
 	async getMetadata(id: string): Promise<AnyRecord | null> {
 		return this.getBackend().get("sessions-metadata", id);

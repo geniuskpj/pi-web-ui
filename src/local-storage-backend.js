@@ -64,17 +64,19 @@ export class LocalStorageBackend {
 		try {
 			localStorage.setItem(this._storeKey(store, key), JSON.stringify(value));
 		} catch (err) {
-			// quota: evict the largest other session item once, then retry
-			if (store === "sessions") {
-				this._evictLargestSession(key);
-				try {
-					localStorage.setItem(this._storeKey(store, key), JSON.stringify(value));
-					return;
-				} catch {
-					/* still too big — memory only */
-				}
+			// QUOTA CHOKE POINT (grok design B): evict the largest session BODY first
+			// (bodies are the only huge keys — metadata must never die), retry the
+			// ORIGINAL write once, then degrade to memory-only. Callers detect the
+			// degraded state via isPersisted() and mark the body bodyLocation:server.
+			this._evictLargestSession(key);
+			try {
+				localStorage.setItem(this._storeKey(store, key), JSON.stringify(value));
+				return;
+			} catch {
+				/* still over quota — memory only */
 			}
-			console.warn("[storage] localStorage set failed (kept in memory):", err?.name);
+			this.degraded = true;
+			console.warn("[storage] localStorage set failed after eviction (kept in memory; body should be marked bodyLocation:server):", err?.name);
 		}
 	}
 
@@ -96,6 +98,12 @@ export class LocalStorageBackend {
 			this._saveKeysList("sessions", keys);
 			console.info("[storage] evicted large local session to fit quota:", largest);
 		}
+	}
+
+	/** True when the key actually reached localStorage (not memory-only after
+	 *  a quota failure). The sessions store uses this to flip bodyLocation. */
+	isPersisted(store, key) {
+		return localStorage.getItem(this._storeKey(store, key)) !== null;
 	}
 
 	async get(store, key) {
