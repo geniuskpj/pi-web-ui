@@ -31,6 +31,7 @@ import net from "node:net";
 import dns from "node:dns";
 import os from "node:os";
 import path from "node:path";
+import zlib from "node:zlib";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
@@ -1786,15 +1787,18 @@ const agentHub = new AgentHub({
 	},
 	// pre-compact safety copy: pi keeps raw entries in its tree file; our linear
 	// mirror is REWRITTEN by compaction, so park the pre-compact file in
-	// data/tmp/precompact (7-day prune) — the nothing-erased guarantee
+	// data/tmp/precompact (GZIP-COMPRESSED, 31-day prune — user request: the raw
+	// history is the only recoverable copy of what the summary folded away, so
+	// keep it a month, not a week; a 5MB mirror gzips to ~1MB) — the
+	// nothing-erased guarantee
 	backupMirror: async (id) => {
 		const src = path.join(DATA_DIR, "sessions", id + ".jsonl");
 		if (!fs.existsSync(src)) return null;
 		const dir = path.join(DATA_DIR, "tmp", "precompact");
 		fs.mkdirSync(dir, { recursive: true });
-		for (const f of fs.readdirSync(dir)) { try { if (Date.now() - fs.statSync(path.join(dir, f)).mtimeMs > 7 * 86400_000) fs.unlinkSync(path.join(dir, f)); } catch { /* raced */ } }
-		const dst = path.join(dir, id + "-" + Date.now().toString(36) + ".jsonl");
-		fs.copyFileSync(src, dst);
+		for (const f of fs.readdirSync(dir)) { try { if (Date.now() - fs.statSync(path.join(dir, f)).mtimeMs > 31 * 86400_000) fs.unlinkSync(path.join(dir, f)); } catch { /* raced */ } }
+		const dst = path.join(dir, id + "-" + Date.now().toString(36) + ".jsonl.gz");
+		fs.writeFileSync(dst, zlib.gzipSync(fs.readFileSync(src), { level: 6 }));
 		return dst;
 	},
 	getSystemPrompt: () => effectiveSystemPrompt(),
@@ -1958,6 +1962,16 @@ function syncConn(ws) {
 						if (cur && incomingCount < curCount) {
 							safeSend(ws, { type: "put-rejected", id, reason: `stale client copy (${incomingCount} < ${curCount} messages) — server mirror kept` });
 							return; // (not break — we're inside a try inside the case block)
+						}
+						// COMPACTED-MIRROR GUARD (user report 2026-10-23): after a hub-side
+						// compact the mirror STARTS with the compaction summary, so its count
+						// is SMALLER — the count guard above would happily accept a stale
+						// PRE-compact client copy (more messages!) and resurrect the old
+						// transcript. A put onto a compacted mirror must also START with the
+						// summary; anything else is a pre-compact stale copy → reject.
+						if (cur?.firstIsSummary && Array.isArray(m.data?.messages) && m.data.messages.length > 0 && !m.data.messages[0]?.isCompactionSummary) {
+							safeSend(ws, { type: "put-rejected", id, reason: "pre-compact stale copy (mirror is compacted; your copy predates it) — resyncing from server" });
+							return;
 						}
 					} catch { /* meta probe failure → allow (fail open for new sessions) */ }
 					await storeOp("put", { id, jsonl });

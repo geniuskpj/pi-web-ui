@@ -419,6 +419,10 @@ const loadSession = async (sessionId: string): Promise<boolean> => {
 		thinkingLevel: snap.thinkingLevel || "high",
 		messages: snap.messages || [],
 	});
+	// land at the BOTTOM (latest message) — long transcripts sometimes stayed at
+	// the top when a session was clicked (user report); ChatView re-sticks a few
+	// times over the first second as markdown blocks finish laying out
+	setTimeout(() => window.dispatchEvent(new CustomEvent("pi-chat-scroll-bottom")), 60);
 	return true;
 };
 

@@ -316,14 +316,17 @@ function MessageView(props: {
 	if (message.role === "user") {
 		if ((message as any).isCompactionSummary) {
 			// compaction summary (pi CompactionEntry parity): rendered as a subdued
-			// context block, NOT as a user bubble — it is synthetic history
+			// COLLAPSIBLE context block, NOT as a user bubble — it is synthetic
+			// history covering the folded-away older turns (the recent turns below it
+			// are the verbatim tail). Collapsed by default — the giant summary text
+			// at the top of every reload was overwhelming (user report 2026-10-23).
 			const text = textOf((message as UserMessage).content).replace(/^## Conversation summary \(auto-compacted\)\n\n?/, "");
 			return (
 				<div class="pw-msg-row">
-					<div class="pw-compact-note">
-						<div class="pw-compact-head">⤓ compacted context</div>
+					<details class="pw-compact-note">
+						<summary class="pw-compact-head">⤓ compacted context — older messages summarized here · recent turns kept below (click to view)</summary>
 						<div class="pw-compact-body">{text}</div>
-					</div>
+					</details>
 				</div>
 			);
 		}
@@ -532,7 +535,7 @@ export function ChatView({ agent }: { agent: Agent }) {
 		try {
 			const r = await (agent as any).compact(20000);
 			if (!r?.ok) throw new Error(r?.reason || r?.error || "compact failed");
-			note(`compacted — ${r.summarized} messages summarized, ${r.kept} kept${r.backupPath ? " · pre-compact backup saved" : ""}`);
+			note(`compacted — ${r.summarized} messages summarized, ${r.kept} kept · summary ~${Math.round((r.summaryChars || 0) / 4).toLocaleString()} tokens${r.backupPath ? " · pre-compact backup saved" : ""}`);
 		} catch (err: any) {
 			note(err?.message || String(err));
 		} finally {
@@ -667,6 +670,21 @@ export function ChatView({ agent }: { agent: Agent }) {
 		if (el) el.scrollTop = el.scrollHeight;
 	};
 
+	// session open → land at the BOTTOM (latest message), even for very long
+	// transcripts. Heights keep changing as markdown/code blocks lay out, so
+	// stick several times over the first second (user report: long sessions
+	// "sometimes go to top" when clicked).
+	useEffect(() => {
+		const onOpen = () => {
+			forceStick();
+			requestAnimationFrame(() => forceStick());
+			setTimeout(forceStick, 250);
+			setTimeout(forceStick, 800);
+		};
+		window.addEventListener("pi-chat-scroll-bottom", onOpen);
+		return () => window.removeEventListener("pi-chat-scroll-bottom", onOpen);
+	}, []);
+
 	// 401 flow (plan §2.1): bad/missing key → surface an inline prompt once the
 	// run settles; the next turn picks the new key up via getApiKey.
 	useEffect(() => {
@@ -739,6 +757,28 @@ export function ChatView({ agent }: { agent: Agent }) {
 	};
 
 	const state = agent.state;
+	// compact progress: server truth (state.compacting) drives the banner so ALL
+	// devices see it and it survives a client-side await timeout (the server
+	// keeps compacting and the next state frame clears the banner)
+	const showCompact = compacting || !!(state as any).compacting;
+	const [compactStarted, setCompactStarted] = useState(0);
+	const [, setCompactTick] = useState(0);
+	useEffect(() => {
+		if (!showCompact) return;
+		setCompactStarted((s) => s || Date.now());
+		const t = setInterval(() => setCompactTick((x) => x + 1), 1000); // elapsed ticker
+		return () => clearInterval(t);
+	}, [showCompact]);
+	// completion note even when the client await timed out (the banner clears via
+	// the server state frame — make that transition visible)
+	const wasCompacting = useRef(false);
+	useEffect(() => {
+		if (showCompact) { wasCompacting.current = true; return; }
+		if (wasCompacting.current) {
+			wasCompacting.current = false;
+			note("compaction finished — transcript updated (older history folded into the summary at the top)");
+		}
+	}, [showCompact]);
 	const toolResults = new Map<string, ToolResultMessage>();
 	for (const m of state.messages) {
 		if (m.role === "toolResult") toolResults.set((m as ToolResultMessage).toolCallId, m as ToolResultMessage);
@@ -826,6 +866,13 @@ export function ChatView({ agent }: { agent: Agent }) {
 				}}
 			/>
 			<UsageBar agent={agent} canCompact={(agent as any).serverSide === true && !state.isStreaming && state.messages.length > 6} compacting={compacting} onCompact={compact} />
+			{showCompact && (
+				<div class="pw-compact-progress" role="status">
+					<span class="pw-compact-spinner" aria-hidden="true">⤓</span>
+					<span>Compacting context… summarizing older history into a checkpoint. The recent tail stays verbatim; this can take minutes on long sessions (the page may be left open).</span>
+					<span class="pw-compact-elapsed">{compactStarted ? `${Math.floor((Date.now() - compactStarted) / 60000)}:${String(Math.floor(((Date.now() - compactStarted) / 1000) % 60)).padStart(2, "0")} elapsed` : "starting…"}</span>
+				</div>
+			)}
 			<FilePickerDialog
 				open={picker.open}
 				initialFile={picker.initialFile}

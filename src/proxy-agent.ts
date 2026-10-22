@@ -115,6 +115,9 @@ export class ProxyAgent {
 			this.state.model = msg.model;
 			this.state.thinkingLevel = msg.thinkingLevel || "high";
 			this.state.isStreaming = !!msg.isStreaming;
+			// compaction in progress (server truth) — all devices show the banner;
+			// survives a client-side await timeout (the server keeps running)
+			this.state.compacting = !!(msg as any).compacting;
 			// mid-run attach: the hub includes the in-flight partial + pending tools
 			this.state.streamingMessage = msg.streamingMessage || undefined;
 			this.state.pendingToolCalls = new Set(msg.pendingToolCalls || []);
@@ -256,11 +259,13 @@ export class ProxyAgent {
 
 	/** COMPACT (pi /compact parity): summarize older history, keep the recent
 	 *  tail. LONG (an LLM call) — the reply lands when compaction finishes; the
-	 *  hub rejects prompts/steers with "compaction in progress" meanwhile. */
+	 *  hub rejects prompts/steers with "compaction in progress" meanwhile.
+	 *  Timeout 10 min (user-observed 3-5 min on a ~500k-token session; a client
+	 *  timeout does NOT stop the server — the state frame clears the banner). */
 	async compact(keepRecentTokens = 20000): Promise<any> {
 		const ready = await this.whenReady(8000);
 		if (!ready) throw new Error("Agent WS not connected");
-		return this.sendAwait({ type: "compact", keepRecentTokens }, 180000);
+		return this.sendAwait({ type: "compact", keepRecentTokens }, 600000);
 	}
 
 	async prompt(input: any, images?: any[]): Promise<any> {

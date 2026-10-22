@@ -239,6 +239,14 @@ class SessionSync {
 			}
 			return;
 		}
+		if (msg.type === "put-rejected") {
+			// server guard: this device pushed a stale copy (pre-compact or frozen);
+			// the server mirror was kept. Surface it — the user should know their
+			// local copy was not authoritative and the next restore resyncs.
+			console.warn("[sync] put rejected by server:", msg.reason);
+			try { window.dispatchEvent(new CustomEvent("pi-toast", { detail: `⚠ session sync rejected: ${String(msg.reason || "stale copy")}` })); } catch { /* noop */ }
+			return;
+		}
 		if (msg.type !== "sessions") return;
 
 		// runtime FULL-REPLACE from the embedded non-idle runtimes — before/independent

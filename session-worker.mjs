@@ -97,10 +97,11 @@ parentPort.on("message", async (msg) => {
 			}
 		} else if (op === "meta" && SESSION_ID_RE.test(sid)) {
 			// lightweight metadata probe (no 5MB message transfer) — the server's
-			// non-regression guard for client session pushes
+			// non-regression guards for client session pushes: messageCount (stale
+			// shrink guard) + firstIsSummary (compacted-mirror guard)
 			await loadFromDisk();
 			const entry = cache.get(sid);
-			result = entry ? { metadata: entry.metadata, messageCount: (entry.messages || []).length } : null;
+			result = entry ? { metadata: entry.metadata, messageCount: (entry.messages || []).length, firstIsSummary: !!(entry.messages || [])[0]?.isCompactionSummary } : null;
 		} else if (op === "put" && SESSION_ID_RE.test(sid) && payload.jsonl) {
 			await putOne(sid, payload.jsonl);
 			result = true;

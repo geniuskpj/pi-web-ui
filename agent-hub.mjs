@@ -483,7 +483,7 @@ export class AgentHub {
 			return { exists: false, messages: [], model, thinkingLevel: "high", isStreaming: false, streamingMessage: null, pendingToolCalls: [] };
 		}
 		const state = entry.agent.state;
-		return {
+		const payload = {
 			exists: true,
 			messages: state.messages,
 			model: state.model,
@@ -491,8 +491,10 @@ export class AgentHub {
 			isStreaming: state.isStreaming,
 			streamingMessage: state.streamingMessage ?? null,
 			pendingToolCalls: state.pendingToolCalls instanceof Set ? [...state.pendingToolCalls] : [],
+			compacting: !!entry.compacting, // all devices show the progress banner
 			pendingPrompt: entry.pendingPrompt ?? null,
 		};
+		return payload;
 	}
 
 	/** Full-state frame to all attached clients: fork/rewrite mutate the transcript
@@ -542,8 +544,18 @@ export class AgentHub {
 		const entry = this.sessions.get(sessionId);
 		const state = entry.agent.state;
 		const now = new Date().toISOString();
-		const firstUser = state.messages.find((m) => m.role === "user");
-		const title = firstUser ? extractPreviewText(firstUser.content) || "Session" : (entry.forkedFrom ? "Fork" : "Session");
+		const firstUser = state.messages.find((m) => m.role === "user" && !m.isCompactionSummary);
+		let title = firstUser ? extractPreviewText(firstUser.content) || "Session" : (entry.forkedFrom ? "Fork" : "Session");
+		// STICKY TITLE (user report 2026-10-23): compaction makes the summary the
+		// first user message — the old re-derive-every-persist logic renamed the
+		// session to "## Conversation summary (auto-compacted)". Once a real title
+		// exists it never changes; only fresh entries (no title yet) derive one,
+		// and they skip isCompactionSummary messages when doing so.
+		// HEAL: a title that IS a summary heading is a pre-sticky artifact — treat
+		// it as no title so the next persist re-derives a real one (fixes sessions
+		// already renamed by the old logic, e.g. 656aacb0).
+		const titleIsBad = !entry.title || entry.title === "Session" || entry.title === "Fork" || /^## Conversation summary \(auto-compacted\)/.test(entry.title);
+		if (!titleIsBad) title = entry.title;
 		const metadata = {
 			id: sessionId,
 			version: 1, // mirror format: linear messages (pi's tree format is v3 — see docs/session-format.md)
@@ -647,6 +659,8 @@ export class AgentHub {
 		const from = prevIdx >= 0 ? prevIdx + 1 : 0;
 		if (cut - from < 2) throw new Error("nothing substantial to compact");
 		entry.compacting = true;
+		this.broadcastState(sessionId); // all devices show the progress banner immediately
+		let ok = false;
 		try {
 			const serialized = serializeConversation(msgs.slice(from, cut));
 			const prevText = (m) => (typeof m.content === "string" ? m.content : (m.content || []).filter((b) => b?.type === "text").map((b) => b.text || "").join("\n"));
@@ -663,8 +677,12 @@ export class AgentHub {
 			this.emitRuntime(sessionId); this.emitSteering(sessionId);
 			await this.persistSession(sessionId, true);
 			this.broadcastState(sessionId);
+			ok = true;
 			return { ok: true, summarized: cut - from, kept: msgs.length - cut, summaryChars: String(summary).trim().length, backupPath };
-		} finally { entry.compacting = false; }
+		} finally {
+			entry.compacting = false;
+			if (!ok) this.broadcastState(sessionId); // failure: clear the banner everywhere
+		}
 	}
 
 	/** Runtime for an existing entry — idle included, seq-stamped (the client's
