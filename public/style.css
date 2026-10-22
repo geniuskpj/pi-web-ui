@@ -1744,13 +1744,25 @@ html.dark .pw-term-host.wterm {
 @keyframes pw-compact-flash { 0%, 100% { background: rgba(96, 165, 250, 0.06); } 50% { background: rgba(96, 165, 250, 0.30); } }
 .pw-compact-fresh { animation: pw-compact-flash 1s ease-in-out 3; border-color: #60a5fa; }
 
-/* 🕘 versions picker: delta records saved by ✎ edits; restore swaps the tail */
-.pw-versions-bar { display: flex; flex-direction: column; align-items: flex-end; padding: 2px 8px; }
+/* 🕘 versions picker (sonnet-5 layout review): lives IN the stats bar, right
+   cluster next to ⤓ compact; the panel FLOATS UPWARD over the transcript
+   (the bottom edge of the transcript is the least-recently-read area) */
+.pw-stats-inner { position: relative; }
+.pw-versions-anchor { position: relative; display: inline-flex; }
 .pw-versions-panel {
-	width: 100%; max-height: 220px; overflow-y: auto;
-	border: 1px solid rgba(128, 128, 128, 0.3); border-radius: 8px;
-	background: var(--secondary, #1a1a1e); padding: 4px;
+	position: absolute;
+	bottom: calc(100% + 6px);
+	right: 0;
+	width: min(480px, 90vw);
+	max-height: 320px; overflow-y: auto;
+	background: var(--card, #fafafa);
+	border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+	border-radius: 8px;
+	box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+	padding: 4px;
 	font-size: 12px;
+	z-index: 20;
+	text-align: left;
 }
 .pw-versions-row { display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 6px; }
 .pw-versions-row:hover { background: rgba(128, 128, 128, 0.12); }
@@ -1762,25 +1774,34 @@ html.dark .pw-term-host.wterm {
 .pw-versions-restore:hover { background: rgba(96, 165, 250, 0.14); }
 .pw-versions-empty { padding: 6px 8px; opacity: 0.6; }
 
-/* inline edit (llama.cpp-webui parity): the bubble becomes a textarea until
-   Resubmit — nothing is sent, no version is made, until a DIFFERENT text is
-   saved. Accent border (no glow — arena review: glow competes with the
-   composer focus ring); subtle accent tint via color-mix. */
-.pw-msg-editing { max-width: 75%; padding: 10px 12px; border: 1px solid rgba(96, 165, 250, 0.6); background: color-mix(in oklch, var(--secondary, #f4f4f5) 92%, #60a5fa); }
+/* inline edit (llama.cpp-webui parity, sonnet-5 layout review): the editing
+   state is an ACTION, not a display bubble — break out of the 75% right-aligned
+   bubble into a FULL-WIDTH editor card, the composer's sibling (same card bg,
+   squarer corners, taller ceiling than the composer since edits paste code) */
+.pw-editing-row { width: 100%; }
+.pw-edit-card {
+	width: 100%; max-width: 100%;
+	background: var(--card, #fafafa);
+	border: 1px solid rgba(96, 165, 250, 0.4);
+	border-radius: 10px;
+	padding: 10px 12px 8px;
+}
 .pw-edit-ta {
-	width: 100%; min-height: 60px; max-height: 320px;
+	width: 100%; min-height: 80px; max-height: 400px; resize: vertical;
 	background: transparent; color: inherit; border: none; outline: none;
-	font: inherit; line-height: 1.6; word-break: break-word;
-	overflow: auto; /* autogrow via JS (arena review) — no resize handle */
+	font: inherit; line-height: 1.5; word-break: break-word;
+	overflow: auto;
 }
-.pw-edit-actions { display: flex; gap: 6px; justify-content: flex-end; margin-top: 6px; }
-.pw-edit-save, .pw-edit-cancel {
-	background: transparent; border-radius: 8px; cursor: pointer; font-size: 12px; padding: 4px 10px;
+.pw-edit-actions {
+	display: flex; gap: 8px; justify-content: flex-end;
+	margin-top: 8px; padding-top: 8px;
+	border-top: 1px solid rgba(128, 128, 128, 0.2);
 }
-.pw-edit-save { border: 1px solid rgba(96, 165, 250, 0.6); color: #93c5fd; }
-.pw-edit-save:hover { background: rgba(96, 165, 250, 0.16); }
-.pw-edit-cancel { border: 1px solid rgba(128, 128, 128, 0.4); color: inherit; opacity: 0.8; }
-.pw-edit-cancel:hover { background: rgba(128, 128, 128, 0.14); }
+.pw-edit-save, .pw-edit-cancel { border-radius: 6px; cursor: pointer; font-size: 13px; padding: 5px 12px; }
+.pw-edit-save { background: var(--accent, #60a5fa); color: #0a0a0a; border: 1px solid transparent; }
+.pw-edit-save:hover { filter: brightness(1.1); }
+.pw-edit-cancel { background: transparent; border: none; color: var(--muted-foreground, #888); }
+.pw-edit-cancel:hover { background: rgba(128, 128, 128, 0.14); color: inherit; }
 /* while editing: everything after the edited message dims (arena review —
    visible-but-dimmed beats hiding: context stays referenceable) */
 .pw-will-replace { opacity: 0.38; pointer-events: none; transition: opacity 150ms ease; }

@@ -141,21 +141,23 @@ function UserBubble({ message, onOpenFile, index, canMutate, onEditMessage, edit
 	return (
 		<div class={"pw-msg-row pw-user-row" + (dimmed ? " pw-will-replace" : "")}>
 			{editing ? (
-				<div class="pw-msg pw-user pw-msg-editing">
-					<textarea
-						ref={taRef}
-						class="pw-edit-ta"
-						value={draft}
-						aria-label="Edit message"
-						onInput={(e: any) => { setDraft(e.currentTarget.value); autoGrow(e.currentTarget); }}
-						onKeyDown={(e: any) => {
-							if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); onSaveEdit?.(index!, draft); }
-							else if (e.key === "Escape") { e.preventDefault(); cancel(); }
-						}}
-					/>
-					<div class="pw-edit-actions">
-						<button type="button" class="pw-edit-save" title="Resubmit (Ctrl+Enter) — the old turn (prompt + responses) is saved as a restorable version (🕘), then the edited message re-prompts" onClick={() => onSaveEdit?.(index!, draft)}>Resubmit</button>
-						<button type="button" class="pw-edit-cancel" onClick={cancel}>cancel</button>
+				<div class="pw-editing-row">
+					<div class="pw-edit-card">
+						<textarea
+							ref={taRef}
+							class="pw-edit-ta"
+							value={draft}
+							aria-label="Edit message"
+							onInput={(e: any) => { setDraft(e.currentTarget.value); autoGrow(e.currentTarget); }}
+							onKeyDown={(e: any) => {
+								if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); onSaveEdit?.(index!, draft); }
+								else if (e.key === "Escape") { e.preventDefault(); cancel(); }
+							}}
+						/>
+						<div class="pw-edit-actions">
+							<button type="button" class="pw-edit-cancel" onClick={cancel}>cancel</button>
+							<button type="button" class="pw-edit-save" title="Resubmit (Ctrl+Enter) — the old turn (prompt + responses) is saved as a restorable version (🕘), then the edited message re-prompts" onClick={() => onSaveEdit?.(index!, draft)}>Resubmit</button>
+						</div>
 					</div>
 				</div>
 			) : (
@@ -495,7 +497,7 @@ function contextUsage(messages: any[], model: any): { pct: number; used: number;
 	return null;
 }
 
-function UsageBar({ agent, canCompact, compacting, onCompact }: { agent: Agent; canCompact?: boolean; compacting?: boolean; onCompact?: () => void }) {
+function UsageBar({ agent, canCompact, compacting, onCompact, canVersions, versionsOpen, versionsList, onToggleVersions, onSwitchVersion }: { agent: Agent; canCompact?: boolean; compacting?: boolean; onCompact?: () => void; canVersions?: boolean; versionsOpen?: boolean; versionsList?: any[] | null; onToggleVersions?: () => void; onSwitchVersion?: (vid: number) => void }) {
 	const state = agent.state;
 	const info = contextUsage(state.messages, state.model);
 	// session totals (parity with the old renderStats footer)
@@ -528,6 +530,25 @@ function UsageBar({ agent, canCompact, compacting, onCompact }: { agent: Agent; 
 				<span class="pw-totals">
 					{hasTotals ? `↑${formatTokenCount(tIn)} ↓${formatTokenCount(tOut)}${tCost >= 0.00005 ? ` · ${tCost.toFixed(4)}` : ""}` : ""}
 				</span>
+				{canVersions && onToggleVersions && (
+					<div class="pw-versions-anchor">
+						<button type="button" class="pw-compact-btn" aria-label="Message versions" title="Versions — every inline edit saves the removed turn here; switching is lossless (the current tail is saved first)" onClick={onToggleVersions}>
+							🕘 versions{versionsList && versionsList.length > 0 ? ` (${versionsList.length})` : ""}
+						</button>
+						{versionsOpen && (
+							<div class="pw-versions-panel">
+								{versionsList == null ? <div class="pw-versions-empty">loading…</div>
+								: versionsList.length === 0 ? <div class="pw-versions-empty">no saved versions yet — ✎ edit a message to create one</div>
+								: [...versionsList].reverse().map((v: any) => (
+									<div class="pw-versions-row" key={v.vid}>
+										<span class="pw-versions-meta">#{v.vid} · turn {v.turn} · {v.count} msg{v.count === 1 ? "" : "s"} · {new Date(v.at).toLocaleTimeString()} · {v.reason}{v.preview ? <span class="pw-versions-preview"> — “{v.preview}”</span> : null}</span>
+										<button type="button" class="pw-versions-restore" title="Current conversation will be saved as a version before switching (lossless)" onClick={() => onSwitchVersion?.(v.vid)}>switch to</button>
+									</div>
+								))}
+							</div>
+						)}
+					</div>
+				)}
 				{canCompact && onCompact && (
 					<button type="button" class="pw-compact-btn" disabled={compacting} title="Compact — summarize older history, keep the recent tail (pi /compact parity)" onClick={onCompact}>
 						{compacting ? "compacting…" : "⤓ compact"}
@@ -816,6 +837,24 @@ export function ChatView({ agent }: { agent: Agent }) {
 	const [compactDone, setCompactDone] = useState(false);
 	const [versionsOpen, setVersionsOpen] = useState(false);
 	const [versionsList, setVersionsList] = useState<any[] | null>(null);
+	// picker lives in the stats bar (arena sonnet-5 review): refetch every open —
+	// never stale across sessions; switch delegates to the hub (lossless)
+	const toggleVersions = async () => {
+		const next = !versionsOpen;
+		setVersionsOpen(next);
+		if (next) {
+			setVersionsList(null);
+			try { const r = await (agent as any).versions(); setVersionsList(r?.versions || []); } catch (err: any) { note(err?.message || String(err)); }
+		}
+	};
+	const switchVersion = async (vid: number) => {
+		try {
+			const r = await (agent as any).restoreVersion(vid);
+			if (!r?.ok) throw new Error(r?.reason || r?.error || "switch failed");
+			note(`🕘 switched to version #${vid} — the replaced tail was saved as a new version (nothing lost)`);
+			setVersionsOpen(false);
+		} catch (err: any) { note(err?.message || String(err)); }
+	};
 	const compactSid = useRef<string | null>(null);
 	const compactSettled = useRef(false); // compact() reply path already handled it
 	useEffect(() => {
@@ -945,39 +984,10 @@ export function ChatView({ agent }: { agent: Agent }) {
 					setImages(imgs);
 				}}
 			/>
-			<UsageBar agent={agent} canCompact={(agent as any).serverSide === true && !state.isStreaming && state.messages.length > 6} compacting={compacting} onCompact={compact} />
-			{(agent as any).serverSide === true && (
-				<div class="pw-versions-bar">
-					<button type="button" class="pw-compact-btn" aria-label="Message versions" title="Versions — every inline edit saves the removed turn here; switching is lossless (the current tail is saved first)" onClick={async () => {
-						const next = !versionsOpen;
-						setVersionsOpen(next);
-						if (next) {
-							setVersionsList(null); // refetch every open — never stale across sessions
-							try { const r = await (agent as any).versions(); setVersionsList(r?.versions || []); } catch (err: any) { note(err?.message || String(err)); }
-						}
-					}}>🕘 versions{versionsList && versionsList.length > 0 ? ` (${versionsList.length})` : ""}</button>
-					{versionsOpen && (
-						<div class="pw-versions-panel">
-							{versionsList === null ? <div class="pw-versions-empty">loading…</div>
-							: versionsList.length === 0 ? <div class="pw-versions-empty">no saved versions yet — ✎ edit a message to create one</div>
-							: [...versionsList].reverse().map((v: any) => (
-								<div class="pw-versions-row" key={v.vid}>
-								 <span class="pw-versions-meta">#{v.vid} · turn {v.turn} · {v.count} msg{v.count === 1 ? "" : "s"} · {new Date(v.at).toLocaleTimeString()} · {v.reason}{v.preview ? <span class="pw-versions-preview"> — “{v.preview}”</span> : null}</span>
-								 <button type="button" class="pw-versions-restore" title="Current conversation will be saved as a version before switching (lossless)" onClick={async () => {
-								  try {
-								   const r = await (agent as any).restoreVersion(v.vid);
-								   if (!r?.ok) throw new Error(r?.reason || r?.error || "switch failed");
-								   note(`🕘 switched to version #${v.vid} — the replaced tail was saved as a new version (nothing lost)`);
-								   setVersionsOpen(false);
-								  } catch (err: any) { note(err?.message || String(err)); }
-								 }}>switch to</button>
-								</div>
-							))}
-						</div>
-					)}
-				</div>
-			)}
-				{compactDone ? (
+			<UsageBar agent={agent} canCompact={(agent as any).serverSide === true && !state.isStreaming && state.messages.length > 6} compacting={compacting} onCompact={compact}
+			 canVersions={(agent as any).serverSide === true} versionsOpen={versionsOpen} versionsList={versionsList}
+			 onToggleVersions={toggleVersions} onSwitchVersion={switchVersion} />
+			{compactDone ? (
 				<div class="pw-compact-progress pw-compact-done" role="status">
 					<span aria-hidden="true">✓</span>
 					<span>Context compacted — the compacted-context summary at the top was just updated.</span>
