@@ -518,10 +518,10 @@ export function ChatView({ agent }: { agent: Agent }) {
 		try {
 			if (i === msgs.length - 1) {
 				const r = await (agent as any).rewrite(i); // drop this user msg + anything after (nothing after by definition)
-				if (r?.ok === false) throw new Error(r?.reason || "rewrite failed");
+				if (!r?.ok) throw new Error(r?.reason || r?.error || "rewrite failed");
 			} else {
 				const r = await (agent as any).fork(i); // copy prefix EXCLUDING this message — the original keeps everything
-				if (r?.ok === false || !r?.newSessionId) throw new Error(r?.reason || "fork failed");
+				if (!r?.ok || !r?.newSessionId) throw new Error(r?.reason || r?.error || "fork failed");
 				window.dispatchEvent(new CustomEvent("pi-open-session", { detail: r.newSessionId }));
 			}
 			steerSeq.current += 1;
@@ -534,7 +534,7 @@ export function ChatView({ agent }: { agent: Agent }) {
 		if ((agent as any).serverSide !== true) return;
 		try {
 			const r = await (agent as any).fork(i + 1); // include this message
-			if (r?.ok === false || !r?.newSessionId) throw new Error(r?.reason || "fork failed");
+			if (!r?.ok || !r?.newSessionId) throw new Error(r?.reason || r?.error || "fork failed");
 			window.dispatchEvent(new CustomEvent("pi-open-session", { detail: r.newSessionId }));
 			note("forked — original session untouched");
 		} catch (err: any) {

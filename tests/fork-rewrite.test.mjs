@@ -60,17 +60,42 @@ if (forked?.newSessionId) {
 	// usage-counter invariant the client UsageBar relies on:
 	const totals = entry.agent.state.messages.reduce((a, m) => ({ in: a.in + (m.usage?.input || 0), out: a.out + (m.usage?.output || 0) }), { in: 0, out: 0 });
 	check("forked UsageBar input would total 100 (inherited only)", totals.in === 100 && totals.out === 10, JSON.stringify(totals));
-	// toolResult identity travels (provider-valid transcript)
-	check("toolResult/toolCallId identity preserved in copies", entry.agent.state.messages.every((m) => m.role !== "toolResult" || m.toolCallId));
+	// toolResult identity travels (provider-valid transcript) — FULL-depth fork
+	const full = await hub.forkSession(SESSION, 6);
+	const fullEntry = hub.sessions.get(full.newSessionId);
+	check("toolResult/toolCallId identity preserved in full-depth fork", fullEntry.agent.state.messages.some((m) => m.role === "toolResult" && m.toolCallId === "call-9"), JSON.stringify(fullEntry.agent.state.messages.map((m) => m.role)));
+	// deep copy: usage objects are NOT aliased between source and fork
+	fullEntry.agent.state.messages[1].usage = { ...fullEntry.agent.state.messages[1].usage, input: 999 };
+	check("deep copy — fork usage mutation does not alias the source", hub.sessions.get(SESSION).agent.state.messages[1].usage.input === 100);
 }
 
-// --- 2) guards ------------------------------------------------------------------
-try { await hub.forkSession(SESSION, 0); check("fork(0) rejected", false); } catch (e) { check("fork(0) rejected", /at least one/.test(e.message)); }
+// --- 2) guards + empty fork + epoch ------------------------------------------------
+{
+	const ef = await hub.forkSession(SESSION, 0); // ✎ on the FIRST message: empty branch off the root
+	check("fork(0) allowed = empty branch", ef?.ok === true && ef.copied === 0, JSON.stringify(ef));
+	const efLine = captured.find((c) => c.id === ef.newSessionId);
+	check("empty fork persists a header-only mirror", efLine && (() => { const l = efLine.jsonl.trim().split("\n"); return l.length === 1 && JSON.parse(l[0]).forkedFrom === SESSION && JSON.parse(l[0]).messageCount === 0; })(), efLine && efLine.jsonl);
+}
+{
+	// epoch guard: a prompt queued behind a busy promptLock when a rewrite lands
+	// must be DROPPED (never appended to the truncated transcript, never run)
+	const entry = hub.sessions.get(SESSION);
+	const origBroadcast = hub.broadcast;
+	hub.broadcast = (id, msg) => {}; // silence broadcasts for this segment
+	entry.promptLock = new Promise((r) => setTimeout(r, 250)); // artificial busy lock
+	const p = hub.prompt(SESSION, "stale queued prompt");
+	const r = await hub.rewriteSession(SESSION, 1); // bumps mutateEpoch while the waiter sits
+	const reply = await p.catch((e) => ({ accepted: false, reason: e.message }));
+	check("prompt queued before rewrite is dropped", reply?.accepted === false && /rewritten/.test(reply?.reason || ""), JSON.stringify(reply));
+	check("epoch advanced by rewrite", (entry.mutateEpoch || 0) >= 1);
+	hub.broadcast = origBroadcast; // restore for the rewrite-section assertions
+	entry.agent.state.messages = JSON.parse(JSON.stringify(baseMessages)); // undo the epoch segment's truncate(1) so the rewrite section sees the full transcript
+}
 {
 	const e2 = hub.sessions.get(SESSION);
 	e2.agent.state.isStreaming = true; // simulate a live run
 	try { await hub.forkSession(SESSION, 3); check("fork while streaming rejected", false); } catch (e) { check("fork while streaming rejected", /streaming/.test(e.message)); }
-	try { hub.rewriteSession(SESSION, 2); check("rewrite while streaming rejected", false); } catch (e) { check("rewrite while streaming rejected", /streaming/.test(e.message)); }
+	try { await hub.rewriteSession(SESSION, 2); check("rewrite while streaming rejected", false); } catch (e) { check("rewrite while streaming rejected", /streaming/.test(e.message)); }
 	e2.agent.state.isStreaming = false;
 }
 
@@ -83,13 +108,13 @@ try { await hub.forkSession(SESSION, 0); check("fork(0) rejected", false); } cat
 	entry.pendingPrompt = { text: "stale steer", images: [], queuedAt: 1 };
 	entry.pendingPromptMessage = { role: "user", content: "stale steer" };
 	entry.followUpCount = 1;
-	const r = hub.rewriteSession(SESSION, 2);
+	const r = await hub.rewriteSession(SESSION, 2);
 	check("rewrite returns {ok, kept:2}", r?.ok === true && r.kept === 2, JSON.stringify(r));
 	const msgs = hub.sessions.get(SESSION).agent.state.messages;
 	check("session truncated to 2 messages", msgs.length === 2);
 	check("usage totals DROP with removed messages (in 100 only)", msgs.reduce((a, m) => a + (m.usage?.input || 0), 0) === 100);
 	check("queued steering dropped by rewrite", !entry.pendingPrompt && entry.followUpCount === 0);
-	const stateFrame = frames.find((f) => f.type === "state");
+	const stateFrame = frames.filter((f) => f.type === "state").pop(); // LAST state frame = this rewrite's resync
 	check("full state frame broadcast for multi-device resync", !!stateFrame && Array.isArray(stateFrame.messages) && stateFrame.messages.length === 2, JSON.stringify(frames.map((f) => f.type)));
 	const line = captured.filter((c) => c.id === SESSION).pop();
 	check("rewrite persisted immediately (messageCount 2)", line && JSON.parse(line.jsonl.split("\n")[0]).messageCount === 2);

@@ -170,6 +170,7 @@ export class AgentHub {
 				persistMaxTimer: null,
 				userPersisted: false,
 				followUpCount: 0,
+				mutateEpoch: 0, // bumped by rewriteSession — invalidates prompts queued pre-truncate
 				pendingPrompt: null, // steering UI payload {text, images, queuedAt} while held
 				pendingPromptMessage: null, // the exact AgentMessage — consumed on message_end
 			};
@@ -283,10 +284,9 @@ export class AgentHub {
 		clearTimeout(entry.persistTimer);
 		clearTimeout(entry.persistMaxTimer);
 		if (immediate) {
-			this._writeSession(sessionId);
-			return;
+			return this._writeSession(sessionId);
 		}
-		entry.persistTimer = setTimeout(() => this._writeSession(sessionId), 400);
+		entry.persistTimer = setTimeout(() => this._writeSession(sessionId), 400); // debounced: fire-and-forget
 		// maxWait: a burst of message_end events can't push the flush out forever
 		entry.persistMaxTimer = setTimeout(() => this._writeSession(sessionId), 2000);
 	}
@@ -300,17 +300,7 @@ export class AgentHub {
 		const now = new Date().toISOString();
 		const firstUser = state.messages.find((m) => m.role === "user");
 		const title = firstUser ? extractPreviewText(firstUser.content) || "Session" : "Session";
-		const metadata = {
-			id: sessionId,
-			version: 1, // mirror format: linear messages (pi's tree format is v3 — see docs/session-format.md)
-			title,
-			modelId: state.model?.id ?? "",
-			thinkingLevel: state.thinkingLevel,
-			createdAt: entry.createdAt || now,
-			lastModified: now,
-			messageCount: state.messages.length,
-		};
-		if (entry.forkedFrom) metadata.forkedFrom = entry.forkedFrom; // lineage (pi header: parentSession)
+				const metadata = this._buildMetadata(sessionId);
 		if (!entry.createdAt) entry.createdAt = now;
 		const lines = [JSON.stringify(metadata)];
 		// FULL message objects (2026-10-22): the old {role, content, timestamp}
@@ -377,8 +367,10 @@ export class AgentHub {
 		// would both pass the isStreaming check and race agent.prompt (which
 		// throws on concurrent prompts). Serialized; the in-lock steer path
 		// handles a run that started while this call waited.
+		const epochAtCall = entry.mutateEpoch || 0;
 		const prev = entry.promptLock || Promise.resolve();
 		const run = async () => {
+			if ((entry.mutateEpoch || 0) !== epochAtCall) return { accepted: false, queued: false, reason: "session was rewritten while this prompt was queued — dropped" };
 			if (entry.agent.state.isStreaming) {
 				return this._steer(entry, sessionId, content, images);
 			}
@@ -470,48 +462,83 @@ export class AgentHub {
 	/** Full-state frame to all attached clients: fork/rewrite mutate the transcript
 	 *  OUTSIDE the normal event stream, so clients must resynchronize wholesale
 	 *  (the client's "state" handler replaces state.messages verbatim). Buffered
-	 *  during attach snapshot builds like agent events. */
+	 *  during attach snapshot builds like agent events. Bumps the shared seq —
+	 *  every emission advances the one monotonic space (commit review). */
 	broadcastState(sessionId) {
 		const entry = this.sessions.get(sessionId);
 		if (!entry) return;
+		entry.seq += 1;
 		const payload = { type: "state", sessionId, ...this.getState(sessionId) };
 		if (entry.buffer) entry.buffer.push(payload);
 		else this.broadcast(sessionId, payload);
 	}
 
-	/** FORK (llama.cpp webui parity — forkConversation): clone messages[0..keepCount)
-	 *  into a NEW session and persist it immediately; the original is untouched.
-	 *  Usage fields travel with the copied messages (full-fidelity mirrors since
-		*  2026-10-22), so the fork's UsageBar totals show the INHERITED spend —
-	 *  correct: those tokens were spent. Cold sessions hydrate from the store
-	 *  first, so forking works right after a restart. */
-	async forkSession(sessionId, keepCount) {
+	/** Shared hydration for fork/rewrite: returns the live entry, hydrating from
+	 *  the store when the hub has no entry (restart) or an EMPTY one (attach
+	 *  created the Agent before the snapshot applied — getSession ignores init
+	 *  messages for existing entries, so fill it in place here, normalized). */
+	async _ensureEntry(sessionId) {
 		let entry = this.sessions.get(sessionId);
-		// self-hydrate: after a hub restart the entry may not exist yet (attach is
-		// what normally loads the store) — pull the mirror directly so fork works
-		// on any persisted session
-		if ((!entry || entry.agent.state.messages.length === 0) && this.loadMessages) {
+		if (entry && entry.agent.state.messages.length > 0) return entry;
+		if (this.loadMessages) {
 			try {
 				const stored = await this.loadMessages(sessionId);
 				if (stored?.messages?.length) {
-					entry = this.getSession(sessionId, {
-						modelId: stored.metadata?.modelId,
-						thinkingLevel: stored.metadata?.thinkingLevel,
-						messages: stored.messages,
-					});
+					if (!entry) {
+						entry = this.getSession(sessionId, {
+							modelId: stored.metadata?.modelId,
+							thinkingLevel: stored.metadata?.thinkingLevel,
+							messages: stored.messages,
+						});
+					} else {
+						entry.agent.state.messages = normalizeRestoredMessages(stored.messages);
+						if (stored.metadata?.modelId) { const m = this._getModel(stored.metadata.modelId); if (m) entry.agent.state.model = m; }
+						if (stored.metadata?.thinkingLevel) entry.agent.state.thinkingLevel = stored.metadata.thinkingLevel;
+					}
 				}
-			} catch { /* store miss → fall through to the entry (or the n<1 guard) */ }
+			} catch { /* store miss → the caller's guards handle it */ }
 		}
+		return entry;
+	}
+
+	/** Mirror metadata builder (shared by _writeSession and empty forks). */
+	_buildMetadata(sessionId) {
+		const entry = this.sessions.get(sessionId);
+		const state = entry.agent.state;
+		const now = new Date().toISOString();
+		const firstUser = state.messages.find((m) => m.role === "user");
+		const title = firstUser ? extractPreviewText(firstUser.content) || "Session" : (entry.forkedFrom ? "Fork" : "Session");
+		const metadata = {
+			id: sessionId,
+			version: 1, // mirror format: linear messages (pi's tree format is v3 — see docs/session-format.md)
+			title,
+			modelId: state.model?.id ?? "",
+			thinkingLevel: state.thinkingLevel,
+			createdAt: entry.createdAt || now,
+			lastModified: now,
+			messageCount: state.messages.length,
+		};
+		if (entry.forkedFrom) metadata.forkedFrom = entry.forkedFrom; // lineage (pi header: parentSession)
+		if (!entry.createdAt) entry.createdAt = now;
+		return metadata;
+	}
+
+	/** FORK (llama.cpp webui parity — forkConversation): clone messages[0..keepCount)
+	 *  into a NEW session and persist it (awaited — the store is authoritative
+	 *  before the reply reaches the navigating client); the original is untouched.
+	 *  Usage fields travel with the copied messages (FULL JSON deep copy — a
+	 *  shallow {...m} would alias usage/cost between source and fork), so the
+	 *  fork's UsageBar totals show the INHERITED spend — correct: those tokens
+	 *  were spent. keepCount 0 is allowed (empty branch off the root prompt —
+	 *  the ✎-on-first-message flow); it persists a header-only mirror because
+	 *  _writeSession skips user-less sessions. */
+	async forkSession(sessionId, keepCount) {
+		const entry = await this._ensureEntry(sessionId);
 		if (!entry) throw new Error("no live session");
 		if (entry.agent.state.isStreaming) throw new Error("cannot fork while a run is streaming — stop it first");
 		const msgs = entry.agent.state.messages;
 		const n = Math.max(0, Math.min(Math.floor(Number(keepCount)) || 0, msgs.length));
-		if (n < 1) throw new Error("fork needs at least one message to copy");
-		const messages = msgs.slice(0, n).map((m) => {
-			const copy = { ...m };
-			if (Array.isArray(copy.content)) copy.content = JSON.parse(JSON.stringify(copy.content)); // detach block refs
-			return copy;
-		});
+		const messages = n > 0 ? JSON.parse(JSON.stringify(msgs.slice(0, n))) : [];
 		const newId = crypto.randomUUID();
 		const forked = this.getSession(newId, {
 			modelId: entry.agent.state.model?.id,
@@ -519,7 +546,8 @@ export class AgentHub {
 			messages,
 		});
 		forked.forkedFrom = sessionId; // lineage in the JSONL header (pi's parentSession)
-		this.persistSession(newId, true); // immediate — the client navigates right away
+		if (n === 0) await this.persist(newId, JSON.stringify(this._buildMetadata(newId)) + "\n");
+		else await this.persistSession(newId, true);
 		return { ok: true, newSessionId: newId, copied: n };
 	}
 
@@ -527,23 +555,26 @@ export class AgentHub {
 	 *  messages[0..keepCount) IN PLACE — the caller re-prompts with the edited
 	 *  text. Idle only (Stop first). The client's UsageBar is message-derived, so
 	 *  token totals and the context estimate shrink automatically; a forced
-	 *  persist refreshes the session list's messageCount. Queued steering is
+	 *  await-ed persist refreshes the mirror + session list. Queued steering is
 	 *  dropped (a truncation invalidates it) and other devices resynchronize via
-	 *  broadcastState. */
-	rewriteSession(sessionId, keepCount) {
-		const entry = this.sessions.get(sessionId);
+	 *  broadcastState. mutateEpoch invalidates prompts queued behind the
+	 *  promptLock before the rewrite (commit review: the lock waiter captured its
+	 *  text pre-truncate and would append stale turns). */
+	async rewriteSession(sessionId, keepCount) {
+		const entry = await this._ensureEntry(sessionId);
 		if (!entry) throw new Error("no live session");
 		if (entry.agent.state.isStreaming) throw new Error("cannot rewrite while a run is streaming — stop it first");
 		const msgs = entry.agent.state.messages;
 		const n = Math.max(0, Math.min(Math.floor(Number(keepCount)) || 0, msgs.length));
 		entry.agent.state.messages = msgs.slice(0, n);
+		entry.mutateEpoch = (entry.mutateEpoch || 0) + 1;
 		entry.pendingPrompt = null;
 		entry.pendingPromptMessage = null;
 		entry.followUpCount = 0;
 		entry.runtime.pendingPrompts = 0;
 		this.emitRuntime(sessionId);
 		this.emitSteering(sessionId);
-		this.persistSession(sessionId, true);
+		await this.persistSession(sessionId, true);
 		this.broadcastState(sessionId);
 		return { ok: true, kept: n };
 	}
