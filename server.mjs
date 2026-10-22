@@ -1801,6 +1801,13 @@ const agentHub = new AgentHub({
 		fs.writeFileSync(dst, zlib.gzipSync(fs.readFileSync(src), { level: 6 }));
 		return dst;
 	},
+	// VERSIONS sidecar ops (user design): delta records keyed by vid/turn —
+	// every ✎ edit parks the removed tail; restore swaps it back
+	versions: {
+		append: async (id, record) => await storeOp("versions-append", { id, record }),
+		list: async (id) => await storeOp("versions-list", { id }),
+		get: async (id, vid) => await storeOp("versions-get", { id, vid }),
+	},
 	getSystemPrompt: () => effectiveSystemPrompt(),
 	defaultModelId: piDefaultModelId(),
 	onRuntimeChange: (sessionId, rt) => sendRuntime(sessionId, rt), // runtime deltas → tiny frame to ALL devices, bypasses all caches/throttles (fable5)
@@ -2067,12 +2074,32 @@ function agentConn(ws) {
 					break;
 				}
 				case "rewrite": {
-					// linear-model message edit: truncate the transcript to the prefix;
-					// all attached devices resynchronize via the hub's broadcastState
+					// linear-model message edit: park the removed tail as a VERSION delta,
+					// then truncate the transcript to the prefix; all attached devices
+					// resynchronize via the hub's broadcastState
 					if (!currentSession) { safeSend(ws, { type: "error", id: m.id, error: "attach first" }); break; }
 					try {
 						const r = agentHub.rewriteSession(currentSession, Number(m.keepCount));
 						safeSend(ws, { type: "rewritten", id: m.id, ...r });
+					} catch (err) { safeSend(ws, { type: "error", id: m.id, error: err.message }); }
+					break;
+				}
+				case "versions": {
+					// meta list of this session's saved deltas (no bodies)
+					if (!currentSession) { safeSend(ws, { type: "error", id: m.id, error: "attach first" }); break; }
+					try {
+						const versions = await agentHub.listVersions(currentSession);
+						safeSend(ws, { type: "versions-list", id: m.id, versions });
+					} catch (err) { safeSend(ws, { type: "error", id: m.id, error: err.message }); }
+					break;
+				}
+				case "restore-version": {
+					// swap a saved tail back into the active transcript (hub-side, so the
+					// put guards don't apply); the replaced tail is captured first
+					if (!currentSession) { safeSend(ws, { type: "error", id: m.id, error: "attach first" }); break; }
+					try {
+						const r = await agentHub.restoreVersion(currentSession, Number(m.vid));
+						safeSend(ws, { type: "version-restored", id: m.id, ...r });
 					} catch (err) { safeSend(ws, { type: "error", id: m.id, error: err.message }); }
 					break;
 				}

@@ -102,19 +102,18 @@ function formatUsage(u: AssistantMessage["usage"]): string {
 // ----------------------------------------------------------------------------
 // message components
 // ----------------------------------------------------------------------------
-function UserBubble({ message, onOpenFile, index, canMutate, onEditMessage, onForkMessage }: { message: UserMessage; onOpenFile?: (path: string) => void; index?: number; canMutate?: boolean; onEditMessage?: (i: number) => void; onForkMessage?: (i: number) => void }) {
+function UserBubble({ message, onOpenFile, index, canMutate, onEditMessage }: { message: UserMessage; onOpenFile?: (path: string) => void; index?: number; canMutate?: boolean; onEditMessage?: (i: number) => void }) {
 	// attached workspace files render as clickable chips → open the explorer
 	// at that file (user request). Images have no path in ImageContent — text
 	// file chips only.
 	const text = textOf(message.content);
 	const files = [...text.matchAll(/^--- file: (.+?) ---$/gm)].map((m) => m[1]);
-	const actions = canMutate && typeof index === "number" && (onEditMessage || onForkMessage);
+	const actions = canMutate && typeof index === "number" && onEditMessage;
 	return (
 		<div class="pw-msg-row pw-user-row">
 			{actions && (
 				<div class="pw-msg-actions">
-					{onEditMessage && <button type="button" class="pw-msg-act" title="Edit — rewrite from this message (forks first when it is not the last message)" onClick={() => onEditMessage(index)}>✎</button>}
-					{onForkMessage && <button type="button" class="pw-msg-act" title="Fork — copy the transcript up to here into a new session" onClick={() => onForkMessage(index)}>⑂</button>}
+					{onEditMessage && <button type="button" class="pw-msg-act" title="Edit — the prompt moves to the composer; the removed turn is saved as a restorable version (🕘)" onClick={() => onEditMessage(index)}>✎</button>}
 				</div>
 			)}
 			<div class="pw-msg pw-user">
@@ -309,7 +308,6 @@ function MessageView(props: {
 	justUpdated?: boolean; // compaction completed this render — flash the summary block
 	canMutate?: boolean;
 	onEditMessage?: (i: number) => void;
-	onForkMessage?: (i: number) => void;
 	onRetry?: () => void;
 	onOpenFile?: (path: string) => void;
 }) {
@@ -331,7 +329,7 @@ function MessageView(props: {
 				</div>
 			);
 		}
-		return <UserBubble message={message as UserMessage} onOpenFile={props.onOpenFile} index={props.index} canMutate={props.canMutate} onEditMessage={props.onEditMessage} onForkMessage={props.onForkMessage} />;
+		return <UserBubble message={message as UserMessage} onOpenFile={props.onOpenFile} index={props.index} canMutate={props.canMutate} onEditMessage={props.onEditMessage} />;
 	}
 	if (message.role === "assistant")
 		return (
@@ -547,11 +545,12 @@ export function ChatView({ agent }: { agent: Agent }) {
 			setCompacting(false);
 		}
 	};
-	// fork/rewrite (llama.cpp-webui parity): per-user-message ✎ / ⑂. Server-side
-	// only. ✎ EDIT: tail message → in-place rewrite (truncate to the prefix,
-	// prefill the composer); older message → FORK first (pi's "the branch you
-	// leave survives", as a separate session) then prefill. ⑂ FORK: copy the
-	// prefix INCLUDING this message into a new session and navigate there.
+	// edit-with-versions (user design 2026-10-23, replaces fork/rewrite buttons):
+	// ONE action per user message. ✎ parks the removed tail as a VERSION delta
+	// (server-side, `versions` sidecar keyed by vid/turn), truncates the
+	// transcript to before this message, and prefills the composer. The removed
+	// prompt + response are restorable via the 🕘 versions picker — nothing is
+	// ever lost, and no new sidebar session is created.
 	const userText = (m: any) => (typeof m?.content === "string" ? m.content : (m?.content || []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n"));
 	const editMessage = async (i: number) => {
 		const msgs = agent.state.messages as any[];
@@ -559,30 +558,11 @@ export function ChatView({ agent }: { agent: Agent }) {
 		if (!m || m.role !== "user" || (agent as any).serverSide !== true) return;
 		const text = userText(m);
 		try {
-			if (i === msgs.length - 1) {
-				const r = await (agent as any).rewrite(i); // drop this user msg + anything after (nothing after by definition)
-				if (!r?.ok) throw new Error(r?.reason || r?.error || "rewrite failed");
-				note(`✎ ready to edit — the removed turn is gone from this session${r.backupPath ? " but a pre-rewrite backup was saved on the server" : ""}. Edit the text and send.`);
-			} else {
-				const r = await (agent as any).fork(i); // copy prefix EXCLUDING this message — the original keeps everything
-				if (!r?.ok || !r?.newSessionId) throw new Error(r?.reason || r?.error || "fork failed");
-				note(`✎ branched — editing in “${r.title || "fork"}” (⑂-marked, in the sidebar). The original session keeps the full history.`);
-				window.dispatchEvent(new CustomEvent("pi-open-session", { detail: r.newSessionId }));
-			}
+			const r = await (agent as any).rewrite(i); // server: park tail as version delta, truncate to [0..i)
+			if (!r?.ok) throw new Error(r?.reason || r?.error || "rewrite failed");
+			note(`✎ editing — the removed turn (prompt + ${Math.max(0, (r.version?.count ?? 1) - 1)} response msgs) is saved as version #${r.version?.vid ?? "?"} (🕘 picker). Edit the text and send.`);
 			steerSeq.current += 1;
-			setSteerDraft({ text, seq: steerSeq.current }); // composer prefill (survives the session switch)
-		} catch (err: any) {
-			note(err?.message || String(err));
-		}
-	};
-	const forkMessage = async (i: number) => {
-		if ((agent as any).serverSide !== true) return;
-		try {
-			const r = await (agent as any).fork(i + 1); // include this message
-			if (!r?.ok || !r?.newSessionId) throw new Error(r?.reason || r?.error || "fork failed");
-			// STAY in this session (user report: navigating away made the original
-			// "disappear" — it was just a same-titled fork they couldn't tell apart).
-			note(`⑂ forked — “${r.title || "new session"}” created in the sidebar with the transcript up to this message. You are still in the original: everything after it (incl. the response) stays here.`);
+			setSteerDraft({ text, seq: steerSeq.current }); // composer prefill
 		} catch (err: any) {
 			note(err?.message || String(err));
 		}
@@ -772,6 +752,8 @@ export function ChatView({ agent }: { agent: Agent }) {
 	const [compactStarted, setCompactStarted] = useState(0);
 	const [, setCompactTick] = useState(0);
 	const [compactDone, setCompactDone] = useState(false);
+	const [versionsOpen, setVersionsOpen] = useState(false);
+	const [versionsList, setVersionsList] = useState<any[] | null>(null);
 	const compactSid = useRef<string | null>(null);
 	const compactSettled = useRef(false); // compact() reply path already handled it
 	useEffect(() => {
@@ -828,7 +810,6 @@ export function ChatView({ agent }: { agent: Agent }) {
 						justUpdated={compactDone && i === summaryIdx}
 						canMutate={!state.isStreaming && (agent as any).serverSide === true}
 						onEditMessage={editMessage}
-						onForkMessage={forkMessage}
 						onRetry={retry}
 						onOpenFile={openFileViewer}
 					/>
@@ -895,6 +876,37 @@ export function ChatView({ agent }: { agent: Agent }) {
 				}}
 			/>
 			<UsageBar agent={agent} canCompact={(agent as any).serverSide === true && !state.isStreaming && state.messages.length > 6} compacting={compacting} onCompact={compact} />
+			{(agent as any).serverSide === true && (
+				<div class="pw-versions-bar">
+					<button type="button" class="pw-compact-btn" title="Versions — every ✎ edit saves the removed turn here; restore swaps it back (lossless both ways)" onClick={async () => {
+						const next = !versionsOpen;
+						setVersionsOpen(next);
+						if (next) {
+							setVersionsList(null); // refetch every open — never stale across sessions
+							try { const r = await (agent as any).versions(); setVersionsList(r?.versions || []); } catch (err: any) { note(err?.message || String(err)); }
+						}
+					}}>🕘 versions{versionsList && versionsList.length > 0 ? ` (${versionsList.length})` : ""}</button>
+					{versionsOpen && (
+						<div class="pw-versions-panel">
+							{versionsList === null ? <div class="pw-versions-empty">loading…</div>
+							: versionsList.length === 0 ? <div class="pw-versions-empty">no saved versions yet — ✎ edit a message to create one</div>
+							: [...versionsList].reverse().map((v: any) => (
+								<div class="pw-versions-row" key={v.vid}>
+									<span class="pw-versions-meta">#{v.vid} · turn {v.turn} · {v.count} msg{v.count === 1 ? "" : "s"} · {new Date(v.at).toLocaleTimeString()} · {v.reason}</span>
+									<button type="button" class="pw-versions-restore" onClick={async () => {
+										try {
+											const r = await (agent as any).restoreVersion(v.vid);
+											if (!r?.ok) throw new Error(r?.reason || r?.error || "restore failed");
+											note(`🕘 restored version #${v.vid} — the replaced tail was saved as a new version (nothing lost)`);
+											setVersionsOpen(false);
+										} catch (err: any) { note(err?.message || String(err)); }
+									}}>restore</button>
+								</div>
+							))}
+						</div>
+					)}
+				</div>
+			)}
 				{compactDone ? (
 				<div class="pw-compact-progress pw-compact-done" role="status">
 					<span aria-hidden="true">✓</span>

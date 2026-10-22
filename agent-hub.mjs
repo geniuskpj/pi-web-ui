@@ -115,7 +115,7 @@ const serializeConversation = (messages) => {
 };
 
 export class AgentHub {
-	constructor({ modelsStore, getAuth, persist, broadcast, getTools, getSystemPrompt, defaultModelId, onRuntimeChange, loadMessages, summarize, backupMirror }) {
+	constructor({ modelsStore, getAuth, persist, broadcast, getTools, getSystemPrompt, defaultModelId, onRuntimeChange, loadMessages, summarize, backupMirror, versions }) {
 		this.modelsStore = modelsStore;
 		this.getAuth = getAuth;
 		this.persist = persist; // async (id, data, metadata) — worker store (atomic)
@@ -124,6 +124,10 @@ export class AgentHub {
 		this.loadMessages = loadMessages || null; // async (id) → {messages, metadata} | null
 		this.summarize = summarize || null; // async ({model, serialized, previousSummary, signal}) → summary text
 		this.backupMirror = backupMirror || null; // async (id) → backup path | null (pre-compact safety copy)
+		// VERSIONS (user design 2026-10-23): delta sidecar ops — {append(id, record),
+		// list(id), get(id, vid)}; every ✎ edit parks the removed tail here with
+		// simple meta (vid/turn/firstId/count) so versions are restorable
+		this.versions = versions || null;
 		this.broadcast = broadcast; // (sessionId, msg) — send to attached clients
 		// server-side toolset (2026-10-21): the SAME builtin+extension tools the exec
 		// bridge exposes — executed IN THIS PROCESS by the server-side agent loop, so
@@ -626,11 +630,22 @@ export class AgentHub {
 		if (entry.agent.state.isStreaming) throw new Error("cannot rewrite while a run is streaming — stop it first");
 		const msgs = entry.agent.state.messages;
 		const n = Math.max(0, Math.min(Math.floor(Number(keepCount)) || 0, msgs.length));
-		// PRE-REWRITE BACKUP (user report: "with rewrite I couldn't see the previous
-		// version"): the linear mirror is truncated IN PLACE — the dropped tail was
-		// unrecoverable. Same gzip mirror backup as compaction (31-day prune).
-		let backupPath = null;
-		if (this.backupMirror) { try { backupPath = await this.backupMirror(sessionId); } catch { /* best-effort */ } }
+		// VERSION DELTA (user design: "save delta jsonl with some id"): park the
+		// removed tail — turn number + first removed id + simple meta — in the
+		// per-session versions sidecar. Restore swaps it back (lossless). This
+		// replaces the gzip pre-rewrite backup (kept for compaction only).
+		let version = null;
+		if (n < msgs.length && this.versions) {
+			try {
+				version = await this.versions.append(sessionId, {
+					turn: n,
+					firstId: msgs[n]?.id || null,
+					count: msgs.length - n,
+					reason: "edit",
+					messages: JSON.parse(JSON.stringify(msgs.slice(n))),
+				});
+			} catch { /* best-effort — the edit proceeds without a version */ }
+		}
 		entry.agent.state.messages = msgs.slice(0, n);
 		entry.mutateEpoch = (entry.mutateEpoch || 0) + 1;
 		entry.pendingPrompt = null;
@@ -641,7 +656,53 @@ export class AgentHub {
 		this.emitSteering(sessionId);
 		await this.persistSession(sessionId, true);
 		this.broadcastState(sessionId);
-		return { ok: true, kept: n, backupPath };
+		return { ok: true, kept: n, version };
+	}
+
+	/** VERSIONS: meta list of the session's saved deltas (no message bodies). */
+	async listVersions(sessionId) {
+		if (!this.versions) return [];
+		return await this.versions.list(sessionId);
+	}
+
+	/** RESTORE a version: swap the saved tail back into the active transcript.
+	 *  The CURRENT tail from the same cut point is captured FIRST as its own
+		*  delta (reason "switch-away") — switching versions is lossless in both
+		*  directions. The restored messages REPLACE active[turn..]: prefixes are
+		*  shared by construction at capture time; after intervening edits the
+		*  splice is still deterministic (clamp turn to the active length). */
+	async restoreVersion(sessionId, vid) {
+		if (!this.versions) throw new Error("versions not configured");
+		const entry = await this._ensureEntry(sessionId);
+		if (!entry) throw new Error("no live session");
+		if (entry.compacting) throw new Error("compaction in progress");
+		if (entry.agent.state.isStreaming) throw new Error("cannot restore a version while a run is streaming — stop it first");
+		const rec = await this.versions.get(sessionId, vid);
+		if (!rec || !Array.isArray(rec.messages)) throw new Error(`version ${vid} not found`);
+		const active = entry.agent.state.messages;
+		const base = Math.max(0, Math.min(Number(rec.turn) || 0, active.length));
+		if (active.length > base) {
+			try {
+				await this.versions.append(sessionId, {
+					turn: base,
+					firstId: active[base]?.id || null,
+					count: active.length - base,
+					reason: `switch-away (restoring v${vid})`,
+					messages: JSON.parse(JSON.stringify(active.slice(base))),
+				});
+			} catch { /* best-effort */ }
+		}
+		entry.agent.state.messages = [...active.slice(0, base), ...JSON.parse(JSON.stringify(rec.messages))];
+		entry.mutateEpoch = (entry.mutateEpoch || 0) + 1;
+		entry.pendingPrompt = null;
+		entry.pendingPromptMessage = null;
+		entry.followUpCount = 0;
+		entry.runtime.pendingPrompts = 0;
+		this.emitRuntime(sessionId);
+		this.emitSteering(sessionId);
+		await this.persistSession(sessionId, true);
+		this.broadcastState(sessionId);
+		return { ok: true, restored: vid, count: entry.agent.state.messages.length };
 	}
 
 	/** COMPACT (pi /compact parity): summarize older history, replace the span

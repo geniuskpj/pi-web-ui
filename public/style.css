@@ -1743,6 +1743,24 @@ html.dark .pw-term-host.wterm {
 .pw-compact-view:hover { background: rgba(134, 239, 172, 0.14); }
 @keyframes pw-compact-flash { 0%, 100% { background: rgba(96, 165, 250, 0.06); } 50% { background: rgba(96, 165, 250, 0.30); } }
 .pw-compact-fresh { animation: pw-compact-flash 1s ease-in-out 3; border-color: #60a5fa; }
+
+/* 🕘 versions picker: delta records saved by ✎ edits; restore swaps the tail */
+.pw-versions-bar { display: flex; flex-direction: column; align-items: flex-end; padding: 2px 8px; }
+.pw-versions-panel {
+	width: 100%; max-height: 220px; overflow-y: auto;
+	border: 1px solid rgba(128, 128, 128, 0.3); border-radius: 8px;
+	background: var(--secondary, #1a1a1e); padding: 4px;
+	font-size: 12px;
+}
+.pw-versions-row { display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 6px; }
+.pw-versions-row:hover { background: rgba(128, 128, 128, 0.12); }
+.pw-versions-meta { flex: 1; opacity: 0.8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pw-versions-restore {
+	background: transparent; border: 1px solid rgba(96, 165, 250, 0.45); color: #93c5fd;
+	border-radius: 6px; cursor: pointer; font-size: 11px; padding: 2px 8px; flex: none;
+}
+.pw-versions-restore:hover { background: rgba(96, 165, 250, 0.14); }
+.pw-versions-empty { padding: 6px 8px; opacity: 0.6; }
 .pw-compact-btn {
 	background: transparent; border: 1px solid rgba(96, 165, 250, 0.4);
 	border-radius: 10px; color: inherit; cursor: pointer;

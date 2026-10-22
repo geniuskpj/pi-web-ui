@@ -274,6 +274,20 @@ export class ProxyAgent {
 		return this.sendAwait({ type: "compact", keepRecentTokens }, 600000);
 	}
 
+	/** VERSIONS: meta list of this session's saved deltas (no bodies). */
+	async versions(): Promise<any> {
+		const ready = await this.whenReady(8000);
+		if (!ready) throw new Error("Agent WS not connected");
+		return this.sendAwait({ type: "versions" }, 15000);
+	}
+
+	/** RESTORE a saved version (hub swaps the tail back; lossless both ways). */
+	async restoreVersion(vid: number): Promise<any> {
+		const ready = await this.whenReady(8000);
+		if (!ready) throw new Error("Agent WS not connected");
+		return this.sendAwait({ type: "restore-version", vid }, 30000);
+	}
+
 	async prompt(input: any, images?: any[]): Promise<any> {
 		const ready = await this.whenReady(8000);
 		if (!ready) throw new Error("Agent WS not connected");

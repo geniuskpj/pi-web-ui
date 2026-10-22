@@ -13,6 +13,11 @@ try { for (const f of fs.readdirSync(SESSIONS_DIR)) if (f.endsWith(".tmp")) fs.u
 
 import { SESSION_ID_RE } from "./session-id.mjs";
 const sessionFile = (id) => path.join(SESSIONS_DIR, `${id}.jsonl`);
+// VERSIONS sidecar (user design 2026-10-23): per-session delta records — the
+// removed tail of every edit/rewrite, keyed by a monotonic vid + turn number +
+// first message id, with simple meta. Restoring a version swaps the tail back
+// (the replaced tail is captured first → lossless round trip).
+const versionsFile = (id) => path.join(SESSIONS_DIR, `${id}.versions.jsonl`);
 
 const cache = new Map(); // id -> { metadata, messages }
 let loaded = false;
@@ -21,7 +26,8 @@ async function loadFromDisk() {
 	if (loaded) return;
 	let files = [];
 	try {
-		files = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith(".jsonl") || f.endsWith(".json"));
+		// .versions.jsonl sidecars are NOT sessions — never load them into the cache
+		files = fs.readdirSync(SESSIONS_DIR).filter((f) => (f.endsWith(".jsonl") || f.endsWith(".json")) && !f.endsWith(".versions.jsonl"));
 	} catch { /* dir missing */ }
 	for (const f of files) {
 		try {
@@ -74,6 +80,31 @@ async function delOne(id) {
 	cache.delete(id);
 	putChains.delete(id);
 	try { await fsp.unlink(sessionFile(id)); } catch { /* gone */ }
+	try { await fsp.unlink(versionsFile(id)); } catch { /* gone */ }
+}
+
+// --- versions sidecar (delta records with simple meta) -----------------------
+async function readVersions(id) {
+	let raw = "";
+	try { raw = await fsp.readFile(versionsFile(id), "utf8"); } catch { return []; }
+	return raw.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+}
+
+async function versionsAppend(id, record) {
+	const existing = await readVersions(id);
+	const vid = existing.reduce((m, r) => Math.max(m, Number(r.vid) || 0), 0) + 1;
+	const full = { ...record, vid, at: Date.now() };
+	await fsp.appendFile(versionsFile(id), JSON.stringify(full) + "\n", "utf8");
+	return full;
+}
+
+async function versionsList(id) {
+	// meta only — never ship the message bodies for a list
+	return (await readVersions(id)).map((r) => ({ vid: r.vid, at: r.at, turn: r.turn, firstId: r.firstId, count: r.count, reason: r.reason }));
+}
+
+async function versionsGet(id, vid) {
+	return (await readVersions(id)).find((r) => Number(r.vid) === Number(vid)) || null;
 }
 
 parentPort.on("message", async (msg) => {
@@ -108,6 +139,12 @@ parentPort.on("message", async (msg) => {
 		} else if (op === "delete" && SESSION_ID_RE.test(sid)) {
 			await delOne(sid);
 			result = true;
+		} else if (op === "versions-append" && SESSION_ID_RE.test(sid)) {
+			result = await versionsAppend(sid, payload.record || {});
+		} else if (op === "versions-list" && SESSION_ID_RE.test(sid)) {
+			result = await versionsList(sid);
+		} else if (op === "versions-get" && SESSION_ID_RE.test(sid)) {
+			result = await versionsGet(sid, payload.vid);
 		} else {
 			throw new Error("bad op: " + op);
 		}
