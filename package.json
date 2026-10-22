@@ -20,6 +20,7 @@
     "test:ssrf": "node tests/ssrf-depth2.test.mjs",
     "test:runtime": "node tests/runtime-seq.test.mjs",
     "test:steer": "node tests/steering.e2e.mjs",
+    "test:fetch": "node tests/fetch-tool.test.mjs",
     "test:shutdown": "node tests/shutdown.test.mjs"
   },
   "dependencies": {
@@ -27,9 +28,12 @@
     "@earendil-works/pi-ai": "0.75.3",
     "@hono/node-server": "^1.13.7",
     "diff": "^8.0.4",
+    "domhandler": "^6.0.1",
     "dompurify": "^3.4.17",
-    "hono": "^4.6.14",
+    "domutils": "^4.0.2",
     "highlight.js": "^11.10.0",
+    "hono": "^4.6.14",
+    "htmlparser2": "^12.0.0",
     "marked": "^18.1.1",
     "preact": "^10.27.2",
     "undici": "^8.12.2",

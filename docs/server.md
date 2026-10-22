@@ -133,6 +133,22 @@ Non-zero exits are NOT errors (`exit <code>` + details.exitCode); spawn-fail/tim
 No `ls` builtin — bash covers listing (mirrors pi's default tool set; an unadvertised-but-registered
 tool gets used without steering is the stated rationale).
 
+**fetch**: server-side GET for web pages (2026-10-22). Same SSRF machinery as the LLM proxy:
+`proxyTargetBlocked(hostname)` depth-1, `llmAgent` dispatcher (its `connect.lookup = proxyLookup`
+validates EVERY resolved address, depth-2), and a manual redirect loop (≤5 hops) that re-checks
+protocol + hostname per hop (redirect:"follow" would hop unvalidated). Body read capped 3MB
+(streamed `for await` + cancel — hostile huge bodies never balloon memory). HTML (by content-type
+or `<` sniff) → `stripBoilerplate()` from the vendored `lib/hp2.mjs` (ws/boilerplate-htmlparser2
+prototype: per-domain content selectors, token-matched chrome dropping — 'SharedPageLayout' never
+matches a 'share' hint — code-fence protection); JSON/text verbatim; `raw:true` skips conversion;
+empty strip falls back to the raw body. Inline output = first 50KB (HEAD, not bash's TAIL — web
+content reads from the top); anything larger (or a 3MB-truncated body) SPILLS to
+`data/tmp/fetch/<slug>-<ts>.md` (slug = hostname+path; 7-day prune on spill) and the result text
+returns the path so `rg`/`read_file` can extract sections. Non-2xx statuses are content (model
+reacts), not errors; invalid URL/protocol/blocked/timeout/abort → `isError:true`. Timeout default
+20s, clamp 60s, wired to the tool `signal`. Test: `tests/fetch-tool.test.mjs` (SSRF blocks
+deterministic; the positive path is network-dependent, like the security suite's public checks).
+
 ## Exec bridge (`POST /api/exec/tool`)
 
 Always `tokenMatches` (even loopback — drive-by POST defense). Params coerced (JSON string → object;

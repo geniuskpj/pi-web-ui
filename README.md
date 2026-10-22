@@ -131,13 +131,28 @@ Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
   Survive page reloads and server restarts.
 - **pi extensions + workspace tools**: the chat agent gets the user's real pi extensions
   (`.pi/extensions/*.ts`, loaded server-side with a lightweight shim) plus built-in workspace
-  tools (`read_file`, `write_file`, `edit`, `bash` — no `ls` builtin, mirroring pi's default
+  tools (`read_file`, `write_file`, `edit`, `bash`, `fetch` — no `ls` builtin, mirroring pi's default
   tool set; bash covers listing) and the **`cdp_eval` extension**
   (evaluate JS in the user's debugged browser on :9222 — UI automation/verification, modeled
   on the `cdp-*.mjs` helper scripts) via `POST /api/exec/tool`. The `edit` tool also recovers
   a path nested inside `edits[]` and fails with the exact call shape when `path` is missing.
   Path containment on fs tools; exec bridge always requires the API token; executions audited
   via `/api/debug/state`; optional per-tool allowlist `PI_WEB_TOOLS`. Tool list: `GET /api/exec/tools`.
+- **`fetch` tool (2026-10-22)**: server-side GET for web pages — HTML → clean markdown by the
+  vendored boilerplate stripper (`lib/hp2.mjs`, from the ws/boilerplate-htmlparser2 prototype:
+  per-domain content selection for Wikipedia/GitHub/MDN/HF/Docusaurus, token-matched chrome
+  dropping, code fences; ~230KB of deps, no jsdom/DOMPurify [DOMPurify silently no-ops on
+  linkedom], no html2markdown.exe). SSRF-guarded with the LLM proxy's machinery
+  (`proxyTargetBlocked` + `llmAgent`'s depth-2 `proxyLookup` + manual redirect loop re-validating
+  every hop). Inline output = first 50KB (web content reads from the top); LARGER RESULTS SPILL
+  to `data/tmp/fetch/<slug>.md` (7-day prune) so `rg`/`read_file` can extract sections; `raw:true`
+  returns the untouched body; body cap 3MB, timeout 20s default/60s max. Test: `npm run test:fetch`.
+- **`cdp-open.mjs` (2026-10-22)**: open a URL in the user's debugged browser — `node cdp-open.mjs
+  <url>` (plus `--list` / `--close <id>`). Exists because every naive path fails: `window.open`
+  from cdp_eval is popup-blocked, and Edge's `PUT /json/new?url=` creates the tab but NEVER
+  navigates it (verified — the tab stays about:blank). The helper uses `Target.createTarget`
+  over the browser-level WS + `Page.navigate` + `Page.loadEventFired` wait (pattern from
+  ws/cdp_project's cdp.js/browser.js). Also the documented reason cdp_eval "open link" failed.
 - **Terminal dock (pseudo-terminal WITHOUT node-pty)**: the 🖥 header button (or "↗ terminal"
   on a bash tool row) opens a bottom dock running **wterm** — the PREBUILT `@wterm/dom` dist
   vendored into `public/vendor/wterm/` (`node vendor-wterm.mjs` downloads the npm tarballs and

@@ -39,6 +39,7 @@ import { Agent as UndiciAgent, fetch as undiciFetch } from "undici";
 import util from "node:util";
 import { AgentHub } from "./agent-hub.mjs";
 import { createTerminalHub } from "./terminal-hub.mjs";
+import { stripBoilerplate } from "./lib/hp2.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, "public");
@@ -904,6 +905,115 @@ const builtinTools = [
 	// NOTE: no `ls` builtin — bash covers directory listing (mirrors pi's default
 	// tool set: read/bash/edit/write; grok r2: an unadvertised-but-registered tool
 	// gets used WITHOUT steering, the worst quadrant)
+	{
+		name: "fetch", label: "Fetch", source: "builtin",
+		// Server-side web fetch (2026-10-22). HTML → clean markdown via the VENDORED
+		// boilerplate stripper (lib/hp2.mjs ← ws/boilerplate-htmlparser2 prototype:
+		// per-domain content selection, token-matched chrome dropping, code fences;
+		// htmlparser2 stack ~230KB — no jsdom/DOMPurify [linkedom silently no-ops],
+		// no html2markdown.exe). GET only; SSRF-guarded with the LLM proxy's exact
+		// machinery: proxyTargetBlocked hostname check + llmAgent's proxyLookup
+		// depth-2 resolved-address validation + manual redirect loop re-validating
+		// EVERY hop (redirect:"follow" would hop unvalidated). Inline output = HEAD
+		// of the document (bash keeps the TAIL: command output matters at the end,
+		// web content at the top); large results are SPILLED to data/tmp/fetch/*.md so
+		// rg/read_file can extract details — workspace-rooted, not tmpdir.
+		description: "Fetch an http(s) URL from the server (GET only) and return readable markdown. HTML is boilerplate-stripped (nav/ads dropped, links/tables/code fences kept, per-site rules); JSON/text returned verbatim; raw:true skips conversion. Loopback/private/link-local targets and non-http(s) schemes are blocked (also per redirect hop). Inline output is capped at 50KB; LARGER RESULTS ARE SAVED to data/tmp/fetch/<slug>.md — use rg or read_file on the returned path to extract sections. Body cap 3MB, default timeout 20s (max 60).",
+		parameters: { type: "object", properties: { url: { type: "string", description: "absolute http(s) URL" }, raw: { type: "boolean", description: "return the raw body without HTML→markdown conversion" }, timeout: { type: "number", description: "seconds (default 20, max 60)" } }, required: ["url"] },
+		async execute(_id, params, signal) {
+			const t0 = Date.now();
+			let parsed;
+			try { parsed = new URL(String(params.url || "")); } catch { throw new Error(`invalid url: ${params.url}`); }
+			if (!["http:", "https:"].includes(parsed.protocol)) throw new Error(`blocked protocol: ${parsed.protocol} (http/https only)`);
+			if (proxyTargetBlocked(parsed.hostname)) throw new Error(`blocked fetch target (private/loopback/link-local): ${parsed.hostname}`);
+			const toSec = Math.min(60, Math.max(1, Number(params.timeout) || 20));
+			const ac = new AbortController();
+			const timer = setTimeout(() => ac.abort(new Error(`timeout`)), toSec * 1000);
+			const onAbort = () => ac.abort(new Error("aborted"));
+			if (signal?.aborted) onAbort(); else signal?.addEventListener("abort", onAbort, { once: true });
+			try {
+				let init = {
+					method: "GET", redirect: "manual", dispatcher: llmAgent, signal: ac.signal,
+					headers: {
+						"user-agent": "pi-web-agent-fetch/1.0 (+local agent tool)",
+						"accept": "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.8",
+						"accept-language": "en,*;q=0.5",
+					},
+				};
+				let currentUrl = parsed.toString();
+				let upstream = null;
+				for (let hop = 0; hop < 6; hop++) {
+					try { upstream = await undiciFetch(currentUrl, init); }
+					catch (err) {
+						if (signal?.aborted) throw new Error("aborted");
+						const reason = ac.signal.reason?.message || err?.cause?.message || err?.message || String(err);
+						if (/timeout/.test(reason)) throw new Error(`fetch timed out after ${toSec}s: ${currentUrl}`);
+						if (/blocked/.test(reason)) throw new Error(reason); // proxyLookup depth-2 rejection
+						throw new Error(`fetch failed: ${err?.cause?.message || err?.message || err}`);
+					}
+					const loc = upstream.status >= 300 && upstream.status < 400 ? upstream.headers.get("location") : null;
+					if (!loc) break;
+					if (hop === 5) throw new Error("too many redirects (5)");
+					let next; try { next = new URL(loc, currentUrl); } catch { throw new Error(`bad redirect location: ${loc}`); }
+					if (!["http:", "https:"].includes(next.protocol)) throw new Error(`blocked redirect protocol: ${next.protocol}`);
+					if (proxyTargetBlocked(next.hostname)) throw new Error(`blocked redirect target (private/loopback/link-local): ${next.hostname}`);
+					try { await upstream.body?.cancel(); } catch { /* noop */ }
+					currentUrl = next.toString();
+				}
+				// capped body read (3MB) — hostile huge bodies must not balloon memory
+				const MAX_BODY = 3 * 1024 * 1024;
+				const chunks = []; let size = 0; let bodyTruncated = false;
+				try {
+					for await (const chunk of upstream.body) {
+						const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+						if (size + buf.length > MAX_BODY) { bodyTruncated = true; try { await upstream.body.cancel(); } catch { /* noop */ } break; }
+						size += buf.length; chunks.push(buf);
+					}
+				} catch (err) {
+					if (!chunks.length) throw new Error(`body read failed: ${err?.message || err}`);
+				}
+				const body = Buffer.concat(chunks).toString("utf8");
+				const ct = (upstream.headers.get("content-type") || "").toLowerCase();
+				const looksHtml = /html|xml/.test(ct) || (!ct && /^\s*</.test(body));
+				let out = "", mode = "text";
+				if (looksHtml && params.raw !== true) {
+					mode = "markdown";
+					const stripped = stripBoilerplate(body, { url: currentUrl });
+					out = (stripped.title ? `${stripped.title}\n\n` : "") + stripped.markdown;
+					if (!out.trim()) { mode = "raw (strip empty)"; out = body; } // stripper found nothing → fall back to raw body
+				} else out = body;
+				// SPILL: full result to data/tmp/fetch/ (a scratch dir under the server's
+				// data dir — workspace-rooted so rg/read_file can grep it) whenever the
+				// inline head had to be cut; prune files older than 7 days so the dir
+				// stays bounded. Slugged hostname+path, collision-safe timestamp suffix.
+				const INLINE_MAX = 50 * 1024;
+				const notes = [];
+				let spillPath = null;
+				if (out.length > INLINE_MAX || bodyTruncated) {
+					try {
+						const dir = path.join(DATA_DIR, "tmp", "fetch");
+						fs.mkdirSync(dir, { recursive: true });
+						for (const f of fs.readdirSync(dir)) { // 7-day prune
+							try { if (Date.now() - fs.statSync(path.join(dir, f)).mtimeMs > 7 * 86400_000) fs.unlinkSync(path.join(dir, f)); } catch { /* raced */ }
+						}
+						let u2; try { u2 = new URL(currentUrl); } catch { u2 = parsed; } // currentUrl is a STRING in the loop
+						const slug = `${u2.hostname}${u2.pathname}`.replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "fetch";
+						spillPath = path.join(dir, `${slug}-${Date.now().toString(36)}.md`);
+						fs.writeFileSync(spillPath, out);
+						notes.push(`\n[full result (${out.length} chars) saved to ${spillPath} — use rg/read_file on it to extract sections]`);
+					} catch (err) { notes.push(`\n[spill failed: ${err?.message || err}]`); }
+				}
+				const head = out.length > INLINE_MAX ? out.slice(0, INLINE_MAX) : out;
+				if (head.length < out.length) notes.push(`\n[showing first 50KB of ${out.length} chars]`);
+				if (bodyTruncated) notes.push(`\n[body truncated at 3MB]`);
+				const summary = `fetch ${currentUrl} → ${upstream.status} ${upstream.statusText || ""} · ${ct || "unknown type"} · ${size} bytes · mode ${mode} · ${Date.now() - t0}ms`;
+				return { content: [{ type: "text", text: `${summary}\n\n${head}${notes.join("")}` }], details: { status: upstream.status, bytes: size, mode, spillPath } };
+			} finally {
+				clearTimeout(timer);
+				signal?.removeEventListener("abort", onAbort);
+			}
+		},
+	},
 	...(BASH_ENABLED ? [{
 		name: "bash", label: "Bash", source: "builtin",
 		description: "Execute a bash command in the workspace. Returns stdout and stderr. Output is truncated to the last 2000 lines or 50KB (whichever is hit first); if truncated, full output is saved to a temp file and its path is returned. fd/rg are on PATH. Optional timeout in seconds (default none, web cap 600s).",
