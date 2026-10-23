@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "description": "Web UI for pi based on official @earendil-works/pi-web-ui dist (Preact shell, nvidia-only provider build)",
   "scripts": {
     "build": "node build.mjs",

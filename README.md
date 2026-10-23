@@ -124,7 +124,17 @@ Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
 
 - **Bundle**: ~1.0MB (0.20MB brotli). node_modules ~75MB. Only deps: preact,
   pi-agent-core, pi-ai, marked, dompurify, highlight.js (lib/common), diff + server-side
-  hono/ws/undici. Provider SDKs stubbed to `stubs/empty` (openai-compatible only).
+  hono/ws/undici. Provider SDKs stubbed to `stubs/empty` (openai-compatible only) — via
+  `overrides` in package.json **and** an esbuild `alias` in build.mjs: npm 9/10 silently
+  ignore `overrides` with `file:` specifiers, so the bundle must not depend on how npm
+  resolved them (otherwise the build pulls in the real SDKs and their missing transitive
+  deps, e.g. `@opentelemetry/api`, and fails — that is what broke CI on node 18/20/22).
+- **Node ≥ 22** (`engines` in package.json; 18/20 are EOL — 18 never worked, `npm run
+  build` fails there because npm 9 drops the file: overrides). CI: `.github/workflows/ci.yml`
+  runs node 22 + 24 on ubuntu + windows — `npm ci` → `typecheck` → `build` → the hermetic
+  suites (share-link, store, runtime, ssrf, security-gates). The real-LLM suites
+  (`test:agent`, `test:steer`, `test:killstop`) and the Windows/pty-specific `term-smoke`
+  stay opt-in; `compact`/`fork`/`shutdown` need a bash/pty host, so they are local too.
 - **Theme variables** come from the vendored `public/assets/app.css` (pi-web-ui's compiled
   tailwind output, kept as a static asset — no runtime dependency). New-component styles live
   in `public/style.css`.
