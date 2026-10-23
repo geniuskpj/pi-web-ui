@@ -649,7 +649,7 @@ function App() {
 					)}
 				</div>
 				<div class="pi-header-right">
-					<button class="pi-btn" title="Terminal (bash dock — no node-pty)" onClick={() => termBus.toggle()}>
+					<button class="pi-btn" title="Terminal (bash dock)" onClick={() => termBus.toggle()}>
 						<Icon d={ICONS.terminal} />
 					</button>
 					<button

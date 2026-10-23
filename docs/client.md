@@ -201,7 +201,8 @@ State mirror of pi-agent-core's event application (message_start/update → stre
 generation-guarded reconnect (exponential + jitter), subscribe-first attach semantics server-side,
 `whenReady` polling, `waitForIdle` with a 5min cap, follow-ups via `prompt()` → WS (`prompt` now also
 accepts `images`). `serverSide = true` flag drives the client behavior differences (no browser key
-prompt, no key-replacement 401 flow — keys live in `.pi/auth.json` on the server). The browser ALSO
+prompt, no key-replacement 401 flow — server keys come from `.pi/auth.json` or Settings' server key
+store). Settings also keeps a local copy for `?local=1`. The browser ALSO
 saves the mirrored transcript locally (session list stays instant offline) while the hub persists the
 authoritative JSONL copy server-side after every turn.
 

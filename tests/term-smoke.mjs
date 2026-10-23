@@ -12,7 +12,7 @@
  *
  * Usage: node tests/term-smoke.mjs   (spawns + kills its own server on a random :87xx port)
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
@@ -24,6 +24,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PORT = 8790 + Math.floor(Math.random() * 500);
 const ORIGIN = `http://127.0.0.1:${PORT}`;
 const GOOD_ID = "smoke0123456789abcdef0123456789ef";
+const HAS_LINUX_SCRIPT = process.platform === "linux" && spawnSync("script", ["--version"], { stdio: "ignore" }).status === 0;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let passed = 0;
@@ -153,6 +154,17 @@ async function main() {
 				conn.state.tier === "pipes" || conn.state.tier === "pty", `tier=${conn.state.tier}`);
 			const prompt = await conn.waitFor((m) => (m.t === "d" || m.t === "replay") && String(m.d || "").includes("$"), 8000);
 			check("first prompt reaches the client (not swallowed by the noise filter)", !!prompt);
+			conn.send({ t: "i", d: "if [ -t 0 ]; then echo TERM_SMOKE_TTY=yes; else echo TERM_SMOKE_TTY=no; fi\r" });
+			await conn.waitFor((m) => (m.t === "d" || m.t === "replay") && String(m.d || "").includes("TERM_SMOKE_TTY="));
+			const ttyOutput = conn.frames.filter((m) => m.t === "d" || m.t === "replay").map((m) => String(m.d || "")).join("");
+			if (conn.state.tier === "pty") {
+				check("pty backend provides a real TTY", ttyOutput.includes("TERM_SMOKE_TTY=yes"), `tier=${conn.state.tier}`);
+			} else {
+				check("pipes backend reports no TTY", ttyOutput.includes("TERM_SMOKE_TTY=no"), `tier=${conn.state.tier}`);
+			}
+			if (HAS_LINUX_SCRIPT) {
+				check("Linux uses system script to give Bash a TTY", conn.state.tier === "pty" && ttyOutput.includes("TERM_SMOKE_TTY=yes"), `tier=${conn.state.tier}`);
+			}
 			conn.send({ t: "i", d: "echo TERM_SMOKE_$((41+1))\r" });
 			const out = await conn.waitFor((m) => (m.t === "d" || m.t === "replay") && String(m.d || "").includes("TERM_SMOKE_42"));
 			check("echo round-trip through the shell", !!out, `tier=${conn.state.tier}`);

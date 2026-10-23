@@ -4,54 +4,14 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createNodePtyBackend, defaultBashPath, selectTerminalBackend } from "../terminal-backends.mjs";
+import { defaultBashPath } from "../terminal-backends.mjs";
 import { killProcessTree } from "../process-tree.mjs";
 import { execTool, startScratchServer } from "./_scratch-server.mjs";
-
-assert.equal(selectTerminalBackend("win32", "pipes", false), "win32-bridge");
-assert.equal(selectTerminalBackend("linux", "auto", true), "pipes");
-assert.equal(selectTerminalBackend("linux", "auto", false), "pipes");
-assert.equal(selectTerminalBackend("linux", "pipes", true), "pipes");
-assert.equal(selectTerminalBackend("linux", "node-pty", false), "pipes");
-assert.equal(selectTerminalBackend("linux", "node-pty", true), "node-pty");
-assert.equal(selectTerminalBackend("linux", "unexpected", true), "invalid");
 
 assert.equal(defaultBashPath("win32", {}), "C:\\Git\\usr\\bin\\bash.exe");
 assert.equal(defaultBashPath("linux", { SHELL: "/usr/bin/bash" }), "/usr/bin/bash");
 assert.equal(defaultBashPath("linux", { SHELL: "/bin/zsh" }), "/bin/bash");
 assert.equal(defaultBashPath("linux", { PI_WEB_BASH_SHELL: "/custom/bash" }), "/custom/bash");
-
-{
-	const events = {};
-	const terminal = {
-		pid: 123,
-		write: (data) => { events.write = data; },
-		resize: (cols, rows) => { events.resize = [cols, rows]; },
-		onData: (callback) => { events.data = callback; },
-		onExit: (callback) => { events.exit = callback; },
-	};
-	const backend = createNodePtyBackend(
-		{ spawn: (shell, args, options) => {
-			events.spawn = { shell, args, options };
-			return terminal;
-		} },
-		{ shell: "/bin/bash", shellArgs: ["-i"], cwd: "/tmp", env: { TERM: "xterm" }, cols: 90, rows: 30 },
-	);
-	assert.equal(backend.kind, "node-pty");
-	assert.equal(backend.pid, 123);
-	assert.deepEqual(events.spawn.options, { name: "xterm", cols: 90, rows: 30, cwd: "/tmp", env: { TERM: "xterm" } });
-	backend.write("echo ok");
-	backend.resize(100, 40);
-	assert.equal(events.write, "echo ok");
-	assert.deepEqual(events.resize, [100, 40]);
-	backend.onData((data) => { events.received = data; });
-	events.data("terminal output");
-	assert.equal(events.received, "terminal output");
-	let exitCode;
-	backend.onExit((code) => { exitCode = code; });
-	events.exit({ exitCode: 7, signal: 0 });
-	assert.equal(exitCode, 7);
-}
 
 if (process.platform !== "win32") {
 	const child = spawn("sh", ["-c", "sleep 300 & wait"], { detached: true, stdio: "ignore" });
@@ -115,4 +75,4 @@ if (process.platform !== "win32") {
 	}
 }
 
-console.log("[term-platform] platform selection, shell paths, PTY adapter, and kill behavior passed");
+console.log("[term-platform] shell paths and POSIX process-group termination passed");

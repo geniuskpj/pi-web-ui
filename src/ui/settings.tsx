@@ -108,11 +108,31 @@ export function SettingsDialog({
 	};
 
 	const setKeyManual = async (provider: string) => {
-		const entered = window.prompt(`API key for "${provider}" (stored locally in your browser):`);
+		const entered = window.prompt(`API key for "${provider}" (saved on the server for server-side chat and in this browser for local mode):`);
 		if (!entered?.trim()) return;
-		await getAppStorage().providerKeys.set(provider, entered.trim());
+		const key = entered.trim();
+		try {
+			await getAppStorage().providerKeys.set(provider, key);
+		} catch (err) {
+			flash(`Browser key save failed: ${err instanceof Error ? err.message : String(err)}`);
+			return;
+		}
 		setKeys(await getAppStorage().providerKeys.list());
-		flash(`Key for "${provider}" saved`);
+		try {
+			const response = await fetch("/api/pi/key", {
+				method: "PUT",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ provider, key }),
+			});
+			if (!response.ok) {
+				const body = await response.json().catch((): { error?: string } => ({}));
+				flash(`Saved in this browser, but server save failed: ${body.error || response.statusText}`);
+				return;
+			}
+			flash(`Key for "${provider}" saved for server and local chat`);
+		} catch (err) {
+			flash(`Saved in this browser, but server save failed: ${err instanceof Error ? err.message : String(err)}`);
+		}
 	};
 
 	const model = agent?.state.model;

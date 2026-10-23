@@ -8,8 +8,9 @@
  *   GET  /api/version               -> { buildId, bootId }
  *   GET  /api/debug/state           -> diagnostics (connections, sessions, uptime)
  *   GET  /api/pi/config             -> providers + defaults from pi config
- *   GET  /api/pi/keys               -> all provider keys from auth.json
- *   POST /api/pi/key               -> { provider } -> key from auth.json
+ *   GET  /api/pi/keys               -> all provider keys from server auth stores
+ *   POST /api/pi/key               -> { provider } -> key from server auth stores
+ *   PUT  /api/pi/key               -> save a provider key for server-side agents
  *   GET  /api/sessions              -> session list from worker store
  *   POST /api/agent/session        -> create agent session
  *   GET  /api/agent/session/:id    -> session state
@@ -106,6 +107,37 @@ process.on("unhandledRejection", (err) => console.error("[pi-web] unhandled reje
 function readJsonSafe(file) {
 	try { return JSON.parse(fs.readFileSync(path.join(PI_DIR, file), "utf8")); }
 	catch { return null; }
+}
+
+const WEB_PROVIDER_KEYS_FILE = path.join(DATA_DIR, "provider-keys.json");
+function readWebProviderKeys() {
+	try {
+		const keys = JSON.parse(fs.readFileSync(WEB_PROVIDER_KEYS_FILE, "utf8"));
+		if (!keys || typeof keys !== "object" || Array.isArray(keys)) {
+			throw new Error("provider-keys.json must contain an object");
+		}
+		return keys;
+	} catch (err) {
+		if (err?.code === "ENOENT") return {};
+		throw err;
+	}
+}
+function getProviderAuth() {
+	return Object.assign(Object.create(null), readJsonSafe("auth.json") || {}, readWebProviderKeys());
+}
+function saveWebProviderKey(provider, key) {
+	const keys = readWebProviderKeys();
+	Object.defineProperty(keys, provider, { value: { type: "api", key }, enumerable: true, configurable: true, writable: true });
+	fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+	const temp = `${WEB_PROVIDER_KEYS_FILE}.${process.pid}.${crypto.randomUUID()}.tmp`;
+	try {
+		fs.writeFileSync(temp, JSON.stringify(keys, null, 2), { mode: 0o600 });
+		fs.chmodSync(temp, 0o600);
+		fs.renameSync(temp, WEB_PROVIDER_KEYS_FILE);
+	} catch (err) {
+		try { fs.unlinkSync(temp); } catch { /* preserve the write error */ }
+		throw err;
+	}
 }
 
 function piConfig() {
@@ -1429,7 +1461,8 @@ app.get("/api/pi/keys", (c) => {
 	if (!tokenMatches(c.env?.incoming)) {
 		return c.json({ error: "unauthorized — /api/pi/keys needs x-pi-web-token (see data/auth-token.txt)" }, 401);
 	}
-	const auth = readJsonSafe("auth.json") || {};
+	let auth;
+	try { auth = getProviderAuth(); } catch (err) { return c.json({ error: `failed to read provider keys: ${err.message}` }, 500); }
 	const out = {};
 	for (const [p, e] of Object.entries(auth)) { const k = typeof e === "string" ? e : e?.key; if (k) out[p] = k; }
 	return c.json({ keys: out });
@@ -1439,10 +1472,25 @@ app.post("/api/pi/key", async (c) => {
 	const body = await c.req.json().catch(() => ({}));
 	const provider = String(body?.provider || "");
 	if (!provider) return c.json({ error: "provider required" }, 400);
-	const auth = readJsonSafe("auth.json");
+	let auth;
+	try { auth = getProviderAuth(); } catch (err) { return c.json({ error: `failed to read provider keys: ${err.message}` }, 500); }
 	const key = typeof auth?.[provider] === "string" ? auth[provider] : auth?.[provider]?.key;
 	if (!key) return c.json({ error: `no key for "${provider}"` }, 404);
 	return c.json({ provider, key });
+});
+app.put("/api/pi/key", async (c) => {
+	const body = await c.req.json().catch(() => ({}));
+	const provider = typeof body?.provider === "string" ? body.provider.trim() : "";
+	const key = typeof body?.key === "string" ? body.key.trim() : "";
+	if (!/^[a-zA-Z0-9._-]{1,128}$/.test(provider)) return c.json({ error: "invalid provider" }, 400);
+	if (!key || key.length > 8192) return c.json({ error: "key must contain 1–8192 characters" }, 400);
+	try {
+		saveWebProviderKey(provider, key);
+		return c.json({ ok: true, provider });
+	} catch (err) {
+		console.error("[pi-web] failed to save provider key:", err?.message || err);
+		return c.json({ error: "failed to save provider key on the server" }, 500);
+	}
 });
 app.get("/api/debug/state", (c) => {
 	const origin = c.req.header("origin");
@@ -1893,7 +1941,7 @@ function piDefaultModelId() {
 
 const agentHub = new AgentHub({
 	modelsStore: piModelsStore,
-	getAuth: () => readJsonSafe("auth.json") || {},
+	getAuth: getProviderAuth,
 	persist: async (id, jsonl) => { await storeOp("put", { id, jsonl }); broadcastSessions().catch(() => {}); },
 	broadcast: (sessionId, msg) => {
 		const payload = JSON.stringify({ type: "agent", sessionId, ...msg });
@@ -1919,7 +1967,7 @@ const agentHub = new AgentHub({
 				messages: [{ role: "user", content: [{ type: "text", text: buildSummarizationPrompt(serialized, previousSummary) }] }],
 				tools: [],
 			},
-			getApiKey: async (p) => { const auth = readJsonSafe("auth.json") || {}; const e = auth[p]; return typeof e === "string" ? e : e?.key; },
+			getApiKey: async (p) => { const auth = getProviderAuth(); const e = auth[p]; return typeof e === "string" ? e : e?.key; },
 		});
 		if (signal) { try { signal.addEventListener("abort", () => summaryAgent.abort(), { once: true }); } catch { /* noop */ } }
 		await summaryAgent.prompt("Produce the structured summary now.");

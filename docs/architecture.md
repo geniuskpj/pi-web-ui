@@ -10,7 +10,7 @@ A browser UI for LLM chat on `@earendil-works/pi-agent-core` + `@earendil-works/
 **Hono** server (`server.mjs`) with **esbuild** bundling (no Vite). The **default chat path runs the
 agent loop SERVER-SIDE** (`agent-hub.mjs`, `/ws/agent`) — a run survives closing the browser/phone,
 and every attached device (PC/phone) sees the same live streaming events; the legacy in-browser loop
-remains behind `?local=1`. Runs on Windows (msys Git Bash) and Linux (Bash + optional node-pty); designed to also be used from
+remains behind `?local=1`. Runs on Windows (msys Git Bash) and Linux (Bash over pipes); designed to also be used from
 phones over plain-http LAN (hence the secure-context fallbacks in `src/id.ts`).
 
 ```
@@ -31,7 +31,7 @@ Browser (any device)                 Node server (:8787)
 | File | Responsibility |
 |---|---|
 | `server.mjs` (1570 L) | Hono app: auth gate, REST, exec bridge, fs endpoints, LLM proxy, static serving, WS routing/upgrade, builtin tools (read/write/edit/bash), pi extension loader |
-| `terminal-hub.mjs` | Pseudo-terminal hub: Windows msys2 `script.exe` / POSIX `node-pty` / pipes fallback, JSON-frame WS protocol, replay ring, session lifecycle |
+| `terminal-hub.mjs` | Terminal hub: Windows msys2 `script.exe` / Linux util-linux `script` PTY / pipes fallback, JSON-frame WS protocol, replay ring, session lifecycle |
 | `agent-hub.mjs` | **Server-side agent sessions — the DEFAULT chat path**: Agent per session with in-process tools (builtin+pi extensions), effective system prompt, settings.json default model; subscribe-first attach, debounced persist, per-session SSE subscriber sets; `retry()` resumes a failed run AT THE FAILURE POINT (drop the error message → `agent.continue()`; no duplicated user turn, completed tools not re-run) with auto-retry (3×3 s) for rate-limit/network errors |
 | `session-worker.mjs` (89 L) | Worker-thread JSONL session store (atomic tmp+rename writes) |
 | `session-id.mjs` (5 L) | Shared `SESSION_ID_RE` (`^[A-Za-z0-9_-]{1,80}$`) used on both sides of the worker seam |

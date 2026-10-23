@@ -68,8 +68,9 @@ See [architecture.md](architecture.md) for the module map and trust-boundary sum
 | `GET /api/version` | blanket | same ids |
 | `GET /api/pi/config` | blanket | re-reads `.pi/models-store.json` + `settings.json` → providers with models, defaults; refreshes the live server-agent model store in place |
 | `GET /api/pi/system` | blanket | system-prompt resolution (below) |
-| `GET /api/pi/keys` | **always token** (2026-10-21) | **returns ALL provider keys from `.pi/auth.json`** — strongest secrets oracle; no client call path uses it |
-| `POST /api/pi/key` | blanket + env-TOKEN check | `{provider}` → that provider's key |
+| `GET /api/pi/keys` | **always token** (2026-10-21) | **returns ALL provider keys from `.pi/auth.json` and `data/provider-keys.json`** — strongest secrets oracle; no client call path uses it |
+| `POST /api/pi/key` | blanket + env-TOKEN check | `{provider}` → that provider's key from `.pi/auth.json` or the private web key store |
+| `PUT /api/pi/key` | blanket | `{provider, key}` → save a key for server-side agents in `data/provider-keys.json` (mode 0600); `.pi/auth.json` is not modified |
 | `GET /api/sessions` | blanket | worker `list` (metadata only), 1s-cached (`listCached`) |
 | `POST /api/sessions` | blanket | returns a fresh `crypto.randomUUID()` (creates nothing) |
 | `GET /api/exec/tools` | blanket (+env-TOKEN if set) | tool defs minus `execute`; `stream:true` for bash |
@@ -323,7 +324,8 @@ up after N attempt(s)". Timers are cleared in `abort()`, `discard()`, `shutdown(
 
 
 Agent per session (**the DEFAULT chat path since 2026-10-21**); `getApiKey` reads `.pi/auth.json`
-server-side (keys never sent to clients); `persist()` → worker store. **The loop is fully server-side**:
+plus the private `data/provider-keys.json` store server-side (keys never sent to clients);
+`persist()` → worker store. **The loop is fully server-side**:
 tools = `builtinTools + extensionTools` run IN-PROCESS via `getTools()` (same objects as the exec
 bridge), `systemPrompt = effectiveSystemPrompt()` (WEB_SYSTEM.md precedence), default model from pi
 `settings.json default_model` via `defaultModelId`. `prompt(sessionId, content, images)` repairs

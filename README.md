@@ -5,9 +5,10 @@ with a **self-contained Preact UI** (`src/ui/`), bundled by **esbuild** (no Vite
 pi-web-ui, no lit), served by a **Hono** server.
 
 The server supports Windows and Linux. Windows retains the Git Bash `script.exe`
-terminal bridge; Linux supports optional `node-pty` (enabled with
-`PI_WEB_TERM_BACKEND=node-pty` during rollout) and otherwise uses the pipe-based
-shell. Bash execution and process-tree shutdown are platform-aware.
+terminal bridge; Linux runs Bash through the system util-linux `script` command
+for a real PTY when available, with a pipe-based Bash fallback. No native Node
+terminal package is required. Bash execution and process-tree shutdown are
+platform-aware.
 
 ```
 npm run build        # esbuild: src/main.tsx -> public/assets/ (hashed filenames + .br/.gz)
@@ -37,7 +38,9 @@ Browser (any device)              Node Server
   (`data/sessions/*.jsonl`) after each turn.
 - **Provider/model config** lives on the server (`/api/pi/config` from pi's `models-store.json`)
   and is cached client-side in localStorage (synchronous boot).
-- **API keys** stay in `.pi/auth.json` on the server; import via the 🗄️ button or Settings.
+- **API keys** from pi config stay in `.pi/auth.json`; keys typed into Settings are also saved
+  in the server's private `data/provider-keys.json` store so the default server-side agent can use them.
+  Both sources stay server-side; import existing pi keys via the 🗄️ button or Settings.
 
 ## Documentation (docs/)
 
@@ -50,7 +53,7 @@ claims without the raw source). Start with `architecture.md` — index + reading
 |---|---|
 | [`docs/architecture.md`](docs/architecture.md) | Big picture: module map (every file → responsibility), server + client boot sequences, the 5 core data flows (chat turn, persistence, session restore, bash exec, terminal), trust boundaries/auth model, env vars, known quirks |
 | [`docs/server.md`](docs/server.md) | `server.mjs` + `agent-hub.mjs` + `session-worker.mjs`: token auth, every REST endpoint, system-prompt/trust resolution, pi extension loader (shim + staging), the builtin tools' algorithms (`assertInsideRoots` realpath walk, the edit tool's 4-form match pipeline + line-fuzzy pass, bash spawn/spill/kill-tree), exec bridge (NDJSON streaming, audit), LLM proxy (stall watchdog), static serving, JSONL worker store, `/ws/sync` + `/ws/agent` hubs |
-| [`docs/terminal.md`](docs/terminal.md) | `terminal-hub.mjs` + `src/ui/terminal.tsx`: Windows pty tier (msys2 `script.exe`), POSIX pty tier (`node-pty`) and pipes fallback (`bash -i` + ONLCR emulation), generated shell rc, JSON frame protocol, session lifecycle, Origin allowlist, and the client |
+| [`docs/terminal.md`](docs/terminal.md) | `terminal-hub.mjs` + `src/ui/terminal.tsx`: Windows pty tier (msys2 `script.exe`), Linux util-linux `script` PTY and pipes fallback, generated shell rc, JSON frame protocol, session lifecycle, Origin allowlist, and the client |
 | [`docs/client.md`](docs/client.md) | Browser side: `main.tsx` boot (fetch/WS token monkeypatch, agent creation, session save/load/delete lifecycle), `chat.tsx` rendering rules (markdown memo, partials map, retry repair), storage layer (LocalStorageBackend, `pi.key.*` fast tier), session-sync protocol, proxy/key resolution, `pi-tools.ts` NDJSON bridge, markdown/XSS pipeline, file explorer |
 
 ## Self-contained UI (replaces @earendil-works/pi-web-ui — plan.md)
@@ -66,7 +69,7 @@ claims without the raw source). Start with `architecture.md` — index + reading
 | Model selector | `src/ui/model-selector.tsx` | pi-config models only (no built-in catalog) |
 | Settings → Import from pi config | `src/ui/settings.tsx` | providers/defaults/key re-import (moved from the header 💾 button) |
 | **Workspace file explorer** | `src/ui/file-picker.tsx` | two-pane: file list (mtime-sorted, checkboxes for multi-select) + live preview (line numbers + syntax highlighting via hljs; images; prose); opens at `ws/` by default, remembers last dir |
-| **Terminal dock** | `src/ui/terminal.tsx` + `terminal-hub.mjs` | wterm in a bottom dock; Windows uses msys2 `script.exe`, Linux uses optional `node-pty` with a pipes fallback; ring-buffer replay, live exit codes via OSC 133, drag-resize; bash tool rows get "↗ terminal" |
+| **Terminal dock** | `src/ui/terminal.tsx` + `terminal-hub.mjs` | wterm in a bottom dock; Windows uses msys2 `script.exe`, Linux uses system `script` to run Bash in a PTY (pipes fallback); ring-buffer replay, live exit codes via OSC 133, drag-resize; bash tool rows get "↗ terminal" |
 | **Attachments** | `chat.tsx` + `server.mjs` `/api/ws/*` | workspace files (no uploads): text files inlined as fenced blocks, images as ImageContent; clipboard image paste (MIME allowlist + 8MB cap); attached files are clickable chips in the composer AND on sent messages → reopen the explorer at that file |
 | Secure-context fallbacks | `src/id.ts` | `makeId()` (randomUUID → getRandomValues v4) + `copyText()` (clipboard → execCommand) — the UI works on `http://<LAN-IP>` |
 | Storage layer | `src/storage.ts` | store classes over LocalStorageBackend; `pi.key.*` fast tier built in |
@@ -195,13 +198,12 @@ Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
     so nano/vim get the right layout (script defaults the pty to 80x25).
     (Why not winpty: Git's bundled CLI — and upstream 0.4.3 — ASSERT headless, winpty.cc:924:
     its resize poll reads TIOCGWINSZ on a pipe → 0x0 → `winpty_set_size(0,0)`.)
-  - Linux tier `pty`: opt in during rollout with `PI_WEB_TERM_BACKEND=node-pty`; the optional
-    dependency supplies a real POSIX PTY, including live resize and terminal line discipline.
-    Linux defaults to pipes until the rollout is complete; `PI_WEB_TERM_BACKEND=pipes` forces that
-    fallback. If node-pty cannot load, startup warns and falls back to pipes. Install
-    `build-essential` and `python3` if npm must compile node-pty.
-  - tier `pipes` (fallback, also used until provisioning finishes): `bash --noprofile --rcfile
-    data/term-shell.rc -i` over pipes. Readline still runs — it echoes input, renders a colored
+  - Linux tier `pty`: system util-linux `script` runs
+    `bash --noprofile --rcfile data/term-shell.rc -i` with a real PTY, so TTY-aware programs such
+    as nano can run. This uses the installed system utility, not a Node dependency. If `script` is
+    unavailable, the terminal falls back to the pipes tier.
+  - tier `pipes` (Linux fallback; also used on Windows if bridge provisioning is disabled):
+    `bash --noprofile --rcfile data/term-shell.rc -i` over pipes. Readline still runs — it echoes input, renders a colored
     prompt, handles arrow-key history redraws, `^C` (bell + abort) and multi-line continuations,
     all as a plain VT stream (verified on Git Bash 5.3). The generated rc adds OSC 133 A/B/D
     markers + OSC 7 cwd, so the status bar shows live exit codes and the cwd. Two pty duties the
@@ -211,7 +213,8 @@ Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
     the spawn env replicates what `git-bash.exe`'s login shell provides: Git's `usr/bin` +
     `mingw64/bin` + `bin` prepended to PATH, `HOME`, `SHELL`, `MSYSTEM`/`MSYSTEM_PREFIX`/
     `_CARCH`/`_CHOST`, `TERM`, `COLUMNS`/`LINES`). Remaining gaps: no job control, native
-    console programs see pipes, fixed grid size. An auto-fallback (pty→pipes) triggers if the
+    console programs see pipes, fixed grid size. Interactive programs requiring a TTY, such as
+    nano, are unsupported in this tier. On Windows, an auto-fallback (pty→pipes) triggers if the
     bridge dies within 4s of spawn.
   - Touch UI: the dock has an **Exit** button (ends the shell via a kill frame —
     safe from any foreground state), a **command-entry bar** that streams every
@@ -224,8 +227,9 @@ Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
   - `npm test`: boots a scratch server and drives /ws/terminal over a raw socket —
     cross-origin rejection, guessable-id rejection, attach → first prompt → echo round-trip →
     ONLCR (no bare `\n` reaches the emulator) → replay → reset → kill (12 checks).
-  - `npm run test:term-platform` verifies backend selection, shell discovery, the node-pty adapter,
-    and POSIX process-group termination. CI runs both terminal suites on Windows and Ubuntu.
+  - `npm run test:term-platform` verifies shell discovery and POSIX process-group termination.
+    `npm test` checks Bash receives a TTY through Linux `script` when installed; CI runs both
+    terminal suites on Windows and Ubuntu.
   - Security: `/ws/terminal` inherits the non-loopback token gate AND enforces a strict Origin
     allowlist inside its own size-capped WSS (WS has no CORS — a drive-by page could otherwise
     dial the socket; DNS-rebinding presents a mismatched Origin/Host pair). 2026-10-21: the same

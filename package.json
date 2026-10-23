@@ -14,6 +14,7 @@
     "start:debug": "node build.mjs --debug && node server.mjs",
     "test": "node tests/term-smoke.mjs",
     "test:provider-models": "node tests/provider-models.test.mjs",
+    "test:provider-keys": "node tests/provider-keys.test.mjs",
     "test:term-platform": "node tests/term-platform.test.mjs",
     "test:agent": "node tests/server-agent.e2e.mjs",
     "test:edit": "node tests/edit-tool.test.mjs",
@@ -61,11 +62,7 @@
     "ollama": "file:stubs/empty"
   },
   "allowScripts": {
-    "esbuild@0.25.12": true,
-    "node-pty@1.1.0": true
-  },
-  "optionalDependencies": {
-    "node-pty": "^1.1.0"
+    "esbuild@0.25.12": true
   },
   "engines": {
     "node": ">=22.19.0"

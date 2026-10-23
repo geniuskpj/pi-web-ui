@@ -28,15 +28,14 @@ Node. The lock-in is concentrated in two files plus one constant:
 3. Shell discovery: `process.env.SHELL || /bin/bash` (login `-l` so PATH matches
    an interactive session); `PI_WEB_BASH_SHELL` override stays the first pick.
 
-## Phase 2 — node-pty backend (the real Linux pty)
-1. Add `node-pty` as an **optionalDependency** (native build; `--no-optional`
-   installs must keep the server bootable — dynamic `import()` behind try/catch,
-   fall back to the pipes tier with a loud log, mirroring today's tier fallback).
-2. Map backend events: `onData` → stripWs path unchanged; `resize(cols, rows)` →
-   SIGWINCH via `pty.resize`; exit codes → the same recovery logic.
-3. Client contract check: the emulator is platform-neutral (vendor-wterm); verify
-   the ONLCR row in term-smoke gains a Linux expectation (`\n`-only output must
-   NOT staircase — the pty's ONLCR handles it, same as msys).
+## Phase 2 — Linux PTY via system util-linux `script` (no Node dependency)
+Linux runs the same interactive Bash shell through `script`, which allocates a
+PTY and bridges stdin/stdout. This supports programs such as nano without a
+native Node package; pipes remain the fallback if `script` is absent.
+1. Keep Bash interactive with the generated rc and readline behavior.
+2. Preserve the ONLCR translation and process-group cleanup for Linux children.
+3. Verify the smoke test confirms `test -t 0` inside Bash when `script` exists,
+   and continues to cover the Windows bridge's PTY behavior separately.
 
 ## Phase 3 — Exec bridge + paths
 1. `builtinTools` bash: `BASH_PATH` per-OS (`/bin/bash`), `shell: true` semantics
@@ -46,24 +45,20 @@ Node. The lock-in is concentrated in two files plus one constant:
 3. Env: `USERPROFILE` vs `HOME` references (rg shows none outside the terminal).
 
 ## Phase 4 — CI + tests
-1. term-smoke gains a Linux row (ubuntu runner has bash + can `apt-get` util-linux
-   `script` — or use node-pty): add `if (process.platform === 'win32')` gates in
-   reverse (skip only the Windows bridge rows).
-2. CI matrix: run term-smoke on ubuntu with the node-pty backend; keep windows
-   rows on the bridge.
-3. Regression suite: `tests/term-platform.test.mjs` — backend selection, shell
-   discovery, kill semantics (per-platform rows).
+1. term-smoke runs on Linux `script` PTY and Windows bridge; assert TTY
+   availability whenever a PTY tier is selected.
+2. CI runs terminal smoke and platform process tests on both Ubuntu and Windows.
+3. Regression suite: `tests/term-platform.test.mjs` — shell discovery and kill
+   semantics (per-platform rows).
 
 ## Phase 5 — Docs + rollout
-1. README: "Runs on Windows (winpty bridge) and Linux (node-pty)" + the optional
-   dependency note (`apt install build-essential python3` if no prebuilt binary).
-2. Rollout order: Phase 1 (pure refactor, green on Windows) → Phase 2 behind
-   `PI_WEB_TERM_BACKEND=node-pty` opt-in → default-on for Linux after a week.
+1. README documents Windows bridge and Linux system-`script` PTY support.
+2. No native Node terminal dependency or backend rollout is planned.
 
 ## Non-goals
-- macOS as a *supported* target (it rides the node-pty backend but is untested).
-- Replacing the msys bridge on Windows (it works; node-pty-on-Windows reintroduces
-  the ConPTY/headless problems documented at terminal-hub.mjs:19-26).
+- macOS as a *supported* target (the pipes path may work but is untested).
+- Replacing the msys bridge on Windows (it works; winpty's ConPTY/headless
+  limitations are documented in `terminal-hub.mjs`).
 
 ## Test checklist (each phase must keep green)
 `npm run typecheck` · `npm test` (term-smoke, Windows) · new
