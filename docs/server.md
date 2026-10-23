@@ -11,22 +11,45 @@ See [architecture.md](architecture.md) for the module map and trust-boundary sum
 - `AUTH_TOKEN`: env `PI_WEB_TOKEN` → else `data/auth-token.txt` → else generate
   `crypto.randomBytes(24).toString("base64url")` and persist (file mode = platform default — no chmod
   anywhere in server.mjs; the boot log prints only the file PATH, never the token).
-- `requestToken()`: header `x-pi-web-token` OR `?token=` query. The query form exists for WebSocket
-  (WS cannot set custom headers) but is accepted on plain HTTP too — query tokens leak via reverse-proxy
-  logs, Referer and history; only the WS upgrade path actually needs it.
+- `requestToken()`: header `x-pi-web-token`, OR `?token=` **only for `/ws/*`** (2026-10-23).
+  The query form exists for WebSocket (WS cannot set custom headers); on plain HTTP it is
+  REFUSED — query tokens leak via Referer, history and reverse-proxy logs, and WS has no CORS,
+  so a foreign page could otherwise dial `ws://host/ws/…?token=…` if the URL ever escaped. Use the
+  `#token=` fragment for share links (client-side, never sent to the server).
 - `tokenMatches()`: length check + `crypto.timingSafeEqual` (timing-safe).
-- `authorized()`: loopback OR token. Loopback = remoteAddress `127.0.0.1` / `::1` / `::ffff:127.0.0.1`.
-- **Browser-origin gate (2026-10-21, r2 after re-review, DNS-rebinding defense)**: `ALLOWED_HOSTS`
-  (localhost, 127.0.0.1, [::1], `os.hostname()`, ALL non-internal interfaces — IPv4 AND bracketed IPv6,
-  zone ids stripped, `PI_WEB_TERM_ORIGIN` extras with scheme stripped + bare IPv6 bracket-wrapped — all
-  lowercased `host:port`) + `browserOriginAllowed(req)` require the `Host` header AND the `Origin`
-  header (when present) to be allowlisted. `headerHostAllowed` NORMALIZES: FQDN trailing dot stripped,
-  portless Host (browsers omit :80/:443) gets `:PORT` appended before the lookup. Applied by middleware
-  to **every `/api/*` route except `/api/health`** (r2: the original prefix list left
-  `/api/agent/session/:id` — which returns message BODIES — un-gated), and at upgrade to `/ws/sync` +
-  `/ws/agent` (a missing Origin = non-browser client → token gate only). `TERM_ALLOWED_ORIGINS =
-  ALLOWED_HOSTS` (shared with the terminal hub). Rationale: loopback trust is not a browser boundary —
-  a rebinding or `*.nip.io` hostname makes an attacker page same-origin over a loopback socket.
+- `authorized()`: loopback OR token. Loopback = remoteAddress `127.0.0.1` / `::1` / `::ffff:127.0.0.1`
+  (socket peer ONLY — `X-Forwarded-For` is never consulted).
+- **Browser-origin gate (2026-10-21, r2; retuned 2026-10-23, grok-reviewed)**: `ALLOWED_HOSTS`
+  (`host:port`) + `ALLOWED_NAMES` (**bare hostnames** — the lookup uses `hostName()`: lowercase,
+  trailing FQDN dot stripped, port stripped, IPv6 kept bracketed) built from localhost, 127.0.0.1,
+  `[::1]`, `os.hostname()`, ALL non-internal interfaces (IPv4 + bracketed IPv6, zone ids stripped)
+  and `PI_WEB_TERM_ORIGIN` extras (scheme stripped, bare IPv6 bracket-wrapped). Matching on the
+  HOSTNAME is port-insensitive on purpose: a TLS proxy on 443 sends `Origin: https://name`
+  (`host` = `name`) and forwards `Host: name`, which previously could never match a `name:PORT` entry.
+  `browserOriginAllowed(req)` requires the `Host` header AND the `Origin` header (when present) to
+  match; a malformed Origin (`null`) fails CLOSED. No suffix/`includes` matching (`localhost.evil.com`
+  is rejected). `TERM_ALLOWED_ORIGINS = ALLOWED_NAMES` (shared with the terminal hub, which strips
+  the port too).
+  **Strictness — `PI_WEB_ORIGIN_GATE`** (`auto` default | `strict` | `off`, applied by the
+  `originGateApplies()` predicate): `auto` gates **loopback peers only**, because loopback is the one
+  trust path that skips the token — a rebinding page (served from `evil.com:PORT`, DNS flipped to
+  127.0.0.1) still arrives as loopback and is still rejected, while a remote peer that presents the
+  token may use ANY hostname (this is what makes a DDNS/domain work with zero config; before
+  2026-10-23 every custom name needed `PI_WEB_TERM_ORIGIN` and a TLS proxy could never work).
+  `strict` restores the old every-peer behaviour; `off` disables the gate entirely and logs a loud
+  WARNING at boot (plus a second warning when `HOST` is a wildcard) — a rebinding page can then read
+  `/api/sessions` with no token. Applied by middleware to **every `/api/*` route except `/api/health`**
+  (r2: the original prefix list left `/api/agent/session/:id` — which returns message BODIES —
+  un-gated) and at upgrade to `/ws/sync` + `/ws/agent` (a missing Origin = non-browser client →
+  token gate only). `headerHostAllowed` still normalizes FQDN trailing dots and portless Hosts.
+  Rationale: loopback trust is not a browser boundary.
+- **Always-token routes** (loopback is NOT enough, any gate mode): `POST /api/exec/tool`,
+  `GET /api/pi/keys` (+`POST /api/pi/key`), `/api/ws/file*` (workspace reads), token read/rotate.
+  The allowlist is not a local-attacker control — a local process just sends `Host: 127.0.0.1`.
+- **Client surfacing (`src/server-auth.ts`)**: the fetch patch attaches the token and now reports
+  `401`/`403` to the shell (banner in `main.tsx`): `no-token`, `bad-token`, `host-blocked`
+  (shows the server's own error string) or `offline` — a blocked host used to look like an empty
+  session list.
 - Middleware (first `app.use`): 401 for any `/api/*` except `/api/health` when not authorized; logs
   every `/api/*` request (errors to console.error always, successes only in debug).
 
