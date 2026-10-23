@@ -37,6 +37,18 @@ an edit COMMITTED while an auto-retry timer is pending → `editCommit` bumps
 against a transcript that was just edited/truncated). Add the epoch check +
 a test.
 
+**A5 (user report 2026-10-24, FIXED — `retry` wiped the toolcall + thinking).**
+After a 429 that killed the run mid-tool-round, clicking Retry deleted the whole
+turn back to the user message. Chain: the dangling toolCall was stripped by the
+protocol repair → the transcript ended on an ASSISTANT tail → `canContinue`
+(user/toolResult only) refused → the RESEND fallback truncated to the user turn.
+Fix (two parts in `_dropFailedTail`): (1) REPAIR v2 — synthesize an interrupted
+`isError` toolResult per dangling call instead of stripping, so the turn stays
+protocol-valid AND `continue()`-able (thinking + tool round survive; the model
+re-plans); (2) pop the DEAD-END assistant (toolUse, no calls — already stripped)
+so retry continues from the user turn instead of resending. Tests: retry 31 → 40
+(mid-round death + dead-end variant, both mode=continue).
+
 ## B. Mobile multi-line edit
 
 Current inline editor is already Enter=newline / Ctrl+Enter=submit / Resubmit

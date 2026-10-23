@@ -235,5 +235,60 @@ async function waitFor(fn, ms = 5000) {
 	check("retried after the requested wait", later);
 }
 
+// --- 4) retry after a 429 that killed the run MID-TOOL-ROUND (user report) ----
+// "toolcall and assistant turn removed after clicking retry": transcript ends
+// user → assistant(thinking+toolCall, NO result) → assistant(429). The old
+// repair stripped the dangling call → assistant tail → RESEND fallback
+// truncated the whole turn. Now the call gets an interrupted toolResult and
+// retry continues FROM the toolcall.
+{
+	const { hub, faux } = makeHub();
+	faux.setResponses([ok("continued after the interrupted tool")]);
+	const id = "retrytest0000000000000000000004";
+	hub.getSession(id, {
+		messages: [
+			{ role: "user", content: [{ type: "text", text: "run the tool" }], timestamp: 0 },
+			{ role: "assistant", content: [{ type: "thinking", thinking: "let me count" }, { type: "toolCall", id: "cx", name: "countme", arguments: {} }], stopReason: "toolUse", timestamp: 1 },
+			// placeholder result so the call survives getSession's hydration repair
+			// (normalizeRestoredMessages strips dangling calls) — removed right after
+			// to recreate the LIVE pre-retry shape: the 429 killed the run before the
+			// tool ever produced a result
+			{ role: "toolResult", toolCallId: "cx", toolName: "countme", content: [{ type: "text", text: "placeholder" }], timestamp: 2 },
+			{ role: "assistant", content: [{ type: "text", text: "" }], stopReason: "error", errorMessage: "429 Too Many Requests — rate limit exceeded", timestamp: 3 },
+		],
+	});
+	hub.sessions.get(id).agent.state.messages.splice(2, 1); // cx now dangles, as live
+	const r = await hub.retry(id);
+	const msgs = msgsOf(hub, id);
+	check("mode = continue (NOT the resend fallback)", r?.ok === true && r.mode === "continue", JSON.stringify(r));
+	check("the toolCall + thinking turn SURVIVES", msgs.some((m) => m.role === "assistant" && Array.isArray(m.content) && m.content.some((p) => p.type === "toolCall" && p.id === "cx")));
+	check("a synthetic interrupted toolResult was created", msgs.some((m) => m.role === "toolResult" && m.toolCallId === "cx" && m.isError === true));
+	check("still one user turn", msgs.filter((m) => m.role === "user").length === 1);
+	check("the retried answer landed", textOf(msgs[msgs.length - 1]).includes("continued after the interrupted tool"));
+}
+
+// --- 5) same death, but the dangling call was ALREADY stripped (restart or ---
+// prompt repair ran first): the transcript ends on a DEAD-END assistant
+// (toolUse, no calls). The dead-end is popped so retry continues from the user
+// turn via continue() — the RESEND fallback (full user-turn re-add) must not fire.
+{
+	const { hub, faux } = makeHub();
+	faux.setResponses([ok("recovered from the dead end")]);
+	const id = "retrytest0000000000000000000005";
+	hub.getSession(id, {
+		messages: [
+			{ role: "user", content: [{ type: "text", text: "run the tool" }], timestamp: 0 },
+			{ role: "assistant", content: [{ type: "thinking", thinking: "let me count" }], stopReason: "toolUse", timestamp: 1 },
+			{ role: "assistant", content: [{ type: "text", text: "" }], stopReason: "error", errorMessage: "429 Too Many Requests — rate limit exceeded", timestamp: 2 },
+		],
+	});
+	const r = await hub.retry(id);
+	const msgs = msgsOf(hub, id);
+	check("dead-end: mode = continue (NOT resend)", r?.ok === true && r.mode === "continue", JSON.stringify(r));
+	check("dead-end: the broken thinking turn is gone", !msgs.some((m) => m.role === "assistant" && m.stopReason === "toolUse"));
+	check("dead-end: still one user turn", msgs.filter((m) => m.role === "user").length === 1);
+	check("dead-end: the retried answer landed", textOf(msgs[msgs.length - 1]).includes("recovered from the dead end"));
+}
+
 console.log(`\n[retry] ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
