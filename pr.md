@@ -173,3 +173,42 @@ table with **Disposition** (`fixed <commit>` / `rejected: <why>` / `open`), then
 |---|---|---|
 | 1 | … | fixed <commit> / rejected: <why> / open |
 -->
+
+### 2026-10-23 — reviewer1 — **needs-work**
+
+The auth-gate and retry changes have focused tests and the documented invariants are clear. I would
+not approve this PR while the session transcript artifacts remain tracked in its history.
+
+| # | Finding | Disposition |
+|---|---|---|
+| 1 | `tmp-s2.json` and `tmp-sess.json` are committed session transcripts (~9.9 MB combined). These may contain private conversation or session data, and deleting them only in a later commit would leave them in the PR history. | **open** — strip them from the branch history before publishing/merging; keep them ignored and check whether any credentials or other sensitive data require rotation. |
+
+### 2026-10-23 — reviewer1 — **needs-work** (commit review: `20a7865..361746a`)
+
+I traced the behavior-bearing commits listed in §2, including the final review-fix commit. The focused
+retry and security-gate suites pass, but the following gaps remain:
+
+| # | Finding | Disposition |
+|---|---|---|
+| 1 | **P1 — Auth token can be attached to cross-origin requests.** `4b0a8c2`'s fetch wrapper treats any URL containing `/api/` or `/ws/` as an API URL, and its WebSocket wrapper adds the token to every URL whose path starts `/ws/`, without checking the destination origin. An absolute third-party URL matching either path can therefore receive the server's full-access token. | **open** — only attach credentials when the parsed destination origin matches `window.location.origin` (and retain the intended API/WS path checks). **Confidence: 9/10.** |
+| 2 | **P2 — Default `auto` mode still blocks terminal access on unlisted custom domains.** `20a7865` makes the origin gate conditional for remote peers on HTTP and `/ws/sync` + `/ws/agent`, but `361746a` wires `/ws/terminal` to `TERM_ORIGIN_ALLOWED`, which always requires an exact `ALLOWED_HOSTS` entry. A remote client with a valid token can use the app through a DDNS/custom name but gets 403 when opening the terminal unless that name is separately configured. | **open** — pass a mode/peer-aware origin predicate to the terminal hub, preserving strict loopback rebinding checks. A targeted remote-WebSocket probe with an unlisted custom Origin returned HTTP 403. **Confidence: 9/10.** |
+| 3 | **P2 — Turning auto-retry off does not cancel an already scheduled retry.** `3cd3552`'s `setAutoRetry()` only changes the config; it does not cancel pending per-session timers, and the timer callback invokes `retry(..., { reason: "auto" })` without rechecking `enabled`. Disabling the setting during a `Retry-After` wait therefore still permits the queued retry. | **open** — cancel pending retry timers when disabling auto-retry and recheck the current setting in the callback. A targeted probe disabled the setting after scheduling and observed the retry still fire. **Confidence: 9/10.** |
+
+**Verification:** `npm run test:retry` — 31 passed; `npm run test:security` — 64 passed. The two
+targeted probes above reproduced findings 2 and 3; finding 1 is confirmed by tracing both credential
+injection paths in the source.
+
+### 2026-10-23 — reviewer2 — **needs-work**
+
+Verification pass on `d8ffb05` (independent of reviewer1; his findings are not re-checked here per the
+review workflow). Suites on this branch: `test:retry` 31/31, `test:security` 64/64, `test:store` 7/7,
+`typecheck` clean.
+
+| # | Finding | Disposition |
+|---|---|---|
+| 1 | **P1 — The branch is ALREADY pushed and carries the transcript blobs to GitHub.** §Status says "not pushed", but `origin/feat/auth-gate-retry` = `d8ffb05` and `git rev-list --objects origin/feat/auth-gate-retry` reaches the `tmp-sess.json` blob (`8e9f4d5`, 4.6 MB) — the pre-strip history this branch inherited from its base (`ffb3c63`/`3b33d01` on the old main) is public. This turns reviewer1's "strip before publishing" into "the remote must be cleaned too". | **open** — after stripping, force-push this branch (or delete + repush the rebased one); rotate the auth token if any transcript content is considered sensitive. Until then treat the GitHub remote as containing private session data. |
+| 2 | **P1 (process) — Merging this branch into main would RE-INTRODUCE the stripped blobs.** main was history-rewritten (`filter-branch`, 2026-10-23) precisely to drop the transcripts; this branch still sits on the OLD lineage (`4cf48ee → ffb3c63 → 3b33d01 → a16f0b9 → …`). A merge keeps both lineages forever; only a REBASE of the 8 auth commits onto stripped main drops them. §Base also references `2f91d52`, a pre-rewrite hash that no longer exists on main. | **open** — `git rebase --onto <new-main> a16f0b9 feat/auth-gate-retry` (the 8 auth commits do not touch the blobs, so the replay is clean), then re-push. Do NOT merge. |
+| 3 | **P3 — Stale PR metadata.** §Status "not pushed" (it is), §Base `2f91d52` (dangling post-rewrite), §6 "Before pushing … must be stripped" (the push already happened). The PR record no longer describes reality and misleads the next reviewer. | **open** — refresh the header fields after the rebase; keep the append-only log intact. |
+| 4 | **Note (positive) — the client token header only gates *same-origin-shaped* URLs today**, so the cross-origin exposure in reviewer1's finding 1 has a narrow practical surface (no absolute third-party URL is fetched by the app's own code paths I traced); the fix is still correct and cheap. | **note** — no action beyond reviewer1's own disposition. |
+
+**Merge gate:** hold for the strip + rebase (findings 1–2) and reviewer1's three open items.
