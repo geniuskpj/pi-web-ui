@@ -35,12 +35,21 @@ hub.getSession(S, { messages: [
 ] });
 const entry = hub.sessions.get(S);
 
-// --- 1) getRuntime self-heal ---------------------------------------------------
+// --- 1) getRuntime self-heal (staleness floor, grok Q1) ----------------------
 entry.agent.state.isStreaming = false; // pi says: not running
-entry.runtime = { status: "running", startedAt: Date.now(), turn: 3, currentTool: "arena_continue", lastText: "x", pendingPrompts: 0 };
+entry.lastEventAt = Date.now() - 60_000; // quiet for a minute — beyond the 15s floor
+entry.runtime = { status: "running", startedAt: Date.now() - 60_000, turn: 3, currentTool: "arena_continue", lastText: "x", pendingPrompts: 0 };
 const rt1 = hub.getRuntime(S);
-check("self-heal flips a running-zombie runtime to idle", rt1.status === "idle", rt1.status);
+check("self-heal flips a QUIESCENT zombie runtime to idle", rt1.status === "idle", rt1.status);
 check("settled runtime keeps seq stamping", typeof rt1.seq === "number");
+
+// the multi-turn race: flag momentarily down but events still flowing (lastEventAt
+// fresh) — a list read in that gap must NOT force-idle a LIVE run (grok Q1)
+entry.agent.state.isStreaming = false;
+entry.lastEventAt = Date.now();
+entry.runtime = { status: "running", startedAt: Date.now(), turn: 5, currentTool: null, lastText: null, pendingPrompts: 0 };
+const rt1b = hub.getRuntime(S);
+check("fresh-activity run survives the self-heal (staleness floor)", rt1b.status === "running", rt1b.status);
 
 // an ERROR runtime is a truthful terminal state — NOT a zombie
 entry.agent.state.isStreaming = false;
@@ -48,18 +57,30 @@ entry.runtime = { status: "error", startedAt: Date.now(), turn: 1, currentTool: 
 const rt2 = hub.getRuntime(S);
 check("error runtime survives (truthful terminal, not a zombie)", rt2.status === "error", rt2.status);
 
-// --- 2) abort() force-settle (Kill) --------------------------------------------
+// --- 2) abort() kill chain: debounce, retry, HARD BACKSTOP (grok Q3/Q5) --------
 entry.agent.abort = () => {}; // pi abort no-op (the wedged case: flag already false)
 entry.agent.clearSteeringQueue = () => {};
 entry.agent.state.isStreaming = false;
 entry.pendingPrompt = { text: "held", images: [], queuedAt: 1 };
 entry.runtime = { status: "running", startedAt: Date.now(), turn: 0, currentTool: "arena_continue", lastText: null, pendingPrompts: 1 };
 hub.abort(S);
+hub.abort(S); // Kill-spam — must be debounced
 check("abort clears the pending steering payload immediately", entry.pendingPrompt === null);
-await sleep(1900); // past the 1.5s grace
+await sleep(1900); // past the 1.5s settle
 const rt3 = hub.getRuntime(S);
 check("abort FORCE-SETTLES a wedged runtime after the grace", rt3.status === "idle", rt3.status);
 check("a runtime frame was emitted (alive rows clear everywhere)", runtimeFrames.some((f) => f.sid === S));
+const settleCount = runtimeFrames.filter((f) => f.sid === S).length;
+check("kill-spam debounced (no duplicate settle storm)", settleCount <= 4, `frames=${settleCount}`);
+
+// the isStreaming-STUCK-TRUE case (grok Q3): flag never drops, no agent_end —
+// only the 6s hard backstop closes it
+entry.agent.state.isStreaming = true;
+entry.runtime = { status: "running", startedAt: Date.now(), turn: 2, currentTool: "bash", lastText: null, pendingPrompts: 0 };
+hub.abort(S);
+await sleep(7000); // past the 6s backstop
+const rt4 = hub.getRuntime(S);
+check("HARD BACKSTOP settles a flag-stuck zombie after 6s", rt4.status === "idle" && entry.agent.state.isStreaming === false, `status=${rt4.status} flag=${entry.agent.state.isStreaming}`);
 
 // --- 3) agent_end path settles + forces pi's flag ------------------------------
 entry.agent.state.isStreaming = true; // phantom: the flag itself stuck

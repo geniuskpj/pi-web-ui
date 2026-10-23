@@ -269,6 +269,10 @@ export class AgentHub {
 					this._settleRuntime(sessionId, entry);
 				}
 				const payload = { type: "agent-event", sessionId, seq: entry.seq, event };
+				// liveness heartbeat for the zombie self-heal (grok Q1): multi-turn runs
+				// legitimately dip pi's isStreaming false between LLM calls — only a run
+				// that has been QUIESCENT for the staleness floor is a zombie
+				entry.lastEventAt = Date.now();
 				// attach() buffering hook (2026-10-21: replaces the old global
 				// this.broadcast swap, which was not reentrant when two attaches overlapped)
 				if (entry.buffer) entry.buffer.push(payload);
@@ -440,6 +444,12 @@ export class AgentHub {
 	}
 
 	abort(sessionId) {
+		// debounce (grok Q5): Kill-spam overlapped timeouts, redundant library
+		// flag writes and broadcast storms — one in-flight kill per session
+		this._aborting ??= new Set();
+		if (this._aborting.has(sessionId)) return;
+		this._aborting.add(sessionId);
+		setTimeout(() => this._aborting.delete(sessionId), 7000).unref?.();
 		const entry = this.sessions.get(sessionId);
 		if (!entry) return;
 		// STOP = stop EVERYTHING (user report 2026-10-23: with a pending steer the
@@ -457,13 +467,26 @@ export class AgentHub {
 		// KILL ARCHITECTURE (LFP zombie 2026-10-23): abort alone is NOT enough when
 		// the run wedged on a tool promise — pi's flag flips but agent_end never
 		// fires, so runtime.status stayed "running" forever (the session "cannot
-		// be killed"). FORCE-SETTLE after a short grace (let a clean abort emit its
-		// own terminal state first), then make the runtime truthful regardless.
+		// be killed"). Retry chain: settle once pi's flag drops (1.5s, retry 2.5s),
+		// then a HARD BACKSTOP at 6s that settles REGARDLESS of the flag (grok Q3:
+		// the flag can stick TRUE with no agent_end — the self-heal skips because
+		// !isStreaming is false, so the kill backstop is the only closer for the
+		// original phantom case; _settleRuntime writes the flag as documented
+		// last-resort for the library bug).
+		const trySettle = (delay) => setTimeout(() => {
+			const e = this.sessions.get(sessionId);
+			if (!e || e.runtime?.status === "idle") return;
+			if (!e.agent.state.isStreaming) this._settleRuntime(sessionId, e);
+			else trySettle(2500); // one retry, ~4s total
+		}, delay).unref?.();
+		trySettle(1500);
 		setTimeout(() => {
 			const e = this.sessions.get(sessionId);
-			if (!e) return;
-			if (!e.agent.state.isStreaming && e.runtime?.status !== "idle") this._settleRuntime(sessionId, e);
-		}, 1500).unref?.();
+			if (e && e.runtime?.status !== "idle") {
+				console.warn(`[hub] force-settle backstop: ${sessionId} still not settled 6s after Kill — overriding (library flag stuck / no agent_end)`);
+				this._settleRuntime(sessionId, e);
+			}
+		}, 6000).unref?.();
 	}
 
 	setModel(sessionId, modelId) {
@@ -853,7 +876,13 @@ export class AgentHub {
 	getRuntime(sessionId) {
 		const entry = this.sessions.get(sessionId);
 		if (!entry) return null;
-		if (entry.runtime?.status === "running" && !entry.agent.state.isStreaming) {
+		if (entry.runtime?.status === "running" && !entry.agent.state.isStreaming
+			&& Date.now() - (entry.lastEventAt || entry.runtime.startedAt || 0) > 15_000) {
+			// staleness floor (grok Q1 2026-10-23): pi's isStreaming legitimately dips
+			// false between the LLM calls of a MULTI-TURN run while runtime correctly
+			// stays "running" (agent_end only fires at run end) — without the floor a
+			// list read in that gap would force-idle a LIVE run. Only a run QUIESCENT
+			// for 15s+ with the flag down is a zombie.
 			// settle to the TRUTHFUL terminal state (an errored run stays "error" —
 			// the alive dialog refuses Kill on error rows and colors them red)
 			const lastA = [...entry.agent.state.messages].reverse().find((m) => m.role === "assistant");
