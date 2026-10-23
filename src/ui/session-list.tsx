@@ -27,6 +27,7 @@ export function SessionListDialog({
 	onClose: () => void;
 }) {
 	const [sessions, setSessions] = useState<SessionMeta[]>([]);
+	const [listErr, setListErr] = useState<string | null>(null);
 	const [loading, setLoading] = useState(false);
 	const [runtime, setRuntime] = useState<ReadonlyMap<string, RuntimeRecord>>(sessionSync.runtimeSnapshot());
 	// applied OUTSIDE the 5s metadata throttle — status feels live
@@ -51,7 +52,14 @@ export function SessionListDialog({
 			// server mirror first
 			try {
 				const r = await fetch("/api/sessions", { signal: AbortSignal.timeout(8000) });
-				if (r.ok) {
+				if (!r.ok) {
+					// the mirror is the source of truth for other devices' sessions — never
+					// swallow the reason (2026-10-23: a 403 host gate looked like "no sessions")
+					let msg = `server returned ${r.status}`;
+					try { const b: any = await r.clone().json(); if (b?.error) msg = String(b.error); } catch { /* non-JSON */ }
+					setListErr(r.status === 401 ? "Server token required — set it in Settings → Server token." : r.status === 403 ? `Server refused this host: ${msg}` : msg);
+				} else {
+					setListErr(null);
 					const d: any = await r.json();
 					for (const m of d.sessions || []) {
 						if (!m?.id) continue;
@@ -112,7 +120,9 @@ export function SessionListDialog({
 				</div>
 				<div class="pw-dialog-body">
 					{loading && <div class="pw-empty">Loading…</div>}
-					{!loading && sessions.length === 0 && <div class="pw-empty">No sessions yet.</div>}
+					{listErr && <div class="pw-sessions-err" role="alert">⚠ {listErr}</div>}
+					{!loading && !listErr && sessions.length === 0 && <div class="pw-empty">No sessions yet.</div>}
+					{!loading && listErr && sessions.length === 0 && <div class="pw-empty">Local sessions only — the server list could not be loaded.</div>}
 					{ordered.map((s) => {
 						const rt = runtime.get(s.id);
 						const bits: string[] = [];

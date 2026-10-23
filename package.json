@@ -26,7 +26,8 @@
     "test:compact": "node tests/compact.test.mjs",
     "test:shutdown": "node tests/shutdown.test.mjs",
     "test:killstop": "node tests/killstop.e2e.mjs",
-    "test:zombie": "node tests/zombie.test.mjs"
+    "test:zombie": "node tests/zombie.test.mjs",
+    "test:share": "node tests/share-link.test.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.75.3",

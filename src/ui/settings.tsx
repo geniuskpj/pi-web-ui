@@ -10,6 +10,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import { useEffect, useState } from "preact/hooks";
 import { getAppStorage } from "../storage.js";
 import { getProxyUrlSync } from "./proxy-stream.js";
+import { retryServerAuth } from "../server-auth.js"; // re-probe after a token change (clears the banner)
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 
 export function SettingsDialog({
@@ -253,6 +254,9 @@ export function SettingsDialog({
 									/* quota */
 								}
 								flash(token.trim() ? "Token saved" : "Token cleared");
+								// a new/cleared token changes authorization — re-probe so the auth banner
+								// (main.tsx) reflects reality immediately instead of on the next call
+								void retryServerAuth();
 							}}
 						/>
 					</section>
