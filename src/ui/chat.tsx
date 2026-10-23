@@ -754,9 +754,11 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 	 // open + the region dimmed while the response streamed invisibly)
 	 try {
 	  // TAIL-FIRST (2026-10-24): the client array index is window-relative — the
-	  // server's editCommit wants the ABSOLUTE seq = arrayIndex + fromSeq (the
-	  // dense window starts at sparse.fromSeq; 0 when fully loaded).
-	  const fromSeq = Number((agent.state as any).sparse?.fromSeq) || 0;
+	  // server's editCommit wants the ABSOLUTE seq. Use sparse.filledFrom (NOT the
+	  // attach-time fromSeq — grok review 01a16a54 #2: fromSeq froze at attach and
+	  // pointed edits at the wrong turn after any expand; filledFrom advances in
+	  // lockstep with fromSeq on every prepend).
+	  const fromSeq = Number((agent.state as any).sparse?.filledFrom ?? (agent.state as any).sparse?.fromSeq) || 0;
 	  const r = await (agent as any).editCommit(i + fromSeq, text);
 	  if (!r?.ok) throw new Error(r?.reason || r?.error || "edit failed");
 	  note(`✎ saved — the old turn was parked as version #${r.version?.vid ?? "?"} (🕘 picker); the edited message is on its way`);

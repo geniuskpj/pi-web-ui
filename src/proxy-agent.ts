@@ -7,7 +7,7 @@
 type Listener = (event: any) => void;
 type AnyRecord = Record<string, any>;
 import { makeId } from "./id.js";
-import { getCachedChunks, putChunk, gunzip, transferPolicy } from "./idb-cache.js";
+import { getCachedChunks, putChunk, gunzip, transferPolicy, cachedRanges, intervalDiff, invalidateSession } from "./idb-cache.js";
 // BACKFILL step in MESSAGES (filledFrom is a seq, not bytes): generous ask —
 // the server clamps the response to 1MB serialized (~140 msgs on the 7.3MB
 // session) and reports the actual window in X-Range-* headers.
@@ -385,9 +385,10 @@ export class ProxyAgent {
 		try { const r = await fetch("/api/health", { signal: AbortSignal.timeout(3000) }); const j = await r.json(); return String(j.netClass || "remote"); } catch { return "remote"; }
 	}
 
-	/** Policy-gated background 1MB backfill (wired/wifi → whole session into IDB;
-	 *  metered → manual expand only). Runs after a sparse attach; fetches only
-	 *  the holes (range-aware IDB — never re-downloads a cached chunk). */
+	/** Policy-gated background IDB warming (wired/wifi → cache the whole body;
+	 *  metered → manual expand only). CRITICAL (user report: "loading all of chat
+	 *  at once"): warming touches IDB ONLY — it must NEVER prepend into
+	 *  state.messages. The render stays tail-only; the expand button grows it. */
 	private async scheduleBackfill(sparse: { fromSeq: number; messageCount: number; rewriteSeq: number }): Promise<void> {
 		if (this.backfillRunning) return;
 		this.backfillRunning = true;
@@ -395,28 +396,41 @@ export class ProxyAgent {
 			const net = await this.netClass();
 			const policy = await transferPolicy(net);
 			if (policy !== "fast") return; // metered: expand stays manual (button)
-			await this.backfillAll();
+			// warm [0, filledFrom) into IDB — the render array is untouched
+			let guard = 40; // hard cap: 40 × 1MB
+			while (guard-- > 0) {
+				const sp = (this.state as any).sparse;
+				if (!sp) return; // session switched / full state frame arrived
+				const filled = sp.filledFrom as number;
+				const covered = await cachedRanges(this.sessionId);
+				const holes = intervalDiff(0, filled, covered);
+				if (holes.length === 0) return; // fully warm
+				const h = holes[0]; // oldest hole first; server clamps to 1MB per response
+				const res = await fetch(`/api/agent/session/${encodeURIComponent(this.sessionId)}/range?fromSeq=${h.fromSeq}&toSeq=${h.toSeq}`, { signal: AbortSignal.timeout(15000) });
+				if (!res.ok && res.status !== 204) return;
+				const buf = await res.arrayBuffer();
+				const rs = Number(res.headers.get("x-range-from-seq") || h.fromSeq);
+				const re = Number(res.headers.get("x-range-to-seq") || h.toSeq);
+				const count = Number(res.headers.get("x-session-message-count") || 0);
+				const rsq = Number(res.headers.get("x-session-mutate-epoch") || 0);
+				if (re <= rs) return; // empty — nothing more to warm
+				try { await putChunk(this.sessionId, rs, re, rsq, count, new Blob([buf], { type: "application/gzip" })); } catch { return; }
+			}
 		} catch { /* best-effort — the tail is already rendered */ }
 		finally { this.backfillRunning = false; }
 	}
 
-	/** Fill every hole above the currently loaded prefix from IDB-then-network. */
-	private async backfillAll(): Promise<void> {
-		const sparse = (this.state as any).sparse as { fromSeq: number; messageCount: number; rewriteSeq: number } | undefined;
-		if (!sparse || this.state.isStreaming) return;
-		while ((this.state as any).sparse && (this.state as any).sparse.filledFrom > 0 && !this.state.isStreaming) {
-			const filled = (this.state as any).sparse.filledFrom as number;
-			// ask for a generous message window — the server CLAMPS to 1MB serialized
-			// (X-Range-* headers report the actual window; filledFrom advances to its top)
-			const from = Math.max(0, filled - BACKFILL_MSGS);
-			const ok = await this.fillWindow(from, filled);
-			if (!ok) return; // network/cache dead — the expand button remains
-		}
+	/** EXPAND (banner button): grow the RENDER by one server-clamped step above
+	 *  the loaded window — IDB first (instant after warming), network for misses.
+	 *  SINGLE-FLIGHT (grok review 01a16a54 #7): double-clicks must not prepend
+	 *  the same window twice. */
+	async expandEarlier(): Promise<boolean> {
+		if (this.backfillRunning) return false;
+		this.backfillRunning = true;
+		try { return await this.expandInner(); } finally { this.backfillRunning = false; }
 	}
 
-	/** EXPAND (banner button / one server-clamped step): fill the window above the
-	 *  loaded prefix — IDB first, network for the miss-set. */
-	async expandEarlier(): Promise<boolean> {
+	private async expandInner(): Promise<boolean> {
 		const sparse = (this.state as any).sparse as { fromSeq: number; messageCount: number; rewriteSeq: number } | undefined;
 		if (!sparse) return false;
 		const filled = (this.state as any).sparse.filledFrom as number;
@@ -426,9 +440,13 @@ export class ProxyAgent {
 
 	/** Fill [from,to): IDB cache first, then /range for the miss-set. The server
 	 *  may return a SMALLER window than asked (1MB serialized cap) — X-Range-From/
-	 *  To-Seq are authoritative and filledFrom advances to the returned top. */
+	 *  To-Seq are authoritative and filledFrom advances to the returned top.
+	 *  EPOCH GUARD (grok review 01a16a54 #6): a response from an older rewrite
+	 *  generation invalidates the cache (server-specified rewrittenFrom — chunks
+	 *  below it survive) and refuses to splice stale messages. */
 	private async fillWindow(from: number, to: number): Promise<boolean> {
 		const requestedTo = to;
+		const sessionIdAtStart = this.sessionId;
 		try {
 			let msgs: any[] = [];
 			const cached = await getCachedChunks(this.sessionId, from, to);
@@ -445,8 +463,18 @@ export class ProxyAgent {
 				const re = Number(res.headers.get("x-range-to-seq") || to);
 				const count = Number(res.headers.get("x-session-message-count") || 0);
 				const rsq = Number(res.headers.get("x-session-mutate-epoch") || 0);
+				const rwr = Number(res.headers.get("x-rewritten-from") || Number.MAX_SAFE_INTEGER);
+				const sparse = (this.state as any).sparse as { rewriteSeq: number } | undefined;
+				if (sparse && rsq !== sparse.rewriteSeq) {
+					// STALE GENERATION (grok #6): the transcript was rewritten since our
+					// attach — drop cached chunks (the server's rewrittenFrom says which
+					// ranges survive) and refuse to splice stale messages
+					console.warn("[backfill] stale epoch (saw", sparse.rewriteSeq, "server", rsq, ") — invalidating cache");
+					try { await invalidateSession(this.sessionId); } catch { /* best-effort */ }
+					return false;
+				}
 				// cache write-through: the SAME raw gzip bytes into IDB (decompress on read)
-				try { await putChunk(this.sessionId, rs, re, rsq, count, new Blob([buf], { type: "application/gzip" })); } catch { /* cache is best-effort */ }
+				try { await putChunk(this.sessionId, rs, re, rsq, count, new Blob([buf], { type: "application/gzip" }), rwr); } catch { /* cache is best-effort */ }
 				const text = await gunzip(new Blob([buf], { type: "application/gzip" }));
 				if (text == null) { console.warn("[backfill] gunzip failed"); return false; }
 				msgs = text.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
@@ -454,11 +482,14 @@ export class ProxyAgent {
 				to = re;
 			}
 			// splice: PREPEND the older window to the dense array; filledFrom advances
-			// to the top of the RETURNED window. Race check against the REQUESTED top.
+			// to the top of the RETURNED window. Race check against the REQUESTED top
+			// AND the session (a switch must not mix windows into the wrong session).
 			const sp = (this.state as any).sparse;
-			if (!sp || sp.filledFrom !== requestedTo) { console.warn("[backfill] raced a rewrite — window dropped"); return false; }
+			if (!sp || sp.filledFrom !== requestedTo || this.sessionId !== sessionIdAtStart) { console.warn("[backfill] raced a rewrite/switch — window dropped"); return false; }
 			this.state.messages = [...msgs, ...this.state.messages];
 			sp.filledFrom = from;
+			sp.fromSeq = from; // LOCKSTEP (grok #2): the edit translation uses fromSeq —
+			// a frozen value would point edits at the wrong turn after any expand
 			this.notifyListeners({ type: "state-snapshot" });
 			return true;
 		} catch (err: any) { console.warn("[backfill] fillWindow failed:", err?.message || err); return false; }

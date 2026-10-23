@@ -349,7 +349,9 @@ const loadSession = async (sessionId: string): Promise<boolean> => {
 		// snapshot delivers messages + model — works from any device (the session
 		// list on the phone opens the same transcript the PC is streaming)
 		try {
-			const r = await fetch(`/api/agent/session/${encodeURIComponent(sessionId)}`, { signal: AbortSignal.timeout(8000) });
+			// ?meta=1: existence + counts ONLY — the old call downloaded the full
+			// 2-7.3MB body just to read j.exists (tail-first plan)
+			const r = await fetch(`/api/agent/session/${encodeURIComponent(sessionId)}?meta=1`, { signal: AbortSignal.timeout(8000) });
 			if (r.ok) {
 				const j = await r.json();
 				if (j.exists === false && !(Array.isArray(j.messages) && j.messages.length > 0)) {

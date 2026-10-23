@@ -2412,11 +2412,24 @@ app.get("/api/agent/continuation/:id", async (c) => {
 app.get("/api/agent/session/:id", async (c) => {
 	try {
 		const id = c.req.param("id");
+		// ?meta=1 (tail-first plan): metadata ONLY — the open-session flow just needs
+		// existence + counts; shipping the full 2-7.3MB body for a boolean was waste
+		const metaOnly = c.req.query("meta") === "1";
 		if (!agentHub.has(id)) {
 			const stored = await storeOp("get", { id });
 			if (stored?.metadata && stored?.messages) {
 				agentHub.getSession(id, { modelId: stored.metadata.modelId, thinkingLevel: stored.metadata.thinkingLevel, messages: stored.messages, rewriteSeq: stored.metadata.rewriteSeq, rewrittenFrom: stored.metadata.rewrittenFrom });
 			}
+		}
+		if (metaOnly) {
+			const st = agentHub.getState(id);
+			return c.json({
+				sessionId: id,
+				exists: !!st.exists,
+				messageCount: Array.isArray(st.messages) ? st.messages.length : 0,
+				rewriteSeq: st.rewriteSeq ?? 0,
+				rewrittenFrom: st.rewrittenFrom ?? 0,
+			});
 		}
 		const state = agentHub.getState(id);
 		const payload = JSON.stringify({ sessionId: id, ...state });
@@ -2459,19 +2472,22 @@ app.get("/api/agent/session/:id/range", async (c) => {
 			fromSeq = from;
 			toSeq = Infinity;
 		}
-		// cap uncompressed JSON at 1MB per response (BACKFILL_BYTES)
+		// cap uncompressed JSON at 1MB per response — KEEP THE HIGH END (grok review
+		// 01a16a54): expand/tail windows must stay ADJACENT to the loaded tail
+		// (filledFrom). Dropping low seqs (not high) prevents seq gaps next to the
+		// dense window. At least one message is always kept.
 		const range = agentHub.getRange(id, { fromSeq, toSeq });
 		if (!range) return c.json({ error: "session not found" }, 404);
 		const MAX = 1024 * 1024;
-		let bytes = 0, end = range.fromSeq;
-		while (end < range.toSeq) {
-			let sz = 0;
-			try { sz = JSON.stringify(range.messages[end - range.fromSeq]).length; } catch { sz = 256; }
-			if (bytes + sz > MAX && end > range.fromSeq) break;
+		let bytes = 0, start = range.toSeq;
+		while (start > range.fromSeq) {
+			let sz = 256;
+			try { sz = JSON.stringify(range.messages[start - 1 - range.fromSeq]).length; } catch { }
+			if (bytes + sz > MAX) break;
 			bytes += sz;
-			end++;
+			start--;
 		}
-		const slice = range.messages.slice(0, end - range.fromSeq);
+		const slice = range.messages.slice(start - range.fromSeq);
 		const ndjson = slice.map((m) => JSON.stringify(m)).join("\n");
 		const gz = zlib.gzipSync(ndjson);
 		return c.body(gz, slice.length === 0 ? 204 : 200, {
@@ -2479,8 +2495,8 @@ app.get("/api/agent/session/:id/range", async (c) => {
 			"X-Pi-Encoding": "gzip",
 			"X-Session-Mutate-Epoch": String(range.rewriteSeq),
 			"X-Session-Message-Count": String(range.messageCount),
-			"X-Range-From-Seq": String(range.fromSeq),
-			"X-Range-To-Seq": String(range.fromSeq + slice.length),
+			"X-Range-From-Seq": String(start),
+			"X-Range-To-Seq": String(range.toSeq),
 			"X-Rewritten-From": String(range.rewrittenFrom),
 			Vary: "Accept-Encoding",
 		});

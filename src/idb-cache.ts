@@ -41,7 +41,7 @@ export interface IdbMeta {
 	sessionId: string;
 	rewriteSeq: number;
 	messageCount: number;
-	ranges: Array<{ fromSeq: number; toSeq: number }>; // sorted, disjoint
+	ranges: Array<{ fromSeq: number; toSeq: number; bytes?: number }>; // sorted, disjoint; bytes per chunk (LRU)
 	totalBytes: number;
 }
 
@@ -52,6 +52,7 @@ const writeQueues = new Map<string, Promise<unknown>>();
 
 function withTimeout<T>(op: (db: IDBDatabase) => Promise<T>): Promise<T | null> {
 	if (degraded || !("indexedDB" in window)) return Promise.resolve(null);
+	const MISS = Symbol("miss"); // sentinel: op itself failed/threw — distinct from a null RESULT
 	dbPromise ??= new Promise<IDBDatabase>((resolve, reject) => {
 		const req = indexedDB.open(DB_NAME, DB_VERSION);
 		req.onupgradeneeded = () => {
@@ -66,12 +67,16 @@ function withTimeout<T>(op: (db: IDBDatabase) => Promise<T>): Promise<T | null> 
 		req.onerror = () => reject(req.error);
 		req.onblocked = () => reject(new Error("idb blocked by another tab"));
 	});
-	const slow = new Promise<null>((resolve) => setTimeout(() => resolve(null), OP_TIMEOUT_MS));
+	let timedOut = false;
+	const slow = new Promise<null>((resolve) => setTimeout(() => { timedOut = true; resolve(null); }, OP_TIMEOUT_MS));
 	return Promise.race([
 		dbPromise.then((db) => op(db)).catch(() => null),
 		slow,
 	]).then((r) => {
-		if (r === null) {
+		// ONLY a timeout (or thrown op) counts as failure — a successful op may
+		// legitimately return null/undefined (grok review 01a16a54 #3: putChunk's
+		// `return null` used to trip the circuit after 3 successful warms)
+		if (timedOut || r === MISS) {
 			if (++failureStreak >= CIRCUIT_THRESHOLD) degraded = true; // stop trying until next page load
 			return null;
 		}
@@ -116,25 +121,23 @@ export async function cachedRanges(sessionId: string): Promise<Array<{ fromSeq: 
 	return meta?.ranges ?? [];
 }
 
-/** Get CACHED decompressed message arrays intersecting [from,to) — returns the
- *  windows found (never fetches). Caller fetches intervalDiff(cached) gaps. */
+/** Get CACHED decompressed message arrays covering [from,to) ENTIRELY — returns
+ *  [] when any part of the window is a hole (grok review 01a16a54 #4: the old
+ *  check was inverted — the cache could never hit). Ranges are 1:1 with chunk
+ *  records (no merging — a merged meta range would read only its first blob). */
 export async function getCachedChunks(sessionId: string, from: number, to: number): Promise<Array<{ fromSeq: number; toSeq: number; messages: any[] }>> {
 	const result = await withTimeout(async (db) => {
 		const meta = await coverage(sessionId);
 		if (!meta) return [];
-		const covered = intervalDiff(from, to, meta.ranges);
-		const needed: Array<{ fromSeq: number; toSeq: number }> = [];
-		let cursor = from;
-		for (const h of covered) { if (h.fromSeq > cursor) needed.push({ fromSeq: cursor, toSeq: h.fromSeq }); cursor = h.toSeq; }
-		if (cursor < to) needed.push({ fromSeq: cursor, toSeq: to });
-		if (needed.length) return []; // some part of the asked window is a hole → caller must fetch anyway
+		const holes = intervalDiff(from, to, meta.ranges);
+		if (holes.length > 0) return []; // partial coverage → caller fetches the whole window
 		const out: Array<{ fromSeq: number; toSeq: number; messages: any[] }> = [];
 		for (const r of meta.ranges) {
 			if (r.toSeq <= from || r.fromSeq >= to) continue;
 			const rec = await txReq(db, [CHUNK_STORE], "readonly", (tx) => tx.objectStore(CHUNK_STORE).get([sessionId, r.fromSeq]) as IDBRequest<IdbChunk>);
-			if (!rec) continue;
+			if (!rec || rec.toSeq !== r.toSeq) return []; // ghost range (blob gone) → fetch instead
 			const text = await gunzip(rec.blob);
-			if (text == null) continue;
+			if (text == null) return [];
 			const msgs = text.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
 			out.push({ fromSeq: rec.fromSeq, toSeq: rec.toSeq, messages: msgs });
 		}
@@ -143,36 +146,46 @@ export async function getCachedChunks(sessionId: string, from: number, to: numbe
 	return result ?? [];
 }
 
-/** Put a fetched window: chunk blob + coverage union in ONE txn (a partial
- *  failure never claims a range it did not write). Serialized per session. */
-export async function putChunk(sessionId: string, fromSeq: number, toSeq: number, rewriteSeq: number, messageCount: number, gzipBlob: Blob): Promise<void> {
+/** Put a fetched window: chunk blob + coverage update in ONE readwrite txn (a
+ *  partial failure never claims a range it did not write). Ranges stay 1:1 with
+ *  chunk records — NO adjacent merging (a merged range would read only its
+ *  first blob, silently hiding messages — grok review 01a16a54 #5).
+ *  EPOCH GUARD: meta from an older rewriteSeq is dropped; ranges below
+ *  rewrittenFrom survive (same identity rule as the server). Serialized per
+ *  session; overwrites of the same key adjust totalBytes (no LRU inflation). */
+export async function putChunk(sessionId: string, fromSeq: number, toSeq: number, rewriteSeq: number, messageCount: number, gzipBlob: Blob, rewrittenFrom = Number.MAX_SAFE_INTEGER): Promise<void> {
 	const run = () => withTimeout(async (db) => {
 		const chunk: IdbChunk = { sessionId, fromSeq, toSeq, rewriteSeq, blob: gzipBlob, bytes: gzipBlob.size, storedAt: Date.now() };
-		const meta = (await coverage(sessionId)) || { sessionId, rewriteSeq, messageCount, ranges: [], totalBytes: 0 };
-		// union [fromSeq,toSeq) into ranges
-		const ranges = [...meta.ranges, { fromSeq, toSeq }].sort((a, b) => a.fromSeq - b.fromSeq);
-		const merged: Array<{ fromSeq: number; toSeq: number }> = [];
-		for (const r of ranges) {
-			const last = merged[merged.length - 1];
-			if (last && r.fromSeq <= last.toSeq) last.toSeq = Math.max(last.toSeq, r.toSeq);
-			else merged.push({ ...r });
-		}
-		const bytes = gzipBlob.size;
-		const nextMeta: IdbMeta = { sessionId, rewriteSeq, messageCount, ranges: merged, totalBytes: meta.totalBytes + bytes };
 		await new Promise<null>((resolve) => {
 			try {
 				const tx = db.transaction([META_STORE, CHUNK_STORE], "readwrite");
-				tx.objectStore(CHUNK_STORE).put(chunk);
-				tx.objectStore(META_STORE).put(nextMeta);
+				const metaReq = tx.objectStore(META_STORE).get(sessionId);
+				metaReq.onsuccess = () => {
+					let meta = metaReq.result as IdbMeta | undefined;
+					if (!meta) meta = { sessionId, rewriteSeq, messageCount, ranges: [], totalBytes: 0 };
+					if ((meta.rewriteSeq || 0) !== rewriteSeq) {
+						// EPOCH CHANGE: keep only ranges strictly below rewrittenFrom
+						const keep = rewrittenFrom >= Number.MAX_SAFE_INTEGER ? [] : meta.ranges.filter((r) => r.toSeq <= rewrittenFrom);
+						const keptBytes = keep.reduce((a, r) => a + (r.bytes || 0), 0);
+						meta = { sessionId, rewriteSeq, messageCount, ranges: keep, totalBytes: meta.totalBytes - keptBytes + gzipBlob.size };
+					} else {
+						// same epoch: replace an existing overlapping record's byte count
+						const old = meta.ranges.find((r) => r.fromSeq === fromSeq);
+						meta.totalBytes = Math.max(0, meta.totalBytes - (old?.bytes || 0) + gzipBlob.size);
+					}
+					const ranges = [...meta.ranges.filter((r) => r.fromSeq !== fromSeq && r.toSeq <= fromSeq || r.fromSeq >= toSeq), { fromSeq, toSeq, bytes: gzipBlob.size }].sort((a, b) => a.fromSeq - b.fromSeq);
+					tx.objectStore(CHUNK_STORE).put(chunk);
+					tx.objectStore(META_STORE).put({ ...meta, ranges });
+				};
 				tx.oncomplete = () => resolve(null);
 				tx.onerror = () => resolve(null);
 				tx.onabort = () => resolve(null);
 			} catch { resolve(null); }
 		});
 		await evictIfNeeded(db);
-		return null;
+		return true;
 	});
-	// serialize per session: latest-wins queue of length 1
+	// serialize per session: latest-wins queue (chained, bounded by put frequency)
 	const prev = writeQueues.get(sessionId) || Promise.resolve();
 	const next = prev.then(run, run).catch(() => null);
 	writeQueues.set(sessionId, next);
@@ -180,24 +193,26 @@ export async function putChunk(sessionId: string, fromSeq: number, toSeq: number
 }
 
 /** Drop ALL chunks of a session (rewrite invalidation when the client can't
- *  trust any cached range — e.g. epoch changed and no rewrittenFrom survived). */
+ *  trust any cached range — e.g. epoch changed and no rewrittenFrom survived).
+ *  Resolves on tx COMPLETE (the old version never resolved on the done path
+ *  and always rode the 2s timeout — grok review 01a16a54 #6). */
 export async function invalidateSession(sessionId: string): Promise<void> {
 	await withTimeout(async (db) => {
 		await new Promise<null>((resolve) => {
 			try {
 				const tx = db.transaction([META_STORE, CHUNK_STORE], "readwrite");
 				tx.objectStore(META_STORE).delete(sessionId);
-				const idx = tx.objectStore(CHUNK_STORE).index("byStoredAt");
-				// delete-by-prefix: open a cursor over chunks, remove this session's
-				const store = tx.objectStore(CHUNK_STORE);
-				const cursorReq = store.openCursor();
+				const range = IDBKeyRange.bound([sessionId, -Infinity], [sessionId, Number.MAX_SAFE_INTEGER]);
+				const cursorReq = tx.objectStore(CHUNK_STORE).openCursor(range);
 				cursorReq.onsuccess = () => {
 					const cur = cursorReq.result;
-					if (!cur) return;
-					const rec = cur.value as IdbChunk;
-					if (rec.sessionId === sessionId) cur.delete();
+					if (!cur) return; // tx.oncomplete resolves
+					cur.delete();
 					cur.continue();
 				};
+				tx.oncomplete = () => resolve(null);
+				tx.onerror = () => resolve(null);
+				tx.onabort = () => resolve(null);
 			} catch { resolve(null); }
 		});
 		return null;
@@ -205,41 +220,44 @@ export async function invalidateSession(sessionId: string): Promise<void> {
 }
 
 async function evictIfNeeded(db: IDBDatabase): Promise<void> {
-	const total = await txReq(db, [META_STORE], "readonly", (tx) => tx.objectStore(META_STORE).getAll() as IDBRequest<IdbMeta[]>);
-	if (!total || total.reduce((a, m) => a + m.totalBytes, 0) <= MAX_CACHE_BYTES) return;
-	// LRU: oldest storedAt chunks first, punching their range out of coverage
-	const oldest = await txReq(db, [CHUNK_STORE], "readonly", (tx) => tx.objectStore(CHUNK_STORE).index("byStoredAt").getAll() as IDBRequest<IdbChunk[]>);
-	if (!oldest) return;
-	const sorted = [...oldest].sort((a, b) => a.storedAt - b.storedAt);
-	for (const rec of sorted) {
-		const after = await txReq(db, [META_STORE], "readonly", (tx) => tx.objectStore(META_STORE).getAll() as IDBRequest<IdbMeta[]>);
-		if (after && after.reduce((a, m) => a + m.totalBytes, 0) <= MAX_CACHE_BYTES) break;
-		await withTimeout(async (db2) => {
-			await new Promise<null>((resolve) => {
-				try {
-					const tx = db2.transaction([META_STORE, CHUNK_STORE], "readwrite");
-					tx.objectStore(CHUNK_STORE).delete([rec.sessionId, rec.fromSeq]);
-					const metaReq = tx.objectStore(META_STORE).get(rec.sessionId);
-					metaReq.onsuccess = () => {
-						const m = metaReq.result as IdbMeta | undefined;
-						if (m) {
-							// punch [fromSeq,toSeq) out of ranges (split if middle)
-							const out: IdbMeta["ranges"] = [];
-							for (const r of m.ranges) {
-								if (r.toSeq <= rec.fromSeq || r.fromSeq >= rec.toSeq) { out.push(r); continue; }
-								if (r.fromSeq < rec.fromSeq) out.push({ fromSeq: r.fromSeq, toSeq: rec.fromSeq });
-								if (r.toSeq > rec.toSeq) out.push({ fromSeq: rec.toSeq, toSeq: r.toSeq });
-							}
-							tx.objectStore(META_STORE).put({ ...m, ranges: out, totalBytes: Math.max(0, m.totalBytes - rec.bytes) });
+	// ONE readwrite txn (grok review 01a16a54 #9 — the old version used nested
+	// timeouts + read-then-write across txns: a partial evict could abort the
+	// outer put, and two tabs could punch from stale meta)
+	await new Promise<null>((resolve) => {
+		try {
+			const tx = db.transaction([META_STORE, CHUNK_STORE], "readwrite");
+			const metasReq = tx.objectStore(META_STORE).getAll();
+			metasReq.onsuccess = () => {
+				const metas = (metasReq.result || []) as IdbMeta[];
+				let total = metas.reduce((a, m) => a + m.totalBytes, 0);
+				if (total <= MAX_CACHE_BYTES) return;
+				const chunksReq = tx.objectStore(CHUNK_STORE).index("byStoredAt").getAll();
+				chunksReq.onsuccess = () => {
+					const chunks = (chunksReq.result || []) as IdbChunk[];
+					for (const rec of chunks.sort((a, b) => a.storedAt - b.storedAt)) {
+						if (total <= MAX_CACHE_BYTES) break;
+						tx.objectStore(CHUNK_STORE).delete([rec.sessionId, rec.fromSeq]);
+						total = Math.max(0, total - rec.bytes);
+						const m = metas.find((x) => x.sessionId === rec.sessionId);
+						if (!m) continue;
+						// punch [fromSeq,toSeq) out of coverage (split if middle)
+						const out: IdbMeta["ranges"] = [];
+						for (const r of m.ranges) {
+							if (r.toSeq <= rec.fromSeq || r.fromSeq >= rec.toSeq) { out.push(r); continue; }
+							if (r.fromSeq < rec.fromSeq) out.push({ fromSeq: r.fromSeq, toSeq: rec.fromSeq });
+							if (r.toSeq > rec.toSeq) out.push({ fromSeq: rec.toSeq, toSeq: r.toSeq });
 						}
-					};
-					tx.oncomplete = () => resolve(null);
-					tx.onerror = () => resolve(null);
-				} catch { resolve(null); }
-			});
-			return null;
-		});
-	}
+						m.ranges = out;
+						m.totalBytes = Math.max(0, m.totalBytes - rec.bytes);
+						tx.objectStore(META_STORE).put(m);
+					}
+				};
+			};
+			tx.oncomplete = () => resolve(null);
+			tx.onerror = () => resolve(null);
+			tx.onabort = () => resolve(null);
+		} catch { resolve(null); }
+	});
 }
 
 /** Native DecompressionStream (Safari 16.4+/FF 113+/Chromium 80+). */
