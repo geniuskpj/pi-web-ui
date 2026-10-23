@@ -18,7 +18,8 @@
 //   5. auth/context errors are NOT retried (no quota burn)
 //   6. an ✎ edit whose resubmit hit a 429 KEEPS its parked version and continues
 //   7. retry refuses when nothing failed (never regenerates a healthy turn)
-import { registerFauxProvider, fauxAssistantMessage, fauxText } from "@earendil-works/pi-ai";
+// pi-ai 1.4.0: the faux provider + generic dispatcher live on the compat subpath
+import { registerFauxProvider, fauxAssistantMessage, fauxText } from "@earendil-works/pi-ai/compat";
 import { AgentHub } from "../agent-hub.mjs";
 
 let pass = 0, fail = 0;

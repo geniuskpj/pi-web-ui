@@ -1,7 +1,11 @@
 import { render } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { Agent, type AgentMessage, type AgentState } from "@earendil-works/pi-agent-core";
-import { getModel, type TextContent } from "@earendil-works/pi-ai";
+// pi-ai 1.4.0: getModel + the generic streamSimple moved to the compat subpath
+// (root only ships per-api modules now); TextContent still lives in root types
+import { getModel } from "@earendil-works/pi-ai/compat";
+import { streamSimple } from "@earendil-works/pi-ai/compat";
+import type { TextContent } from "@earendil-works/pi-ai";
 import { customConvertToLlm } from "./llm.js";
 import { makeId } from "./id.js";
 import { SessionListDialog } from "./ui/session-list.js";
@@ -249,6 +253,9 @@ const createAgent = async (initialState?: Partial<AgentState>) => {
 		? (Object.fromEntries(Object.entries(initialState).filter(([, v]) => v !== undefined)) as Partial<AgentState>)
 		: {};
 	agent = new Agent({
+		// pi-ai 1.4.0: streamFn is REQUIRED — start with the compat generic
+		// dispatcher; the proxy-aware streamFn below replaces it immediately
+		streamFn: streamSimple as any,
 		initialState: {
 			systemPrompt: piSystemPrompt || "You are a helpful AI assistant.",
 			model: bootModel,

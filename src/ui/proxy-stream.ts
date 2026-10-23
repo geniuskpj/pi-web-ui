@@ -16,7 +16,11 @@
 //   - clone-before-proxy: NEVER mutate the catalog model — proxy on→off must
 //     not leave it permanently proxied
 //   - options spread verbatim: signal/temperature/reasoning are never swallowed
-import { streamSimple, type Model } from "@earendil-works/pi-ai";
+// pi-ai 1.4.0: the generic streamSimple dispatcher (routes on model.api) moved
+// from the root to the compat subpath — compat also auto-registers the builtin
+// api providers on import
+import { streamSimple } from "@earendil-works/pi-ai/compat";
+import type { Model } from "@earendil-works/pi-ai";
 
 export function shouldUseProxyForProvider(provider: string | undefined, apiKey?: string): boolean {
 	switch ((provider || "").toLowerCase()) {
