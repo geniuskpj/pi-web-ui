@@ -16,9 +16,16 @@ Covers `src/main.tsx`, `src/ui/chat.tsx`, `src/storage.ts`, `src/local-storage-b
    anywhere since the prompt-viewer button was removed.)
 2. Theme class before first paint (`theme` = system|light|dark + `.dark` on `<html>`; matchMedia
    listener when in system mode).
-3. **fetch monkeypatch**: same-API = URL contains `/api/` or `/ws/`; attaches `x-pi-web-token` from
-   `localStorage["pi.webToken"]`; on 401 → one `window.prompt` → store + retry. **WebSocket patch**:
-   appends `?token=` for `/ws/*` paths (WS cannot set headers).
+3. **fetch monkeypatch** (`src/server-auth.ts`, 2026-10-23): same-API = URL contains `/api/` or
+   `/ws/`; attaches `x-pi-web-token` from `localStorage["pi.webToken"]`, then classifies the reply
+   into the auth state the shell renders: `ok`, `no-token` (bare 401 → ONE `window.prompt` → store +
+   replay), `bad-token` (401 WHILE a token is stored — never prompts in a loop), `host-blocked` (403;
+   the banner shows the server's own reason, e.g. "Host/Origin not allowlisted") and `offline`. Both
+   used to be SILENT (an empty session list with no message); now an amber banner in the App shell
+   (Retry/Settings buttons) plus an inline note in the session dialog explain them.
+   **WebSocket patch**: appends `?token=` for `/ws/*` paths (WS cannot set headers) — since
+   2026-10-23 the server accepts the query form on `/ws/*` ONLY, so the token cannot leak through
+   Referer/browser history/proxy logs on plain HTTP.
 4. `piSystemPrompt` = resolvePiSystemPrompt(): `/api/pi/system` → base = wins-flagged WEB_SYSTEM.md or
    SYSTEM.md, + wins-flagged APPEND_SYSTEM.md, joined; offline → undefined (chat default).
 5. `piServerTools` = fetchPiServerTools() — must be ready before Agent creation (tools are passed
@@ -63,9 +70,18 @@ Covers `src/main.tsx`, `src/ui/chat.tsx`, `src/storage.ts`, `src/local-storage-b
   re-stick and rubber-band during fast streams); re-stick near bottom (<10px).
 - 401 flow: on `agent_end` → `waitForIdle()` → inspect ONLY the last assistant message →
   `looksLikeAuthError` (401/403/invalid-key regex) → prompt → store via providerKeys.
-- Retry: resend the last user text as a NEW turn (never replay tool calls); before prompting, strip
-  dangling toolCall parts (no matching toolResult) from the last assistant message — tool_use without
-  tool_result is invalid for Anthropic/OpenAI-style APIs.
+- Retry (2026-10-23): the button delegates to the HUB (`agent.retry()` → `{type:"retry"}` →
+  `{type:"retried"}` ack; the run streams as normal agent events). The hub drops the 429/error message
+  and calls `agent.continue()`, so the failed model call is re-issued against the SAME transcript: the
+  user turn appears exactly once (the old version here called `prompt()` with the last user text, which
+  APPENDED a second user message) and tool calls that already completed are NOT re-run; a failed resubmit
+  of an ✎ edit keeps its parked version. The `?local=1` in-browser loop mirrors the semantics locally
+  (`agent.continue()` + the dangling-toolCall repair — tool_use without tool_result is invalid for
+  Anthropic/OpenAI-style APIs).
+- Auto-retry (2026-10-23): Settings → Retry (default ON, `localStorage pi.autoRetry`), pushed to the hub
+  after every attach (`{type:"set-auto-retry"}`). Only transient failures are retried (429/rate-limit/
+  quota/5xx/network), 3 attempts 3 s apart; the counter resets on success or any user action, and auth /
+  context-overflow errors are never retried. Progress shows in the runtime preview ("retrying (2/3)…").
 - Composer: Enter=send / Shift+Enter=newline, IME-safe (isComposing/229), draft persisted
   (`pi.web.draft`), auto-grow ≤200px, Send↔Stop with text labels, `sending` ref + a ≤1s busy-wait for
   `isStreaming` as the double-send guard. Attachments: text files inlined as fenced blocks with a fence

@@ -81,9 +81,11 @@ Downloads a PINNED package (`util-linux-2.40.2-2` from repo.msys2.org, sha256-pi
 ## Security
 
 - Upgrade: server.mjs token-gates non-loopback; the hub then enforces a strict **Origin allowlist**
-  (localhost, 127.0.0.1, [::1], hostname, non-internal IPv4s, `PI_WEB_TERM_ORIGIN` extras — port
-  appended) because WS has no CORS and DNS rebinding presents a mismatched Origin/Host pair; missing
-  Origin is allowed only for loopback.
+  (localhost, 127.0.0.1, [::1], hostname, non-internal IPv4s, `PI_WEB_TERM_ORIGIN` extras) because WS
+  has no CORS and DNS rebinding presents a mismatched Origin/Host pair; missing Origin is allowed only for
+  loopback. Since 2026-10-23 the comparison is PORT-INSENSITIVE (the hub receives bare hostnames —
+  `TERM_ALLOWED_ORIGINS = ALLOWED_NAMES` — so a TLS proxy's portless `Origin: https://name` matches an
+  entry stored as `name:PORT`, which was previously impossible).
 - Own `WebSocketServer` with `maxPayload = MAX_INPUT + 64KB` (the shared 25MB WSS would let one frame
   allocate 25MB/socket).
 - Session ids must be unguessable (`validSessionId`: ≥16 chars, not all digits/`-`/`_`) — the id is the

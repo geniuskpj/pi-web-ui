@@ -32,7 +32,7 @@ Browser (any device)                 Node server (:8787)
 |---|---|
 | `server.mjs` (1570 L) | Hono app: auth gate, REST, exec bridge, fs endpoints, LLM proxy, static serving, WS routing/upgrade, builtin tools (read/write/edit/bash), pi extension loader |
 | `terminal-hub.mjs` (998 L) | Pseudo-terminal hub: pty tier (msys2 `script.exe`) / pipes tier (`bash -i`), JSON-frame WS protocol, replay ring, session lifecycle |
-| `agent-hub.mjs` (263 L) | **Server-side agent sessions — the DEFAULT chat path**: Agent per session with in-process tools (builtin+pi extensions), effective system prompt, settings.json default model; subscribe-first attach, debounced persist, per-session SSE subscriber sets |
+| `agent-hub.mjs` | **Server-side agent sessions — the DEFAULT chat path**: Agent per session with in-process tools (builtin+pi extensions), effective system prompt, settings.json default model; subscribe-first attach, debounced persist, per-session SSE subscriber sets; `retry()` resumes a failed run AT THE FAILURE POINT (drop the error message → `agent.continue()`; no duplicated user turn, completed tools not re-run) with auto-retry (3×3 s) for rate-limit/network errors |
 | `session-worker.mjs` (89 L) | Worker-thread JSONL session store (atomic tmp+rename writes) |
 | `session-id.mjs` (5 L) | Shared `SESSION_ID_RE` (`^[A-Za-z0-9_-]{1,80}$`) used on both sides of the worker seam |
 | `build.mjs` (138 L) | esbuild bundle (`app-[hash].js`), hljs→lib/common alias, manifest.json, .br/.gz precompression, stale-bundle pruning |
@@ -115,17 +115,26 @@ refresh, `?session=` restore.
 - **Blanket gate**: every `/api/*` (except `/api/health`) from a **non-loopback** peer requires the
   token. Loopback peers are trusted unconditionally (OS boundary). Header `x-pi-web-token` by design —
   custom headers cannot be attached cross-origin, so CSRF is structurally impossible for browsers that
-  honor CORS. **Browser-origin gate (2026-10-21, r2)**: loopback trust is NOT a browser boundary (DNS
-  rebinding / `*.nip.io` make an attacker page same-origin over a loopback socket), so **every `/api/*`
-  route except `/api/health`** additionally requires the `Host` header AND the `Origin` header (when
-  present) to name a host in `ALLOWED_HOSTS` (localhost, 127.0.0.1, [::1], hostname, all LAN IPs v4+v6,
-  `PI_WEB_TERM_ORIGIN` extras; portless Host normalized, trailing dots stripped). Non-browser clients
-  send no Origin and are unaffected.
-- **Always-token endpoints** (even loopback): `POST /api/exec/tool` and `GET /api/ws/file` — content
-  execution/reading is a secrets oracle; drive-by simple POSTs (text/plain, no preflight) and
-  DNS-rebinding are named in the code as the reason. Contrast: `GET /api/pi/keys` (ALL provider keys),
-  `GET /api/ws/files` (listings), `/api/sessions` and `/api/debug/state` (audit tail) are blanket-gate
-  only — reachable after any loopback bypass.
+  honor CORS. **Browser-origin gate (2026-10-21 r2; retuned 2026-10-23)**: loopback trust is NOT a
+  browser boundary (DNS rebinding / `*.nip.io` make an attacker page same-origin over a loopback
+  socket), so the `Host` header AND the `Origin` header (when present) must name a host the server is
+  actually reachable on — `ALLOWED_HOSTS` (`host:port`) plus `ALLOWED_NAMES` (**bare hostnames**; the
+  comparison is port-insensitive, so `Origin: https://name` and a proxy-forwarded portless `Host` both
+  match, IPv6 bracketed, trailing dots stripped, a malformed Origin fails CLOSED, no suffix matching).
+  Strictness is `PI_WEB_ORIGIN_GATE`: **`auto` (default) applies the gate to LOOPBACK peers only** —
+  loopback is the one trust path that skips the token, so a rebinding page still arrives as loopback and
+  is still rejected, while a remote peer that presents the token may use ANY hostname (before this, every
+  custom DNS name needed `PI_WEB_TERM_ORIGIN` and a TLS proxy could never work at all); `strict` gates
+  every peer; `off` disables it and warns loudly at boot. Also 2026-10-23: the `?token=` query form is
+  accepted on `/ws/*` upgrades ONLY. Non-browser clients send no Origin and are unaffected.
+- **Always-token endpoints** (even from loopback, in any gate mode): `POST /api/exec/tool`,
+  `GET /api/pi/keys` (EVERY provider key — the strongest secrets oracle) and `GET /api/ws/file`
+  (content). Content execution and secret reads justify it: a drive-by page can send simple cross-origin
+  POSTs (text/plain, no preflight) and DNS-rebinding can reach loopback — the token header is unforgeable
+  cross-origin. Contrast (blanket gate only, i.e. loopback-friendly or valid-token): `GET /api/exec/tools`
+  (tool META, no execute), `GET /api/ws/files` (listings), `POST /api/pi/key` (one provider's key),
+  `/api/sessions` and `/api/debug/state` (audit tail). Asserted by `npm run test:security` (the
+  2026-10-23 rows run from a REAL non-loopback peer).
 - **WS**: `/ws/*` upgrades are token-gated for non-loopback in `server.mjs`; `/ws/terminal` ADDITIONALLY
   enforces a strict Origin allowlist (real hosts: localhost, 127.0.0.1, hostname, LAN IPs,
   `PI_WEB_TERM_ORIGIN` extras) inside the hub, because WS has no CORS and DNS-rebinding presents a
@@ -154,7 +163,8 @@ refresh, `?session=` restore.
 | `PI_WEB_BASH` / `PI_WEB_BASH_SHELL` | on / `C:\Git\usr\bin\bash.exe` | bash tool on/off + shell path |
 | `PI_WEB_TERM_COLS/LINES` | 110/32 | terminal grid clamp (40–240 / 10–120) |
 | `PI_WEB_TERM_BRIDGE` | auto | `0`/`pipes` forces pipe tier; path uses that bridge exe |
-| `PI_WEB_TERM_ORIGIN` | — | extra host[:port] entries for the terminal Origin allowlist |
+| `PI_WEB_TERM_ORIGIN` | — | extra names for the GLOBAL Host/Origin allowlist (every `/api/*` route + all three WS endpoints, not just the terminal); port-insensitive matching |
+| `PI_WEB_ORIGIN_GATE` | `auto` | origin-gate strictness: `auto` = loopback peers only (a valid token is enough for remote peers — this is what lets any domain work), `strict` = every peer, `off` = disabled (warns at boot) |
 | `PI_GIT_HOME` | — | override the Git root (terminal shell env; tar fallback in bridge provisioning) |
 | `PROXY_IDLE_MS` | 150000 | LLM proxy stall watchdog |
 | `PI_WEB_DEBUG` | off | verbose server logging |
