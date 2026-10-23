@@ -2233,6 +2233,13 @@ function agentConn(ws) {
 					break;
 				}
 
+				case "cancel-retry": {
+					// auto-retry UI (2026-10-24): cancel THIS pending retry only — auto-retry
+					// stays enabled. Attach-gated like retry (acts on the current session).
+					if (!currentSession) { safeSend(ws, { type: "error", id: m.id, error: "attach first" }); break; }
+					safeSend(ws, { type: "retry-cancelled", id: m.id, ...agentHub.cancelPendingRetry(currentSession) });
+					break;
+				}
 				case "fork": {
 					// llama.cpp-webui-style fork: clone the transcript prefix into a NEW
 					// session (original untouched); the client navigates to the new id

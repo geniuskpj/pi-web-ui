@@ -291,5 +291,62 @@ async function waitFor(fn, ms = 5000) {
 	check("dead-end: the retried answer landed", textOf(msgs[msgs.length - 1]).includes("recovered from the dead end"));
 }
 
+// --- 6) auto-retry UI: cancel + fire-time guards (user request 2026-10-24) ----
+// the pending retry must be VISIBLE (runtime.retry) and CANCELLABLE — and the
+// old bugs stay dead: disable cancels pending timers (A1), the callback rechecks
+// enabled/discarded/compacting at fire time, and a refusal burns NO attempt (A2).
+{
+	const { hub, faux } = makeHub();
+	hub.setAutoRetry({ enabled: true, attempts: 3, delayMs: 50 });
+	faux.setResponses([RATE_LIMIT()]);
+	const id = "retrytest0000000000000000000006";
+	hub.getSession(id, { messages: [] });
+	await hub.prompt(id, "hello");
+	const entry = hub.sessions.get(id);
+	// scheduled: runtime.retry is server-driven (every device renders the countdown)
+	const rt1 = hub.getRuntime(id);
+	check("pending retry ships on the runtime frame", rt1?.retry?.state === "scheduled" && rt1.retry.attempt === 1 && rt1.retry.attempts === 3 && typeof rt1.retry.retryAt === "number" && typeof rt1.retry.epoch === "number", JSON.stringify(rt1?.retry));
+	// CANCEL: this pending retry only — auto-retry stays enabled, attempt NOT burned
+	const rc = hub.cancelPendingRetry(id);
+	check("cancelPendingRetry ok", rc?.ok === true, JSON.stringify(rc));
+	check("cancel clears the runtime marker", hub.getRuntime(id)?.retry === undefined);
+	check("cancel does not burn the attempt", entry.retryAttempts === 0);
+	// a NEW failure still auto-schedules (auto-retry itself is still on)
+	faux.setResponses([RATE_LIMIT()]);
+	await hub.prompt(id, "again");
+	check("cancel keeps auto-retry enabled (next failure re-schedules)", hub.getRuntime(id)?.retry?.state === "scheduled" && hub.getRuntime(id)?.retry?.attempt === 1, JSON.stringify(hub.getRuntime(id)?.retry));
+}
+{
+	const { hub, faux } = makeHub();
+	hub.setAutoRetry({ enabled: true, attempts: 3, delayMs: 400 });
+	faux.setResponses([RATE_LIMIT()]);
+	const id = "retrytest0000000000000000000007";
+	hub.getSession(id, { messages: [] });
+	await hub.prompt(id, "hello");
+	check("(disable) pending before the timer fires", hub.getRuntime(id)?.retry?.state === "scheduled");
+	hub.setAutoRetry({ enabled: false }); // A1: must cancel the ALREADY-SCHEDULED timer
+	const callsAfterDisable = faux.calls ?? 0;
+	await new Promise((r) => setTimeout(r, 650)); // past the original fire time
+	check("disable cancels the pending retry (A1) — nothing fired", hub.sessions.get(id).retryPending === null && hub.getRuntime(id)?.retry === undefined && msgsOf(hub, id).at(-1)?.stopReason === "error", JSON.stringify(hub.getRuntime(id)?.retry));
+	check("disable cleared the retryNote", hub.sessions.get(id).retryNote === null);
+}
+{
+	const { hub, faux } = makeHub();
+	hub.setAutoRetry({ enabled: true, attempts: 3, delayMs: 30 });
+	faux.setResponses([RATE_LIMIT()]);
+	const id = "retrytest0000000000000000000008";
+	hub.getSession(id, { messages: [] });
+	await hub.prompt(id, "hello");
+	const entry = hub.sessions.get(id);
+	entry.compacting = true; // compaction starts AFTER scheduling, BEFORE firing
+	// waitMs = delayMs(30) + jitter(0-250) — poll instead of a fixed sleep
+	await waitFor(() => entry.retryPending === null && entry.retryNote === null);
+	check("fire-time compacting guard: NO attempt burned (A2)", entry.retryAttempts === 0 && entry.retryPending === null && entry.retryNote === null, JSON.stringify({ attempts: entry.retryAttempts, note: entry.retryNote }));
+	entry.compacting = false;
+	faux.setResponses([RATE_LIMIT()]);
+	await hub.prompt(id, "later");
+	check("budget intact — next failure is still attempt 1", hub.getRuntime(id)?.retry?.attempt === 1, JSON.stringify(hub.getRuntime(id)?.retry));
+}
+
 console.log(`\n[retry] ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

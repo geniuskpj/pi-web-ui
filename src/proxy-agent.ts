@@ -341,9 +341,21 @@ export class ProxyAgent {
 
 	/** Push the stored auto-retry preference to the hub (called after each attach). */
 	private pushAutoRetrySetting(): void {
-		let enabled = true;
-		try { enabled = localStorage.getItem("pi.autoRetry") !== "0"; } catch { /* private mode */ }
-		this.sendMsg({ type: "set-auto-retry", enabled });
+		let enabled = true, attempts = 3, delayMs = 3000;
+		try {
+			enabled = localStorage.getItem("pi.autoRetry") !== "0";
+			attempts = Math.max(0, Math.min(10, Number(localStorage.getItem("pi.autoRetryAttempts")) || 3));
+			delayMs = Math.max(1000, Math.min(60000, Number(localStorage.getItem("pi.autoRetryDelayMs")) || 3000));
+		} catch { /* private mode */ }
+		this.sendMsg({ type: "set-auto-retry", enabled, attempts, delayMs });
+	}
+
+	/** CANCEL the pending auto-retry of the attached session (auto-retry UI
+	 *  2026-10-24): the hub clears the timer + runtime marker; the broadcast
+	 *  runtime frame (retry gone) is the real ack for every device. */
+	async cancelRetry(): Promise<any> {
+		await this.whenReady(3000);
+		return this.sendAwait({ type: "cancel-retry" }, 8000);
 	}
 
 	cancelSteering(): void {

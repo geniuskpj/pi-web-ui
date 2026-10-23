@@ -255,6 +255,37 @@ function ToolRow({
 	);
 }
 
+/** Server-driven pending auto-retry (auto-retry UI 2026-10-24, sonnet-5 design):
+ *  countdown ticks locally from retryAt (epoch ms) — no server pushes needed;
+ *  when remaining hits 0 the label goes indeterminate until the runtime frame
+ *  resolves (the retry fired or was refused). Cancel cancels THIS pending retry
+ *  only (auto-retry stays enabled); Retry now dispatches immediately. */
+function RetryCountdown({ retryState, onCancel, onRetryNow }: { retryState: any; onCancel?: () => void; onRetryNow?: () => void }) {
+	const [, setNow] = useState(0);
+	useEffect(() => {
+		const id = setInterval(() => setNow((n: number) => n + 1), 250);
+		return () => clearInterval(id);
+	}, []);
+	const remaining = Math.max(0, (retryState.retryAt || 0) - Date.now());
+	const pct = retryState.delayMs ? Math.min(1, 1 - remaining / retryState.delayMs) : 1;
+	return (
+		<div class="pw-retry-pending">
+			<div class="pw-retry-countdown">
+				<span class="pw-retry-countdown-text">
+					{remaining > 0
+						? `Retrying in ${Math.ceil(remaining / 1000)}s — attempt ${retryState.attempt}/${retryState.attempts}`
+						: "Retrying…"}
+				</span>
+				<div class="pw-retry-countdown-bar" style={{ transform: `scaleX(${pct})` }} />
+			</div>
+			<div class="pw-retry-actions">
+				{onCancel && <button type="button" class="pw-retry-cancel" onClick={onCancel}>Cancel</button>}
+				{onRetryNow && <button type="button" class="pw-retry" onClick={onRetryNow}>Retry now</button>}
+			</div>
+		</div>
+	);
+}
+
 function AssistantBubble({
     message,
     streaming,
@@ -263,6 +294,9 @@ function AssistantBubble({
     partials,
     isLast,
     onRetry,
+    onRetryNow,
+    onCancelRetry,
+    retryState,
     dimmed,
 }: {
 	message: AssistantMessage;
@@ -272,9 +306,13 @@ function AssistantBubble({
 	partials?: Map<string, string>;
 	isLast?: boolean;
 	onRetry?: () => void;
+	onRetryNow?: () => void;
+	onCancelRetry?: () => void;
+	retryState?: any;
 	dimmed?: boolean;
 	}) {
 	const failed = message.stopReason === "error" || message.stopReason === "aborted";
+	const showScheduledRetry = failed && !streaming && isLast && retryState?.state === "scheduled" && !!onCancelRetry;
 	return (
 	 <div class={"pw-msg pw-assistant" + (failed ? " pw-failed" : "") + (dimmed ? " pw-will-replace" : "")}>
 			{message.content.map((part, i) => {
@@ -308,16 +346,25 @@ function AssistantBubble({
 						{message.stopReason === "aborted" ? "⏹ Aborted" : "⚠ Error"}
 						{message.errorMessage ? ` — ${message.errorMessage}` : ""}
 					</span>
-					{/* plan §2.7: Retry = resend last user message as a NEW turn — never
-					    replay tool calls; aborted ≠ error so Retry can't double-run a
-					    cancelled tool (§2.8 #8) */}
-					{!streaming && message.stopReason === "error" && isLast && onRetry && (
-						<button
-							class="pw-retry"
-							onClick={onRetry}
-						>
-							Retry
-						</button>
+					{/* auto-retry UI (2026-10-24): the pending retry renders INSIDE the error
+					    chrome (sonnet-5 design) — same row, same lifecycle; the countdown is
+					    server-driven (retryAt epoch) with Cancel (this pending retry only) and
+					    Retry now (immediate dispatch). Give-up shows its note + plain Retry. */}
+					{showScheduledRetry && (
+						<RetryCountdown retryState={retryState} onCancel={onCancelRetry} onRetryNow={onRetryNow || onRetry} />
+					)}
+					{!streaming && message.stopReason === "error" && isLast && !showScheduledRetry && (
+						<>
+							{retryState?.state === "given-up" && retryState.note && <span class="pw-retry-giveup-note">{retryState.note}</span>}
+							{onRetry && (
+								<button
+									class="pw-retry"
+									onClick={onRetry}
+								>
+									Retry
+								</button>
+							)}
+						</>
 					)}
 				</div>
 			)}
@@ -368,8 +415,11 @@ function MessageView(props: {
 	onCancelEdit?: () => void;
 	dimmed?: boolean;
 	onRetry?: () => void;
+	onRetryNow?: () => void;
+	onCancelRetry?: () => void;
+	retryState?: any;
 	onOpenFile?: (path: string) => void;
-}) {
+	}) {
 	const { message } = props;
 	if (message.role === "user") {
 		if ((message as any).isCompactionSummary) {
@@ -393,16 +443,19 @@ function MessageView(props: {
 	if (message.role === "assistant")
 	 return (
 	  <AssistantBubble
-	   message={message as AssistantMessage}
-	   streaming={!!props.streaming}
-	   toolResults={props.toolResults}
-	   pending={props.pending}
-	   partials={props.partials}
-	   isLast={props.isLast}
-	   onRetry={props.onRetry}
-	   dimmed={props.dimmed}
-	  />
-	 );
+	  message={message as AssistantMessage}
+	  streaming={!!props.streaming}
+	  toolResults={props.toolResults}
+	  pending={props.pending}
+	  partials={props.partials}
+	  isLast={props.isLast}
+	  onRetry={props.onRetry}
+	  onRetryNow={props.onRetryNow}
+	  onCancelRetry={props.onCancelRetry}
+	  retryState={props.retryState}
+	  dimmed={props.dimmed}
+	 />
+	);
 	if (message.role === "system-notification") return <NotificationLine message={message as SystemNotificationMessage} />;
 	// toolResult messages render inline inside their assistant toolCall row
 	return null;
@@ -562,7 +615,7 @@ function UsageBar({ agent, canCompact, compacting, onCompact, canVersions, versi
 // ----------------------------------------------------------------------------
 // ChatView
 // ----------------------------------------------------------------------------
-export function ChatView({ agent }: { agent: Agent }) {
+export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; retryState?: any; onCancelRetry?: () => void }) {
 	const [, setTick] = useState(0);
 	const scrollRef = useRef<HTMLDivElement>(null);
 	const stick = useRef(true);
@@ -979,9 +1032,12 @@ export function ChatView({ agent }: { agent: Agent }) {
 						onSaveEdit={saveEdit}
 						onCancelEdit={() => setEditingIdx(null)}
 						onRetry={retry}
+						onRetryNow={retry}
+						onCancelRetry={onCancelRetry}
+						retryState={retryState}
 						onOpenFile={openFileViewer}
-					/>
-					</Fragment>
+						/>
+						</Fragment>
 				))}
 					{state.streamingMessage ? (
 						<MessageView

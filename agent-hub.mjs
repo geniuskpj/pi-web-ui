@@ -281,7 +281,7 @@ export class AgentHub {
 					// on every user action (prompt/steer/abort/edit/retry), so it only ever
 					// chains consecutive failures of the same turn.
 					if (failed) this._maybeScheduleAutoRetry(entry, sessionId, lastA);
-					else { entry.retryAttempts = 0; entry.retryNote = null; }
+					else { entry.retryAttempts = 0; entry.retryNote = null; entry.retryGivenUp = false; entry.retryPending = null; }
 				}
 				const payload = { type: "agent-event", sessionId, seq: entry.seq, event };
 				// liveness heartbeat for the zombie self-heal (grok Q1): multi-turn runs
@@ -485,11 +485,42 @@ export class AgentHub {
 			attempts: Math.max(0, Math.min(10, Number(cfg.attempts ?? this.autoRetry?.attempts ?? 3) || 3)),
 			delayMs: Math.max(0, Math.min(60000, Number(cfg.delayMs ?? this.autoRetry?.delayMs ?? 3000) || 3000)),
 		};
+		// A1 (reviewer1 #3, user report "cannot cancel auto-retry"): disabling must
+		// also cancel ALREADY-SCHEDULED timers — the old code left entry.retryTimers
+		// running and the callbacks never re-checked `enabled`, so a disable during a
+		// 30 s Retry-After wait still fired. Cancel every session's pending retry.
+		if (!this.autoRetry.enabled) {
+			for (const [sid, e] of this.sessions) {
+				if (!e.retryPending && !e.retryTimer) continue;
+				this._cancelAutoRetry(e);
+				e.retryNote = null;
+				e.retryGivenUp = false;
+				this.emitRuntime(sid);
+			}
+		}
 		return { ...this.autoRetry };
 	}
 
+	/** Clear a session's pending auto-retry (timer + runtime marker + epoch bump).
+	 *  Pure state clear — callers own retryNote cleanup + emitRuntime. The epoch
+	 *  bump makes any timer callback that somehow still fires a no-op. */
 	_cancelAutoRetry(entry) {
 		if (entry?.retryTimer) { clearTimeout(entry.retryTimer); entry.retryTimer = null; }
+		if (entry?.retryPending) { entry.retryPending = null; entry.retryEpoch = (entry.retryEpoch || 0) + 1; }
+	}
+
+	/** CANCEL the pending auto-retry of one session (new WS "cancel-retry", UI
+	 *  Cancel button): cancels THIS pending retry only — auto-retry stays enabled
+		*  for future failures, and the failed turn stays as-is (plain error + Retry). */
+	cancelPendingRetry(sessionId) {
+		const entry = this.sessions.get(sessionId);
+		if (!entry) return { ok: false, reason: "no live session" };
+		const had = !!entry.retryPending || !!entry.retryTimer;
+		this._cancelAutoRetry(entry);
+		entry.retryNote = null;
+		entry.retryGivenUp = false;
+		this.emitRuntime(sessionId);
+		return { ok: true, cancelled: had };
 	}
 
 	/** Schedule ONE more attempt when a run died of a retryable error. Chained
@@ -502,21 +533,47 @@ export class AgentHub {
 		if (this.discarded.has(sessionId)) return;
 		if ((entry.retryAttempts || 0) >= cfg.attempts) {
 			entry.retryNote = `auto-retry gave up after ${cfg.attempts} attempt(s) — press Retry to try again`;
+			entry.retryGivenUp = true;
+			entry.retryPending = null;
 			this.emitRuntime(sessionId);
 			return;
 		}
-		entry.retryAttempts = (entry.retryAttempts || 0) + 1;
 		// Honour a provider-specified wait when the error carries one ("retry after 30",
 		// "retry-after: 30") — bounded to 30 s — and add a little jitter so N sessions that
 		// hit the same rate limit do not retry in lockstep (grok review 2026-10-23).
+		const nextAttempt = (entry.retryAttempts || 0) + 1;
 		const ra = /retry[- ]?after[^0-9]{0,6}(\d{1,3})/i.exec(String(failedMessage?.errorMessage || ""));
 		const waitMs = Math.max(cfg.delayMs, ra ? Math.min(30000, Number(ra[1]) * 1000) : 0) + Math.floor(Math.random() * 250);
-		entry.retryNote = `retrying (${entry.retryAttempts}/${cfg.attempts})…`;
-		this.emitRuntime(sessionId);
+		entry.retryNote = `retrying (${nextAttempt}/${cfg.attempts})…`;
+		entry.retryGivenUp = false;
 		this._cancelAutoRetry(entry);
+		const epoch = (entry.retryEpoch = (entry.retryEpoch || 0) + 1);
+		// RUNTIME EXPOSURE (auto-retry UI 2026-10-24): the pending retry ships on the
+		// runtime frame — every device renders the same server-driven countdown;
+		// retryAt (epoch ms) lets clients tick locally without server pushes.
+		entry.retryPending = { attempt: nextAttempt, attempts: cfg.attempts, retryAt: Date.now() + waitMs, delayMs: waitMs, epoch };
+		this.emitRuntime(sessionId);
 		entry.retryTimer = setTimeout(() => {
 			entry.retryTimer = null;
-			this.retry(sessionId, { reason: "auto" }).catch((err) => console.error(`[hub] auto-retry failed for ${sessionId}:`, err?.message || err));
+			// FIRE-TIME GUARDS (A2): enabled may have been flipped off, the session
+			// discarded or compaction started AFTER scheduling — re-check live, and an
+			// epoch mismatch means cancel/disable superseded this timer.
+			if (!this.autoRetry?.enabled || this.discarded.has(sessionId) || entry.compacting || entry.retryPending?.epoch !== epoch) {
+				entry.retryPending = null;
+				entry.retryNote = null;
+				this.emitRuntime(sessionId);
+				return; // NO attempt burned
+			}
+			entry.retryPending = null;
+			this.emitRuntime(sessionId);
+			// The attempt counter commits HERE, synchronously at dispatch (A2): the
+			// fire-time guards above already cleared refused cases (disabled/discarded/
+			// compacting), so a burn here is a real dispatch. Committing in .then()
+			// instead would lag behind the NEXT failure's agent_end (retry's promise
+			// resolves at run end) and the cap check would under-count → over-run.
+			entry.retryAttempts = nextAttempt;
+			this.retry(sessionId, { reason: "auto" })
+				.catch((err) => console.error(`[hub] auto-retry failed for ${sessionId}:`, err?.message || err));
 		}, waitMs);
 		if (typeof entry.retryTimer?.unref === "function") entry.retryTimer.unref();
 	}
@@ -595,7 +652,7 @@ export class AgentHub {
 		if (!entry) return { ok: false, reason: "no live session" };
 		if (entry.compacting) return { ok: false, reason: "compaction in progress — try again shortly" };
 		if (entry.agent.state.isStreaming) return { ok: false, reason: "a run is already streaming" };
-		if (reason !== "auto") { this._cancelAutoRetry(entry); entry.retryAttempts = 0; entry.retryNote = null; }
+		if (reason !== "auto") { this._cancelAutoRetry(entry); entry.retryAttempts = 0; entry.retryNote = null; entry.retryGivenUp = false; }
 		const dropped = this._dropFailedTail(entry);
 		// refuse when nothing failed — retry must never regenerate a healthy turn
 		if (dropped === 0) return { ok: false, reason: "nothing to retry (the transcript does not end in a failed turn)" };
@@ -1088,7 +1145,19 @@ export class AgentHub {
 			try { this.emitRuntime(sessionId); } catch { /* sink must not break reads */ }
 			console.log(`[hub] runtime zombie settled: ${sessionId} (last stop=${lastA?.stopReason || "none"} — no agent_end ever fired)`);
 		}
-		return { ...entry.runtime, sessionId, seq: entry.seq };
+		return { ...entry.runtime, sessionId, seq: entry.seq, ...this._retryRuntimeView(entry) };
+	}
+
+	/** The retry slice of the runtime frame (auto-retry UI 2026-10-24): pending
+	 *  countdown (server-driven, client ticks from retryAt) or the give-up note.
+	 *  Absent otherwise — presence is the signal, no boolean soup. */
+	_retryRuntimeView(entry) {
+		if (entry.retryPending) {
+			const p = entry.retryPending;
+			return { retry: { state: "scheduled", attempt: p.attempt, attempts: p.attempts, retryAt: p.retryAt, delayMs: p.delayMs, epoch: p.epoch } };
+		}
+		if (entry.retryGivenUp && entry.retryNote) return { retry: { state: "given-up", note: entry.retryNote } };
+		return {};
 	}
 
 	/** Authoritative force-settle: used by abort()/Kill — the terminal event may

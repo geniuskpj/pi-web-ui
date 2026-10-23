@@ -701,7 +701,7 @@ function App() {
 					)}
 				</div>
 			)}
-			{agent ? <ChatView agent={agent} /> : <div class="pw-chat" />}
+			{agent ? <ChatView agent={agent} retryState={currentSessionId ? runtime.get(currentSessionId)?.retry : undefined} onCancelRetry={() => { const a: any = agent; void a?.cancelRetry?.()?.catch?.(() => {}); }} /> : <div class="pw-chat" />}
 			{toast && <div class="pi-toast">{toast}</div>}
 			<AliveSessionsDialog
 				open={aliveOpen}
