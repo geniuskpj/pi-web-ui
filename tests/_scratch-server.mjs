@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(HERE, "..");
 
-export async function startScratchServer({ port = 9100 + Math.floor(Math.random() * 500), workspaceDir } = {}) {
+export async function startScratchServer({ port = 9100 + Math.floor(Math.random() * 500), workspaceDir, piDir } = {}) {
 	const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-test-"));
 	const wsDir = workspaceDir || fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-ws-"));
 	const proc = spawn(process.execPath, [path.join(ROOT, "server.mjs")], {
@@ -22,6 +22,7 @@ export async function startScratchServer({ port = 9100 + Math.floor(Math.random(
 			PI_WEB_PORT: String(port),
 			PI_WEB_DATA_DIR: dataDir,
 			PI_WS: wsDir,
+			...(piDir ? { PI_DIR: piDir } : {}),
 			PI_WEB_TERM_BRIDGE: "pipes", // no pty provisioning from tests
 		},
 		stdio: ["ignore", "pipe", "pipe"],

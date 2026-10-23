@@ -3,9 +3,6 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": {
-    "node": ">=22"
-  },
   "description": "Web UI for pi based on official @earendil-works/pi-web-ui dist (Preact shell, nvidia-only provider build)",
   "scripts": {
     "build": "node build.mjs",
@@ -16,6 +13,8 @@
     "build:debug": "node build.mjs --debug",
     "start:debug": "node build.mjs --debug && node server.mjs",
     "test": "node tests/term-smoke.mjs",
+    "test:provider-models": "node tests/provider-models.test.mjs",
+    "test:term-platform": "node tests/term-platform.test.mjs",
     "test:agent": "node tests/server-agent.e2e.mjs",
     "test:edit": "node tests/edit-tool.test.mjs",
     "test:security": "node tests/security-gates.test.mjs",
@@ -62,7 +61,11 @@
     "ollama": "file:stubs/empty"
   },
   "allowScripts": {
-    "esbuild@0.25.12": true
+    "esbuild@0.25.12": true,
+    "node-pty@1.1.0": true
+  },
+  "optionalDependencies": {
+    "node-pty": "^1.1.0"
   },
   "engines": {
     "node": ">=22"

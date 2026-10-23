@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * terminal-hub.mjs — pseudo-terminal bridge for the pi web UI, WITHOUT node-pty.
+ * terminal-hub.mjs — platform-aware terminal hub for the pi web UI.
  *
- * Strategy (Windows-first, zero native npm builds — every binary is prebuilt):
+ * Strategy:
  *
  *   tier "pipes" (fallback): `bash --noprofile --rcfile <rc> -i` over plain
  *                  pipes. Readline still runs: it ECHOES input, renders the
@@ -14,7 +14,7 @@
  *                  COLUMNS/LINES env hints. OSC 133/7 shell-integration
  *                  markers reach the client raw — wterm strips them, our
  *                  scanner reads exit codes + cwd from them.
- *   tier "pty" (default, auto-provisioned): msys2's util-linux `script.exe`
+ *   Windows pty (default, auto-provisioned): msys2's util-linux `script.exe`
  *                  (downloaded once into data/bin/script/, links only against
  *                  Git's own runtime) allocates a REAL msys pty and bridges our
  *                  stdio — bash gets /dev/ptyN: nano/vim pass the isatty check
@@ -25,6 +25,9 @@
  *                  (winpty is NOT usable: its CLI asserts headless —
  *                  winpty.cc:924, cols/rows=0 — because it expects an msys tty
  *                  (mintty), where msys fakes the console-size API.)
+ *   POSIX pty (opt-in): `node-pty` supplies a real pty when
+ *                  PI_WEB_TERM_BACKEND=node-pty; it is optional and dynamically
+ *                  loaded so installs without the native module remain bootable.
  *   neither:       the session starts in phase "error"; the UI explains.
  *
  * Protocol (JSON frames over /ws/terminal, one object per text message):
@@ -52,11 +55,23 @@
  * token gate runs in server.mjs BEFORE handleUpgrade is called.
  */
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { WebSocketServer } from "ws";
+import { createNodePtyBackend, selectTerminalBackend } from "./terminal-backends.mjs";
+
+let nodePtyModule = null;
+let nodePtyLoadError = null;
+if (process.platform !== "win32") {
+	try {
+		nodePtyModule = await import("node-pty");
+	} catch (err) {
+		nodePtyLoadError = err;
+	}
+}
 
 const MAX_SESSIONS = 6;
 const SESSION_TTL_MS = 15 * 60 * 1000; // detached idle lifetime (dead sessions expire even attached)
@@ -66,7 +81,7 @@ const MAX_INPUT = 64 * 1024; // per-frame stdin cap
 const FLUSH_MS = 30; // output coalescing window (readline emits tiny chunks fast)
 const FLUSH_FORCE_BYTES = 32 * 1024;
 const TERM_MAX_BUFFERED = 4 * 1024 * 1024; // per-socket outbound queue cap — CLOSE a lagging client, never drop frames
-const PTY_FALLBACK_MS = 4000; // opt-in bridge exited non-zero this fast → try pipes
+const PTY_FALLBACK_MS = 4000; // a pty backend exited non-zero this fast → try pipes
 const RESET_RECOVERY_MS = 1500; // exit event lost after taskkill → force respawn
 
 const TERM_COLS = Math.min(240, Math.max(40, Number(process.env.PI_WEB_TERM_COLS || 110)));
@@ -104,6 +119,11 @@ function gitRoots() {
 function findBash() {
 	const env = process.env.PI_WEB_BASH_SHELL;
 	if (env && fs.existsSync(env) && !isLegacyWslBash(env)) return env;
+	if (process.platform !== "win32") {
+		const shell = process.env.SHELL;
+		if (shell && path.basename(shell) === "bash" && fs.existsSync(shell)) return shell;
+		return fs.existsSync("/bin/bash") ? "/bin/bash" : null;
+	}
 	for (const root of gitRoots()) {
 		for (const sub of [path.join("usr", "bin", "bash.exe"), path.join("bin", "bash.exe")]) {
 			const p = path.join(root, sub);
@@ -119,6 +139,21 @@ function shellEnv(agentDir, gitRoot, sessCols, sessLines, workspaceDir) {
 	const key = Object.keys(process.env).find((k) => k.toLowerCase() === "path") ?? "PATH";
 	const cur = process.env[key] ?? "";
 	const entries = cur.split(path.delimiter).filter(Boolean);
+	if (process.platform !== "win32") {
+		const nodeDir = path.dirname(process.execPath);
+		const additions = [binDir, nodeDir].filter((dir) => !entries.includes(dir));
+		return {
+			...process.env,
+			[key]: [...additions, ...entries].join(path.delimiter),
+			HOME: process.env.HOME || process.env.USERPROFILE || os.homedir(),
+			SHELL: process.env.PI_WEB_BASH_SHELL || (path.basename(process.env.SHELL || "") === "bash" ? process.env.SHELL : "/bin/bash"),
+			TERM: "xterm-256color",
+			COLUMNS: String(sessCols),
+			LINES: String(sessLines),
+			PI_TERM_COLS: String(sessCols),
+			PI_TERM_LINES: String(sessLines),
+		};
+	}
 	// DEFAULTS before launching bash (user requirement): --noprofile skips
 	// /etc/profile, so replicate what a real Git Bash session gets. Verified
 	// against git-bash.exe → login shell (`bash -l -c env`): PATH head is
@@ -366,6 +401,7 @@ export function createTerminalHub({
 	let bridgePromise = null;
 	let bridgeNextTryAt = 0;
 	function ensureBridge() {
+		if (process.platform !== "win32") return null;
 		if (Date.now() < bridgeNextTryAt) return null;
 		if (!bridgePromise) {
 			bridgePromise = provisionScriptBridge(dataDir, debug)
@@ -385,6 +421,11 @@ export function createTerminalHub({
 		pathsResolved = true;
 		bashPath = findBash();
 		debug("[term] bash:", bashPath || "(none)");
+	}
+
+	const termBackendOverride = process.env.PI_WEB_TERM_BACKEND || "auto";
+	if (process.platform !== "win32" && !nodePtyModule && termBackendOverride !== "pipes") {
+		console.warn(`[term] node-pty unavailable; using pipes fallback${nodePtyLoadError ? `: ${nodePtyLoadError.message}` : ""}`);
 	}
 
 	// interactive bash rc: colored prompt wrapped in OSC 133;A/B markers,
@@ -618,12 +659,12 @@ export function createTerminalHub({
 			sess.resetTimer = null;
 		}
 		const elapsed = Date.now() - sess.spawnedAt;
-		// auto-fallback (opt-in winpty only): the bridge dying non-zero within 4s
-		// of spawn is a startup failure — a real shell exits 0 on "exit" and
+		// A pty backend dying non-zero within 4s of spawn is a startup failure —
+		// a real shell exits 0 on "exit" and
 		// never exits non-zero on its own otherwise
 		if (sess.tier === "pty" && !sess.fallbackTried && !sess.resetting && code !== 0 && elapsed < PTY_FALLBACK_MS) {
 			sess.fallbackTried = true;
-			debug("[term] pty bridge died instantly — falling back to pipe tier");
+			debug("[term] pty backend died instantly — falling back to pipes");
 			beginSpawn(sess, "pipes");
 			// banner WITHOUT the phase flip: the noise filter must stay armed
 			// until the new pipe-shell actually produces output
@@ -652,14 +693,29 @@ export function createTerminalHub({
 		if (!bashPath) {
 			sess.phase = "error";
 			sess.tier = null;
-			sess.error = "no bash found — install Git for Windows or set PI_WEB_BASH_SHELL";
+			sess.error = process.platform === "win32"
+				? "no bash found — install Git for Windows or set PI_WEB_BASH_SHELL"
+				: "no bash found — install bash or set PI_WEB_BASH_SHELL";
 			broadcast(sess, stateFrame(sess));
 			return;
 		}
 		const env = shellEnv(agentDir, gitRootFromBash(bashPath), sess.wantCols || TERM_COLS, sess.wantRows || TERM_LINES, workspaceDir);
+		const backend = tier === "pipes"
+			? "pipes"
+			: selectTerminalBackend(process.platform, termBackendOverride, Boolean(nodePtyModule));
+		if (backend === "invalid") {
+			sess.phase = "error";
+			sess.tier = null;
+			sess.error = `PI_WEB_TERM_BACKEND must be auto, node-pty, or pipes (got ${termBackendOverride})`;
+			broadcast(sess, stateFrame(sess));
+			return;
+		}
+		if (process.platform !== "win32" && termBackendOverride === "node-pty" && !nodePtyModule) {
+			debug("[term] requested node-pty backend unavailable; falling back to pipes");
+		}
 		// bridge decision at spawn time — provisioning may complete between spawns
 		let bridge = null;
-		{
+		if (process.platform === "win32") {
 			const override = bridgeOverride();
 			if (override === "pipes") bridge = null;
 			else if (override === "invalid") {
@@ -682,7 +738,21 @@ export function createTerminalHub({
 		const shUnsafe = (p) => /[$`"]/.test(String(p));
 		let proc;
 		try {
-			if (tier === "pty" && bridge && !shUnsafe(bashPath) && !(rcFile && shUnsafe(rcFile))) {
+			if (backend === "node-pty") {
+				const rc = ensureRcFile();
+				const args = ["--noprofile"];
+				if (rc) args.push("--rcfile", rc);
+				args.push("-i");
+				proc = createNodePtyBackend(nodePtyModule, {
+					shell: bashPath,
+					shellArgs: args,
+					cwd: workspaceDir,
+					env,
+					cols: sess.wantCols || TERM_COLS,
+					rows: sess.wantRows || TERM_LINES,
+				});
+				tier = "pty";
+			} else if (process.platform === "win32" && tier === "pty" && bridge && !shUnsafe(bashPath) && !(rcFile && shUnsafe(rcFile))) {
 				// msys pty bridge (msys2 util-linux script): a REAL /dev/ptyN for
 				// bash — nano/vim get isatty(stdin)=true, pty-native ONLCR, ^C.
 				// -c runs via sh → forward slashes + quoting; /dev/null typescript.
@@ -709,6 +779,7 @@ export function createTerminalHub({
 					cwd: workspaceDir,
 					env,
 					stdio: ["pipe", "pipe", "pipe"],
+					detached: process.platform !== "win32",
 					windowsHide: true,
 				});
 			}
@@ -734,8 +805,15 @@ export function createTerminalHub({
 		debug(`[term] session ${sess.id}: spawned ${tier} pid=${sess.pid} gen=${gen}`);
 
 		// every handler captures gen — a replaced/killed proc's events no-op.
-		// onlcr() emulates the pty line discipline (bare \n → \r\n) — without it
-		// the emulator staircase-offsets the cursor after every Enter.
+		// node-pty supplies the pty line discipline; the pipes tier emulates ONLCR.
+		if (proc.kind === "node-pty") {
+			proc.onData((data) => {
+				if (gen !== sess.gen || sess.destroyed) return;
+				feed(sess, data);
+			});
+			proc.onExit((code) => onShellExit(sess, gen, code));
+			return;
+		}
 		proc.stdout?.on("data", (buf) => {
 			if (gen !== sess.gen || sess.destroyed) return;
 			feed(sess, onlcr(sess, sess.decOut.write(buf)));
@@ -762,6 +840,10 @@ export function createTerminalHub({
 		if (!sess.proc || (sess.phase !== "ready" && sess.phase !== "starting")) return false;
 		if (!data) return true;
 		try {
+			if (sess.proc.kind === "node-pty") {
+				sess.proc.write(data);
+				return true;
+			}
 			if (sess.proc.stdin.writableLength > 1024 * 1024) {
 				debug("[term] input dropped (backpressure)");
 				return false;
@@ -900,7 +982,7 @@ export function createTerminalHub({
 			sessions.set(id, sess);
 			// spawnShell demotes to the pipe tier itself when no bridge is available
 			beginSpawn(sess, "pty");
-			void ensureBridge(); // provisioning may not have finished yet
+			void ensureBridge(); // Windows bridge provisioning may not have finished yet
 		}
 		// flush BEFORE adding the new socket: existing clients get the pending
 		// tail as a live frame, the new socket gets the same bytes in the replay
@@ -929,13 +1011,20 @@ export function createTerminalHub({
 				killShell(sess);
 			} else if (m.t === "r" || m.t === "ping") {
 				touch(sess);
-				// remember the client's latest grid: Restart/reset respawns the pty
-				// at this size (no live-resize channel into script.exe's pty)
+				// remember the client's latest grid: reset respawns at this size;
+				// node-pty also receives a live resize above.
 				if (m.t === "r") {
 					const c = clampDim(m.cols, 20, 500);
 					const r2 = clampDim(m.rows, 5, 200);
 					if (c) sess.wantCols = c;
 					if (r2) sess.wantRows = r2;
+					if (sess.proc?.kind === "node-pty" && c && r2) {
+						try {
+							sess.proc.resize(c, r2);
+						} catch (err) {
+							debug("[term] pty resize failed:", err?.message || err);
+						}
+					}
 				}
 				if (m.t === "ping") safeSend(ws, { t: "ping" });
 			}
@@ -980,7 +1069,7 @@ export function createTerminalHub({
 		wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 	}
 
-	void ensureBridge(); // provision the msys pty bridge ASAP (first use may already be live)
+	if (process.platform === "win32") void ensureBridge(); // provision early; first use may already be live
 
 	const sweeper = setInterval(() => {
 		const now = Date.now();

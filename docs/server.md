@@ -66,7 +66,7 @@ See [architecture.md](architecture.md) for the module map and trust-boundary sum
 |---|---|---|
 | `GET /api/health` | none | `{ok, bootId, buildId, piDir}` — buildId parsed from the hashed bundle filename |
 | `GET /api/version` | blanket | same ids |
-| `GET /api/pi/config` | blanket | re-reads `.pi/models-store.json` + `settings.json` → providers with models, defaults |
+| `GET /api/pi/config` | blanket | re-reads `.pi/models-store.json` + `settings.json` → providers with models, defaults; refreshes the live server-agent model store in place |
 | `GET /api/pi/system` | blanket | system-prompt resolution (below) |
 | `GET /api/pi/keys` | **always token** (2026-10-21) | **returns ALL provider keys from `.pi/auth.json`** — strongest secrets oracle; no client call path uses it |
 | `POST /api/pi/key` | blanket + env-TOKEN check | `{provider}` → that provider's key |
@@ -83,6 +83,12 @@ See [architecture.md](architecture.md) for the module map and trust-boundary sum
 | `WS /ws/sync`, `WS /ws/agent` | token for non-loopback at upgrade | hubs below |
 | `WS /ws/terminal` | token for non-loopback + hub Origin allowlist | see [terminal.md](terminal.md) |
 | `POST /api/agent/*`, `GET /api/agent/session/:id`, `GET /api/agent/events` (SSE) | blanket | server-side agent path |
+
+Custom provider models (including NVIDIA's OpenAI-compatible endpoint) come from
+`.pi/models-store.json`. pi-ai's `getModels(provider)` returns its generated built-in catalog; it
+does not discover custom providers such as `nvidia`. When `/api/pi/config` refreshes that file, it
+updates the existing `AgentHub.modelsStore` object in place so already-running server agents can
+resolve newly-added models as well as the browser picker.
 
 ## System-prompt resolution (`/api/pi/system`)
 
@@ -149,14 +155,15 @@ inside the mutation queue.
    `firstChangedLine`, `matchForm`. No-op (identical content) is an error.
 
 **bash**: spawn `BASH_PATH -c <cmd>` (verified constant path; `PI_WEB_BASH_SHELL` override), cwd =
-WORKSPACE_DIR, env = `getShellEnv()` (prepends PI bin dir, bash's dir — msys DLL resolution — and the
-running node's dir to PATH). Two sinks per stream: RAW-BYTE spill file (≤256MB, best-effort) and a
+WORKSPACE_DIR, env = `getShellEnv()` (prepends PI bin, Bash, and Node paths; Windows also prepends
+Git's runtime dirs for msys DLL resolution). Two sinks per stream: RAW-BYTE spill file (≤256MB, best-effort) and a
 StringDecoder ring tail (last 256KB, decoder carries multibyte across chunks). `pushPartial()` throttles
 `onUpdate` snapshots to 250 ms (first byte forced; harder 100-line/16KB cap). `waitForChildProcess()`
 (port of pi's): resolves on exit only after stdout/stderr end OR fall 100ms-idle (re-armed per chunk)
 — a detached descendant can't hang or lose its tail; single finalize guard. Abort/timeout (per-call
-`timeout` seconds, server clamp 600s) → `killProcessTree` via System32 `taskkill /F /T /PID` (PATH-
-independent, detached, errors consumed). Output sanitized of C0/UTF-8-ambiguous control chars.
+`timeout` seconds, server clamp 600s) → `killProcessTree` via System32 `taskkill /F /T /PID` on
+Windows or SIGTERM to the detached POSIX process group followed by SIGKILL after 2s. Output
+sanitized of C0/UTF-8-ambiguous control chars.
 Non-zero exits are NOT errors (`exit <code>` + details.exitCode); spawn-fail/timeout/abort →
 `isError:true` with partial output. Spill deleted when the inline tail is complete.
 

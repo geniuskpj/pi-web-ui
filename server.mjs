@@ -41,11 +41,13 @@ import util from "node:util";
 import { Agent } from "@earendil-works/pi-agent-core";
 import { AgentHub } from "./agent-hub.mjs";
 import { createTerminalHub } from "./terminal-hub.mjs";
+import { defaultBashPath } from "./terminal-backends.mjs";
+import { killProcessTree } from "./process-tree.mjs";
 import { stripBoilerplate } from "./lib/hp2.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, "public");
-const PI_DIR = path.resolve(process.env.PI_DIR || "C:/pi-windows-x64/.pi");
+const PI_DIR = path.resolve(process.env.PI_DIR || (process.platform === "win32" ? "C:/pi-windows-x64/.pi" : path.join(os.homedir(), ".pi")));
 const DATA_DIR = path.resolve(process.env.PI_WEB_DATA_DIR || path.join(__dirname, "data"));
 const PORT = Number(process.env.PORT || process.env.PI_WEB_PORT || 8787);
 const HOST = process.env.HOST || process.env.PI_WEB_HOST || "0.0.0.0";
@@ -450,7 +452,7 @@ function normalizePathArg(p) {
 	let s = String(p ?? "").trim();
 	s = s.replace(/^["'`“”‘’]+/, "").replace(/["'`“”‘’]+$/, "").trim();
 	if (s === "~" || s.startsWith("~/")) s = path.join(os.homedir(), s.slice(1));
-	const gm = s.match(/^\/(?:c|d|e)\/(.*)$/i); // Git Bash /c/...
+	const gm = process.platform === "win32" ? s.match(/^\/(?:c|d|e)\/(.*)$/i) : null; // Git Bash /c/...
 	if (gm) s = `${gm[0][1].toUpperCase()}:/${gm[1]}`;
 	s = s.replace(/\\{2,}/g, "\\"); // collapse over-escaped backslashes
 	return s;
@@ -495,17 +497,14 @@ function getShellEnv() {
 	const key = Object.keys(process.env).find((k) => k.toLowerCase() === "path") ?? "PATH";
 	const cur = process.env[key] ?? "";
 	const entries = cur.split(path.delimiter).filter(Boolean);
+	if (process.platform !== "win32") {
+		const add = [PI_BIN_DIR, path.dirname(BASH_PATH), path.dirname(process.execPath)].filter((d) => !entries.includes(d));
+		return { ...process.env, [key]: [...add, ...entries].join(path.delimiter) };
+	}
 	const add = [PI_BIN_DIR, path.dirname(BASH_PATH), path.dirname(process.execPath)].filter((d) => !entries.includes(d));
 	return { ...process.env, [key]: [...add, cur].filter(Boolean).join(path.delimiter) };
 }
 const sanitizeOutput = (s) => s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\uFFF9-\uFFFB]/g, "");
-function killProcessTree(pid) {
-	// System32 taskkill (PATH-independent), /F /T = tree; detached + consumed error
-	try {
-		const tk = spawn(path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"), ["/F", "/T", "/PID", String(pid)], { stdio: "ignore", detached: true, windowsHide: true });
-		tk.once("error", () => {});
-	} catch { /* ignore */ }
-}
 function waitForChildProcess(child, onSettled) {
 	// port of pi's waitForChildProcess: resolve on exit only after stdout/stderr pipes
 	// end or fall idle (100ms grace, re-armed per chunk) — a short-lived child can exit
@@ -732,7 +731,7 @@ function generateUnifiedPatch(pathArg, oldContent, newContent, contextLines = 4)
 // bash: verified working at C:\Git\usr\bin\bash.exe (portable Git at C:\Git —
 // NOT Program Files; bin\bash.exe silently fails to load msys DLLs from a bare
 // environment). Override with PI_WEB_BASH_SHELL if Git ever moves.
-const BASH_PATH = process.env.PI_WEB_BASH_SHELL || "C:\\Git\\usr\\bin\\bash.exe";
+const BASH_PATH = defaultBashPath(process.platform);
 const BASH_ENABLED = process.env.PI_WEB_BASH !== "0" && fs.existsSync(BASH_PATH); // on by default; PI_WEB_BASH=0 to disable
 const builtinTools = [
 	{
@@ -1118,7 +1117,7 @@ const builtinTools = [
 		// Mirrors pi-coding-agent dist/core/tools/bash.js + utils (shell.js, child-process.js,
 		// truncate.js, output-accumulator.js): Git Bash on Windows (ProgramFiles → where, skip
 		// legacy WSL bash; cmd.exe fallback so the tool still exists without Git), PATH prepend
-		// of PI bin dir (fd/rg), System32 taskkill process-tree kill, exit+pipe-idle wait so
+		// of PI bin dir (fd/rg), platform-specific process-tree kill, exit+pipe-idle wait so
 		// detached descendants don't hang us or lose their tail output (pi#5303), tail-truncate
 		// last 2000 lines / 50KB with full-output temp spill, control-char sanitization.
 		async execute(_id, params, signal, onUpdate) {
@@ -1127,7 +1126,7 @@ const builtinTools = [
 			const timeoutMs = params.timeout !== undefined ? toMs(params.timeout) : undefined;
 			// bash location is a verified constant (BASH_PATH) — no runtime discovery
 			if (!fs.existsSync(BASH_PATH)) throw new Error("bash not found at " + BASH_PATH + " — set PI_WEB_BASH_SHELL");
-			const child = spawn(BASH_PATH, ["-c", cmd], { cwd: WORKSPACE_DIR, env: getShellEnv(), stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+			const child = spawn(BASH_PATH, ["-c", cmd], { cwd: WORKSPACE_DIR, env: getShellEnv(), stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32", windowsHide: true });
 			// Two independent sinks for one data stream, neither lying about completeness:
 			//  - spill file: RAW BYTES streamed unconditionally (full capture, no decode issue)
 			//  - inline tail: StringDecoder ring (last 256KB decoded — decoder carries
@@ -1830,7 +1829,12 @@ function storeOp(op, payload = {}) {
 // --- agent hub (server-side agents) -------------------------------------------
 let piModelsStore = {};
 function refreshModelsStore() {
-	try { const j = readJsonSafe("models-store.json"); if (j && typeof j === "object") piModelsStore = j; } catch {}
+	const loaded = readJsonSafe("models-store.json");
+	if (!loaded || typeof loaded !== "object" || Array.isArray(loaded)) return;
+	for (const key of Object.keys(piModelsStore)) delete piModelsStore[key];
+	for (const [key, value] of Object.entries(loaded)) {
+		Object.defineProperty(piModelsStore, key, { value, enumerable: true, configurable: true, writable: true });
+	}
 }
 refreshModelsStore();
 

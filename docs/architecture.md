@@ -10,7 +10,7 @@ A browser UI for LLM chat on `@earendil-works/pi-agent-core` + `@earendil-works/
 **Hono** server (`server.mjs`) with **esbuild** bundling (no Vite). The **default chat path runs the
 agent loop SERVER-SIDE** (`agent-hub.mjs`, `/ws/agent`) — a run survives closing the browser/phone,
 and every attached device (PC/phone) sees the same live streaming events; the legacy in-browser loop
-remains behind `?local=1`. Runs on Windows (msys Git Bash); designed to also be used from
+remains behind `?local=1`. Runs on Windows (msys Git Bash) and Linux (Bash + optional node-pty); designed to also be used from
 phones over plain-http LAN (hence the secure-context fallbacks in `src/id.ts`).
 
 ```
@@ -31,7 +31,7 @@ Browser (any device)                 Node server (:8787)
 | File | Responsibility |
 |---|---|
 | `server.mjs` (1570 L) | Hono app: auth gate, REST, exec bridge, fs endpoints, LLM proxy, static serving, WS routing/upgrade, builtin tools (read/write/edit/bash), pi extension loader |
-| `terminal-hub.mjs` (998 L) | Pseudo-terminal hub: pty tier (msys2 `script.exe`) / pipes tier (`bash -i`), JSON-frame WS protocol, replay ring, session lifecycle |
+| `terminal-hub.mjs` | Pseudo-terminal hub: Windows msys2 `script.exe` / POSIX `node-pty` / pipes fallback, JSON-frame WS protocol, replay ring, session lifecycle |
 | `agent-hub.mjs` | **Server-side agent sessions — the DEFAULT chat path**: Agent per session with in-process tools (builtin+pi extensions), effective system prompt, settings.json default model; subscribe-first attach, debounced persist, per-session SSE subscriber sets; `retry()` resumes a failed run AT THE FAILURE POINT (drop the error message → `agent.continue()`; no duplicated user turn, completed tools not re-run) with auto-retry (3×3 s) for rate-limit/network errors |
 | `session-worker.mjs` (89 L) | Worker-thread JSONL session store (atomic tmp+rename writes) |
 | `session-id.mjs` (5 L) | Shared `SESSION_ID_RE` (`^[A-Za-z0-9_-]{1,80}$`) used on both sides of the worker seam |
@@ -89,7 +89,7 @@ refresh, `?session=` restore.
    new Agent WITH the loaded messages.
 4. **Tool exec (bash)**: chat → NDJSON stream frames (`partial` → UI-only partials map, throttled
    250 ms server-side; final `result`). Stop/abort → client aborts fetch → server sees `close` →
-   AbortController → taskkill /F /T the process tree.
+   AbortController → Windows taskkill or POSIX process-group termination.
 5. **Session status discovery (fable5 design, 2026-10-21)**: the hub keeps an in-memory runtime per
    session `{status: running|idle|error, startedAt, turn, currentTool, lastText (≤120-char preview),
    pendingPrompts}`. BOUNDARY events (agent_start/end, tool start/end) and assistant message_end emit a

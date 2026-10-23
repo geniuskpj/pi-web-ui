@@ -4,6 +4,11 @@ A browser UI for LLM chat built on `@earendil-works/pi-agent-core` + `@earendil-
 with a **self-contained Preact UI** (`src/ui/`), bundled by **esbuild** (no Vite, no
 pi-web-ui, no lit), served by a **Hono** server.
 
+The server supports Windows and Linux. Windows retains the Git Bash `script.exe`
+terminal bridge; Linux supports optional `node-pty` (enabled with
+`PI_WEB_TERM_BACKEND=node-pty` during rollout) and otherwise uses the pipe-based
+shell. Bash execution and process-tree shutdown are platform-aware.
+
 ```
 npm run build        # esbuild: src/main.tsx -> public/assets/ (hashed filenames + .br/.gz)
 npm run build:debug  # readable output + sourcemaps (for debugging)
@@ -45,7 +50,7 @@ claims without the raw source). Start with `architecture.md` — index + reading
 |---|---|
 | [`docs/architecture.md`](docs/architecture.md) | Big picture: module map (every file → responsibility), server + client boot sequences, the 5 core data flows (chat turn, persistence, session restore, bash exec, terminal), trust boundaries/auth model, env vars, known quirks |
 | [`docs/server.md`](docs/server.md) | `server.mjs` + `agent-hub.mjs` + `session-worker.mjs`: token auth, every REST endpoint, system-prompt/trust resolution, pi extension loader (shim + staging), the builtin tools' algorithms (`assertInsideRoots` realpath walk, the edit tool's 4-form match pipeline + line-fuzzy pass, bash spawn/spill/kill-tree), exec bridge (NDJSON streaming, audit), LLM proxy (stall watchdog), static serving, JSONL worker store, `/ws/sync` + `/ws/agent` hubs |
-| [`docs/terminal.md`](docs/terminal.md) | `terminal-hub.mjs` + `src/ui/terminal.tsx`: pty tier (auto-provisioned msys2 `script.exe`, sha256-pinned download) vs pipes tier (`bash -i` + ONLCR emulation), generated shell rc (OSC 133/7, adaptive PS1, stty), JSON frame protocol, session lifecycle (generation guards, reset recovery, TTL sweeper), Origin allowlist, and the client (wterm loader fallbacks, OSC scanner, mobile entry-bar diffing, click-to-move cursor math, key strip) |
+| [`docs/terminal.md`](docs/terminal.md) | `terminal-hub.mjs` + `src/ui/terminal.tsx`: Windows pty tier (msys2 `script.exe`), POSIX pty tier (`node-pty`) and pipes fallback (`bash -i` + ONLCR emulation), generated shell rc, JSON frame protocol, session lifecycle, Origin allowlist, and the client |
 | [`docs/client.md`](docs/client.md) | Browser side: `main.tsx` boot (fetch/WS token monkeypatch, agent creation, session save/load/delete lifecycle), `chat.tsx` rendering rules (markdown memo, partials map, retry repair), storage layer (LocalStorageBackend, `pi.key.*` fast tier), session-sync protocol, proxy/key resolution, `pi-tools.ts` NDJSON bridge, markdown/XSS pipeline, file explorer |
 
 ## Self-contained UI (replaces @earendil-works/pi-web-ui — plan.md)
@@ -61,7 +66,7 @@ claims without the raw source). Start with `architecture.md` — index + reading
 | Model selector | `src/ui/model-selector.tsx` | pi-config models only (no built-in catalog) |
 | Settings → Import from pi config | `src/ui/settings.tsx` | providers/defaults/key re-import (moved from the header 💾 button) |
 | **Workspace file explorer** | `src/ui/file-picker.tsx` | two-pane: file list (mtime-sorted, checkboxes for multi-select) + live preview (line numbers + syntax highlighting via hljs; images; prose); opens at `ws/` by default, remembers last dir |
-| **Terminal dock (no node-pty)** | `src/ui/terminal.tsx` + `terminal-hub.mjs` | wterm (prebuilt dist vendored to `public/vendor/wterm/`, lazy-loaded) in a bottom dock; server runs `bash -i` over pipes with a generated rc (readline gives echo/prompt/history/^C as a raw VT stream) — verified by `node term-smoke.mjs` (12 checks); ring-buffer replay, live exit codes via OSC 133, drag-resize; bash tool rows get "↗ terminal" |
+| **Terminal dock** | `src/ui/terminal.tsx` + `terminal-hub.mjs` | wterm in a bottom dock; Windows uses msys2 `script.exe`, Linux uses optional `node-pty` with a pipes fallback; ring-buffer replay, live exit codes via OSC 133, drag-resize; bash tool rows get "↗ terminal" |
 | **Attachments** | `chat.tsx` + `server.mjs` `/api/ws/*` | workspace files (no uploads): text files inlined as fenced blocks, images as ImageContent; clipboard image paste (MIME allowlist + 8MB cap); attached files are clickable chips in the composer AND on sent messages → reopen the explorer at that file |
 | Secure-context fallbacks | `src/id.ts` | `makeId()` (randomUUID → getRandomValues v4) + `copyText()` (clipboard → execCommand) — the UI works on `http://<LAN-IP>` |
 | Storage layer | `src/storage.ts` | store classes over LocalStorageBackend; `pi.key.*` fast tier built in |
@@ -172,7 +177,7 @@ Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
   navigates it (verified — the tab stays about:blank). The helper uses `Target.createTarget`
   over the browser-level WS + `Page.navigate` + `Page.loadEventFired` wait (pattern from
   ws/cdp_project's cdp.js/browser.js). Also the documented reason cdp_eval "open link" failed.
-- **Terminal dock (pseudo-terminal WITHOUT node-pty)**: the 🖥 header button (or "↗ terminal"
+- **Terminal dock**: the 🖥 header button (or "↗ terminal"
   on a bash tool row) opens a bottom dock running **wterm** — the PREBUILT `@wterm/dom` dist
   vendored into `public/vendor/wterm/` (`node vendor-wterm.mjs` downloads the npm tarballs and
   esbuild-bundles them into one self-contained ESM file with the ~26KB Zig WASM core inlined;
@@ -180,16 +185,21 @@ Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
   CDN URLs (esm.sh/jsdelivr) remain as runtime fallbacks only. The shell lives on the server
   (`terminal-hub.mjs`, WS `/ws/terminal`, JSON frames — replay ring 128KB on attach, output
   coalesced 30ms, idle TTL 15min, max 6 sessions, stdin cap 64KB):
-  - tier `pty` (default, auto-provisioned): **msys2 `script.exe`** allocates a REAL msys pty
+  - Windows tier `pty` (default, auto-provisioned): **msys2 `script.exe`** allocates a REAL msys pty
     and bridges our stdio — bash gets `/dev/ptyN`, so interactive TUIs work: `nano`/`vim` pass
     the isatty check (the old "standard input is not a terminal" is fixed — verified with a
     scripted nano session), pty-native ONLCR/echo/`^C`/job control, and the OSC 133/7 markers
     still pass through raw. The bridge is a 63KB exe downloaded ONCE from repo.msys2.org into
     `data/bin/script/` and links only against Git's own runtime (msys-2.0/intl/iconv, verified
-    via ldd) — no node-pty, no native builds, no compiler. The generated rc runs `stty cols/rows`
+    via ldd). The generated rc runs `stty cols/rows`
     so nano/vim get the right layout (script defaults the pty to 80x25).
     (Why not winpty: Git's bundled CLI — and upstream 0.4.3 — ASSERT headless, winpty.cc:924:
     its resize poll reads TIOCGWINSZ on a pipe → 0x0 → `winpty_set_size(0,0)`.)
+  - Linux tier `pty`: opt in during rollout with `PI_WEB_TERM_BACKEND=node-pty`; the optional
+    dependency supplies a real POSIX PTY, including live resize and terminal line discipline.
+    Linux defaults to pipes until the rollout is complete; `PI_WEB_TERM_BACKEND=pipes` forces that
+    fallback. If node-pty cannot load, startup warns and falls back to pipes. Install
+    `build-essential` and `python3` if npm must compile node-pty.
   - tier `pipes` (fallback, also used until provisioning finishes): `bash --noprofile --rcfile
     data/term-shell.rc -i` over pipes. Readline still runs — it echoes input, renders a colored
     prompt, handles arrow-key history redraws, `^C` (bell + abort) and multi-line continuations,
@@ -211,9 +221,11 @@ Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
     (hold-to-repeat on ↑/↓), and **click/tap-to-move the shell cursor** (click a
     character on the cursor's row → arrow-key deltas; pty tier, same-row rule).
     The strip/entry are desktop-hidden; a "Keys" head button toggles them.
-  - `node term-smoke.mjs`: boots a scratch server and drives /ws/terminal over a raw socket —
+  - `npm test`: boots a scratch server and drives /ws/terminal over a raw socket —
     cross-origin rejection, guessable-id rejection, attach → first prompt → echo round-trip →
     ONLCR (no bare `\n` reaches the emulator) → replay → reset → kill (12 checks).
+  - `npm run test:term-platform` verifies backend selection, shell discovery, the node-pty adapter,
+    and POSIX process-group termination. CI runs both terminal suites on Windows and Ubuntu.
   - Security: `/ws/terminal` inherits the non-loopback token gate AND enforces a strict Origin
     allowlist inside its own size-capped WSS (WS has no CORS — a drive-by page could otherwise
     dial the socket; DNS-rebinding presents a mismatched Origin/Host pair). 2026-10-21: the same
@@ -262,7 +274,8 @@ While it runs:
   (throttled to 250ms, first byte flushes immediately), then `✓` / `✗ error`. Click the row to
   expand full args + output. Output tail is capped at the last **2000 lines / 50KB** — if
   truncated, the full output is saved to a temp file whose path is returned.
-- **Stop** (or a session switch) kills the whole **process tree** (taskkill) — no orphaned
+- **Stop** (or a session switch) kills the whole **process tree** (`taskkill` on Windows, POSIX
+  process-group SIGTERM followed by SIGKILL) — no orphaned
   builds/dev-servers. An aborted/timeout command returns `isError: true` with the partial
   output attached.
 - **Timeout**: optional per-call (`timeout: <seconds>` — the model decides). The bash tool clamps
@@ -274,11 +287,9 @@ While it runs:
 Environment & resolution:
 
 - **cwd** = the workspace (`PI_WS`, or the parent of `PI_DIR`).
-- **Shell**: resolved ONCE at boot from a verified constant — `C:\Git\usr\bin\bash.exe`
-  on this machine (portable Git at `C:\Git`; `bin\bash.exe` silently fails to load msys DLLs
-  from a bare environment — the original "No bash found" + silent-output bugs). Override with
-  `PI_WEB_BASH_SHELL` (must be a `usr\bin\bash.exe`); a missing binary disables the tool with
-  a boot log line instead of failing every call.
+- **Shell**: resolved ONCE at boot — Git Bash at `C:\Git\usr\bin\bash.exe` on Windows and
+  `$SHELL` (when Bash) or `/bin/bash` on POSIX. Override with `PI_WEB_BASH_SHELL`; a missing
+  binary disables the tool with a boot log line instead of failing every call.
 - **PATH** gets pi's `bin/` prepended — `fd` and `rg` are available.
 
 Requirements & limits:

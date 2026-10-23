@@ -9,10 +9,8 @@ name: CI
 # stub-assertion proof), so the bundle is independent of how npm resolved them.
 #
 # Real-LLM suites (test:agent, test:steer, test:killstop) are deliberately NOT
-# run here: they need provider keys and minutes of wall time. The Windows-only
-# term-smoke and the bash-dependent compact/fork/shutdown suites stay local —
-# compact/fork DID pass on ubuntu in local runs, but they shell out to bash and
-# are excluded here to keep CI node-only and hermetic (same policy as the branch).
+# run here: they need provider keys and minutes of wall time. Terminal smoke and
+# platform-backend tests run on both Windows and Ubuntu to protect both paths.
 
 on:
   push:
@@ -63,3 +61,10 @@ jobs:
           npm run test:versions
       - name: "Tests (security gates — token + origin/Host allowlist)"
         run: npm run test:security
+
+      - name: "Tests (terminal platform + WebSocket smoke)"
+        env:
+          PI_WEB_TERM_BACKEND: node-pty
+        run: |
+          npm run test:term-platform
+          npm test

@@ -1,31 +1,35 @@
 # Terminal — terminal-hub.mjs + src/ui/terminal.tsx
 
-> Updated 2026-10-21 · See also: [architecture.md](architecture.md) (trust model) ·
+> Updated 2026-10-23 · See also: [architecture.md](architecture.md) (trust model) ·
 [server.md](server.md) (upgrade gating, exec bridge) · [client.md](client.md) (chat-side command bridge)
 
 Covers `terminal-hub.mjs` (server), `src/ui/terminal.tsx` (client dock), `src/ui/wterm-loader.ts`,
 `vendor-wterm.mjs`, `public/vendor/wterm/`.
 
-## Tiers (no node-pty, zero native builds)
+## Platform backends and tiers
 
-- **pty (default)**: msys2 util-linux `script.exe` allocates a REAL msys pty and bridges our stdio —
-  bash sees `/dev/ptyN`, so nano/vim pass isatty, and ONLCR/echo/^C/job-control are pty-native.
-  Winpty is NOT used: its CLI asserts headless (`winpty.cc:924` — resize poll reads TIOCGWINSZ on a
-  pipe → 0x0 → `winpty_set_size(0,0)`).
+- **Windows pty (default)**: msys2 util-linux `script.exe` allocates a REAL msys pty and bridges our
+  stdio — bash sees `/dev/ptyN`, so nano/vim pass isatty, and ONLCR/echo/^C/job-control are
+  pty-native. This path is unchanged. Winpty is NOT used: its CLI asserts headless (`winpty.cc:924`).
+- **POSIX pty (opt-in during rollout)**: `PI_WEB_TERM_BACKEND=node-pty` dynamically loads
+  `node-pty` and spawns Bash in a real PTY with live
+  resize. It is an optional native dependency; if it cannot be loaded, startup logs the error and
+  the hub falls back to pipes. POSIX defaults to pipes during rollout, and
+  `PI_WEB_TERM_BACKEND=pipes` forces that backend. If native compilation is needed, install
+  `build-essential` and `python3`.
 - **pipes (fallback)**: `bash --noprofile --rcfile <generated rc> -i` over plain pipes. Readline still
   echoes input, renders the PS1, redraws history, and handles `^C` — all as a raw VT stream. The hub
   emulates the two pty duties bash loses: **ONLCR** (`onlcr()` — state carries across chunk boundaries;
-  lone `\r` untouched) and a **default env** replicating `git-bash.exe`'s login shell (`shellEnv()`:
-  Git `usr/bin`+`mingw64/bin`+`bin` prepended, `HOME`, `SHELL=/usr/bin/bash`,
-  `MSYSTEM=MINGW64` + prefix/carch/chost, `TERM=xterm-256color`, `COLUMNS/LINES`,
-  `PI_TERM_COLS/LINES` for the rc's stty; node's dir is not prepended if it IS the workspace root).
+  lone `\r` untouched). Windows uses a Git Bash environment (`shellEnv()`: Git `usr/bin` +
+  `mingw64/bin` + `bin`, MSYSTEM variables); POSIX inherits the process environment and adds Bash,
+  Node, and pi tool paths plus HOME, TERM, COLUMNS/LINES, and PI_TERM_COLS/LINES.
 - Remaining gaps (pipes): no job control, native console programs see pipes, fixed grid.
-- Auto-fallback: the pty bridge dying non-zero within 4s of spawn (`PTY_FALLBACK_MS`) downgrades that
-  session to pipes once (`fallbackTried`); a pipes-started session may upgrade to pty on later respawns.
+- `PI_WEB_TERM_BACKEND` only selects the POSIX backend; Windows continues to use
+  `PI_WEB_TERM_BRIDGE` as before. A pipes-started session may upgrade to pty on later respawns.
 
 ## Bridge provisioning (`provisionScriptBridge`)
 
-Downloads a PINNED package (`util-linux-2.40.2-2` from repo.msys2.org, sha256-pinned constant,
+On Windows only, downloads a PINNED package (`util-linux-2.40.2-2` from repo.msys2.org, sha256-pinned constant,
 8MB cap), requires node zlib `zstdDecompressSync` (node ≥ 22.15), decompresses, extracts ONLY
 `usr/bin/script.exe` with **System32 tar** (never PATH-searched) into a unique tmp dir
 (`.tmp-<pid>-<ts>`), validates it (`bridgeUsable`: regular file, 8KB–2MB, `MZ` header), then
@@ -37,7 +41,8 @@ Downloads a PINNED package (`util-linux-2.40.2-2` from repo.msys2.org, sha256-pi
 
 - `HISTFILE=/dev/null` (web commands never land in the user's real history).
 - `stty cols $PI_TERM_COLS rows $PI_TERM_LINES` (fixes script.exe's 80x25 pty default; no-op without a
-  tty) + `kill -s WINCH $$` so readline re-reads the size it already snapshotted.
+  tty) + `kill -s WINCH $$` so readline re-reads the size it already snapshotted. node-pty additionally
+  applies the dimensions at spawn and on each client resize.
 - Adaptive PS1: grid ≥ 60 cols → `user:cwd` colored prompt; narrower → `\W$ ` only (readline redraw
   math breaks when PS1 exceeds the line width). Both wrapped in OSC `133;A`/`133;B`; raw ESC/BEL bytes
   embedded via single quotes (no `$''`).
@@ -62,7 +67,7 @@ Downloads a PINNED package (`util-linux-2.40.2-2` from repo.msys2.org, sha256-pi
 
 - `newSession(id)`: phase `starting`, empty ring, `StringDecoder`s for out/err, `onlcrCR` carry,
   `wantCols/wantRows` from the connect query.
-- `spawnShell(sess, tier)`: kill any live proc first (`killLive` derives the pid from the LIVE
+- `spawnShell(sess, tier)`: select Windows bridge / POSIX node-pty / pipes, kill any live proc first (`killLive` derives the pid from the LIVE
   `sess.proc` so a nulled `sess.pid` can't leak the old bash), `gen += 1`, decide the bridge at spawn
   time (provisioning may have finished), spawn with `windowsHide`, wire stdout/stderr (ONLCR + stderr
   startup-noise filter for the two known bash warnings — literal prefixes only, held only while the

@@ -12,10 +12,11 @@
  *
  * Usage: node tests/term-smoke.mjs   (spawns + kills its own server on a random :87xx port)
  */
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
+import { killProcessTree } from "../process-tree.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // random scratch port: leftover listeners from a previous crashed run must not
@@ -38,11 +39,7 @@ function check(name, ok, extra = "") {
 }
 
 function killTree(pid) {
-	try {
-		spawnSync(path.join(process.env.SystemRoot || "C:\\Windows", "System32", "taskkill.exe"), ["/F", "/T", "/PID", String(pid)], { stdio: "ignore" });
-	} catch {
-		/* ignore */
-	}
+	killProcessTree(pid);
 }
 
 /** Open a terminal WS and collect frames until `done` says stop. */
@@ -111,6 +108,7 @@ async function main() {
 	console.log(`[smoke] booting server on :${PORT} …`);
 	const server = spawn(process.execPath, [path.join(HERE, "..", "server.mjs")], {
 		env: { ...process.env, PORT: String(PORT), PI_WEB_PORT: String(PORT), PI_WEB_DEBUG: "1" },
+		detached: process.platform !== "win32",
 		stdio: ["ignore", "pipe", "pipe"],
 	});
 	let serverLog = "";
@@ -151,7 +149,7 @@ async function main() {
 			check("terminal attached", conn.why === "open");
 			const st = await conn.waitFor((m) => m.t === "state" && (m.s.phase === "ready" || m.s.phase === "error" || m.s.phase === "dead"));
 			check("shell reached a phase", !!st, `tier=${conn.state.tier} phase=${conn.state.phase} err=${conn.state.error || "-"}`);
-			check("tier is pty (msys bridge) or pipes (fallback — bridge provisioning is async)",
+			check("tier is pty backend or pipes fallback",
 				conn.state.tier === "pipes" || conn.state.tier === "pty", `tier=${conn.state.tier}`);
 			const prompt = await conn.waitFor((m) => (m.t === "d" || m.t === "replay") && String(m.d || "").includes("$"), 8000);
 			check("first prompt reaches the client (not swallowed by the noise filter)", !!prompt);
