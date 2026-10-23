@@ -39,6 +39,11 @@ import { WebSocketServer } from "ws";
 import { Agent as UndiciAgent, fetch as undiciFetch } from "undici";
 import util from "node:util";
 import { Agent } from "@earendil-works/pi-agent-core";
+// pi-ai 1.4.0: AgentOptions.streamFn is REQUIRED (compat generic dispatcher)
+import { streamSimple } from "@earendil-works/pi-ai/compat";
+// pi-ai 1.4.0 builtin catalog — the no-.pi fallback for the model list (5.6KB
+// aggregation module; the per-provider model data loads alongside it)
+import { getBuiltinProviders, getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { AgentHub } from "./agent-hub.mjs";
 import { createTerminalHub } from "./terminal-hub.mjs";
 import { defaultBashPath } from "./terminal-backends.mjs";
@@ -112,8 +117,32 @@ function piConfig() {
 		if (models.length === 0) continue;
 		providers.push({ name, baseUrl: models.find((m) => m.baseUrl)?.baseUrl || "", models });
 	}
+	// CATALOG FALLBACK (user request 2026-10-24): a deploy without .pi (no
+	// models-store.json, or one with no providers) used to boot with ZERO models —
+	// an empty picker that could never chat. pi-ai 1.4.0 ships a maintained builtin
+	// catalog (providers/all — 42 providers, records in exactly the models-store
+	// shape), so seed from it. Options considered: (2) REST GET {baseUrl}/models
+	// discovery — needs a key + network and returns bare ids without metadata
+	// (context window, reasoning flags) — rejected; (3) a backup-model-store.json
+	// in the repo — static, goes stale, duplicates upstream data — rejected. The
+	// builtin catalog is upstream-maintained, offline and key-free. Store entries
+	// ALWAYS win when present: they may carry custom ids/baseUrls the catalog lacks.
+	let catalogFallback = false;
+	if (providers.length === 0) {
+		try {
+			for (const name of getBuiltinProviders()) {
+				const models = getBuiltinModels(name);
+				if (models.length === 0) continue;
+				providers.push({ name, baseUrl: models.find((m) => m.baseUrl)?.baseUrl || "", models });
+			}
+			catalogFallback = providers.length > 0;
+		} catch (err) {
+			console.error("[pi-web] builtin model catalog unavailable:", err?.message || err);
+		}
+	}
 	return {
 		providers,
+		modelSource: providers.length === 0 ? "none" : catalogFallback ? "builtin-catalog" : "models-store",
 		defaults: {
 			provider: settings.default_provider || settings.defaultProvider || undefined,
 			model: settings.default_model || settings.defaultModel || undefined,
@@ -1828,13 +1857,32 @@ function storeOp(op, payload = {}) {
 
 // --- agent hub (server-side agents) -------------------------------------------
 let piModelsStore = {};
+// CATALOG FALLBACK for the HUB too: _getModel iterates modelsStore[provider].models,
+// so a missing .pi would leave even the /api/pi/config fallback powerless (the picker
+// would list models the hub refuses to run). Same precedence: store entries win.
+function builtinModelsStore() {
+	try {
+		const out = {};
+		for (const name of getBuiltinProviders()) {
+			const models = getBuiltinModels(name);
+			if (models.length === 0) continue;
+			out[name] = { name, models };
+		}
+		return out;
+	} catch (err) {
+		console.error("[pi-web] builtin model catalog unavailable:", err?.message || err);
+		return {};
+	}
+}
 function refreshModelsStore() {
 	const loaded = readJsonSafe("models-store.json");
-	if (!loaded || typeof loaded !== "object" || Array.isArray(loaded)) return;
-	for (const key of Object.keys(piModelsStore)) delete piModelsStore[key];
-	for (const [key, value] of Object.entries(loaded)) {
-		Object.defineProperty(piModelsStore, key, { value, enumerable: true, configurable: true, writable: true });
+	if (loaded && typeof loaded === "object" && !Array.isArray(loaded)) {
+		for (const key of Object.keys(piModelsStore)) delete piModelsStore[key];
+		for (const [key, value] of Object.entries(loaded)) {
+			Object.defineProperty(piModelsStore, key, { value, enumerable: true, configurable: true, writable: true });
+		}
 	}
+	if (Object.keys(piModelsStore).length === 0) Object.assign(piModelsStore, builtinModelsStore());
 }
 refreshModelsStore();
 
@@ -1863,6 +1911,7 @@ const agentHub = new AgentHub({
 	// off. Structured checkpoint format mirrors pi's SUMMARIZATION_PROMPT.
 	summarize: async ({ model, serialized, previousSummary, signal }) => {
 		const summaryAgent = new Agent({
+			streamFn: streamSimple, // pi-ai 1.4.0: streamFn required
 			initialState: {
 				model,
 				thinkingLevel: "off",
