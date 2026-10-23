@@ -65,6 +65,8 @@ credentials*.json
 Thumbs.db
 desktop.ini
 
+# scratch session transcripts — two leaked into history on 2026-10-23 and had to be
+# stripped with filter-branch; a third (tmp-lfp.json) appeared afterwards — never track these.
 # scratch probe output (P1 review 2026-10-23: two transcript dumps rode `git add -A`)
 tmp-*.json
 commit-review-*.md
