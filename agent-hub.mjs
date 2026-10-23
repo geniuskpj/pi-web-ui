@@ -502,13 +502,18 @@ export class AgentHub {
 			return;
 		}
 		entry.retryAttempts = (entry.retryAttempts || 0) + 1;
+		// Honour a provider-specified wait when the error carries one ("retry after 30",
+		// "retry-after: 30") — bounded to 30 s — and add a little jitter so N sessions that
+		// hit the same rate limit do not retry in lockstep (grok review 2026-10-23).
+		const ra = /retry[- ]?after[^0-9]{0,6}(\d{1,3})/i.exec(String(failedMessage?.errorMessage || ""));
+		const waitMs = Math.max(cfg.delayMs, ra ? Math.min(30000, Number(ra[1]) * 1000) : 0) + Math.floor(Math.random() * 250);
 		entry.retryNote = `retrying (${entry.retryAttempts}/${cfg.attempts})…`;
 		this.emitRuntime(sessionId);
 		this._cancelAutoRetry(entry);
 		entry.retryTimer = setTimeout(() => {
 			entry.retryTimer = null;
 			this.retry(sessionId, { reason: "auto" }).catch((err) => console.error(`[hub] auto-retry failed for ${sessionId}:`, err?.message || err));
-		}, cfg.delayMs);
+		}, waitMs);
 		if (typeof entry.retryTimer?.unref === "function") entry.retryTimer.unref();
 	}
 

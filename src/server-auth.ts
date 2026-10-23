@@ -94,6 +94,14 @@ export function installServerAuth() {
 				return res;
 			}
 			setToken(entered.trim());
+			// Replay ONLY safe methods: re-issuing a POST after a 401 could execute a tool
+			// twice (e.g. POST /api/exec/tool) — the user retries side-effecting actions
+			// deliberately (grok review 2026-10-23).
+			const method = String(init?.method || (typeof input !== "string" && input?.method) || "GET").toUpperCase();
+			if (method !== "GET" && method !== "HEAD") {
+				emit("no-token", `token saved — press ${method === "POST" ? "the button" : method} again`);
+				return res;
+			}
 			res = await origFetch(input, headerFor(init, input, entered.trim()));
 			if (res.status === 401) emit("bad-token", "the server token was rejected");
 			else if (res.ok) emit("ok");

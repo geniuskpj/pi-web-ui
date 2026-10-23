@@ -447,3 +447,30 @@ and collapsed a 130-line method block to one tab). For anything with nested leve
 block to a file and splice it with an anchored script instead — normalise CRLF→LF for matching,
 write back with the original EOL, and assert each anchor matches exactly once. Verify with
 `git diff --stat` vs `git diff -w --stat`: their stats must be identical (no whitespace-only churn).
+
+## "Ignore the port" is not the TLS-proxy fix (2026-10-23, grok PR review)
+
+**Symptom that triggered it:** the origin allowlist stored entries as `name:PORT`, while a TLS reverse
+proxy sends `Origin: https://name` (`new URL(...).host` drops the default 443) — so the check could
+never pass and a domain behind a proxy was permanently 403.
+
+**Wrong fix (mine, first attempt):** compare bare HOSTNAMES, ignoring ports entirely. It works for the
+proxy case, but it also accepts `Origin: http://localhost:3000` against `Host: localhost:8787` — i.e.
+any other app on the same machine becomes a trusted origin, and since loopback peers skip the token,
+that is CSRF onto every non-always-token route (prompt/abort/session reads).
+
+**Right fix:** keep EXACT `host:port` entries and resolve a MISSING port to the scheme default —
+`http` → `:80`, `https` → `:443` — while a portless `Host` (what a proxy forwards) is tried as the app
+port plus `:80`/`:443`. The operator declares the public form (`PI_WEB_TERM_ORIGIN=name:443`).
+Malformed Origins fail closed; no suffix/includes matching.
+
+**Related hardening from the same review:** the loopback token exemption must be tied to the HOST, not
+just the peer — a reverse proxy on this machine makes the peer loopback while serving a PUBLIC name, so
+`authorized()` trusts a loopback caller only when it names a LOCAL host (`isLocalHost()`), in every
+`PI_WEB_ORIGIN_GATE` mode. Order matters: run the origin gate BEFORE the token gate, so a loopback
+request naming a foreign Host still reports 403 (rebinding defence) instead of 401.
+
+**Where the rules live now:** `hostName()` / `hostCandidates()` / `isLocalHost()` / `authorized()` in
+server.mjs, and the terminal hub receives the same origin rule as a PREDICATE (`originAllowed`) so the
+two checks cannot drift. Tests: `npm run test:security` (64 checks — other-port Origin, loopback +
+public Host without token, portless proxy form, `off`-mode token independence).

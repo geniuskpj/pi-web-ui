@@ -114,7 +114,7 @@ Workspace file attach + image paste are BACK (plan.md §12–14) — see the exp
 | `PI_WEB_EXIT_ON_STDIN_CLOSE` | off | run the full graceful-shutdown sequence when the parent closes the server's stdin pipe (pipe-friendly Ctrl+C equivalent; used by tests — on Windows a cross-process `kill(SIGINT)` TerminateProcesses without running handlers) |
 | `PI_WEB_TERM_COLS` / `PI_WEB_TERM_LINES` | `110` / `32` | terminal grid size (stty in the pty tier, COLUMNS/LINES env in the pipe tier) |
 | `PI_WEB_TERM_BRIDGE` | auto | `0`/`pipes` forces the pipe tier; a path uses that exe as an msys-pty-bridge; unset → auto-provision msys2 `util-linux` `script.exe` into `data/bin/script/` (sha256-pinned `util-linux-2.40.2-2` package from repo.msys2.org, 8MB size cap, extracts a 63KB exe — once) |
-| `PI_WEB_TERM_ORIGIN` | auto | extra `host[:port]` **names for the global Host/Origin allowlist** — every `/api/*` route and all three WS endpoints (`/ws/sync`, `/ws/agent`, `/ws/terminal`), not just the terminal. Comma-separated; scheme stripped; matching is port-insensitive (a TLS proxy on 443 works). Localhost, `os.hostname()` and every interface IP are always allowed |
+| `PI_WEB_TERM_ORIGIN` | auto | extra `host[:port]` **names for the global Host/Origin allowlist** — every `/api/*` route and all three WS endpoints (`/ws/sync`, `/ws/agent`, `/ws/terminal`), not just the terminal. Comma-separated, scheme stripped. Matching is EXACT on `host:port`: a missing Origin port means the scheme default (http→80, https→443) and a portless Host is tried as the app port plus 80/443 — so a TLS reverse proxy needs its public form spelled out (`PI_WEB_TERM_ORIGIN=name:443`). Localhost, `os.hostname()` and every interface IP are always allowed |
 | `PI_WEB_ORIGIN_GATE` | `auto` | how strictly the DNS-rebinding Host/Origin allowlist applies: `auto` = **loopback peers only** (a remote peer must present the API token — that is what lets the UI work on any domain/DDNS name with no config), `strict` = every peer (pre-2026-10-23 behaviour, only allowlisted names pass), `off` = no host check at all (**foot-gun**, warns at boot: a rebinding page can read `/api/sessions` with no token) |
 | `PROXY_IDLE_MS` | `150000` | LLM proxy stall timeout |
 
@@ -132,7 +132,7 @@ Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
 - **Node ≥ 22** (`engines` in package.json; 18/20 are EOL — 18 never worked, `npm run
   build` fails there because npm 9 drops the file: overrides). CI: `.github/workflows/ci.yml`
   runs node 22 + 24 on ubuntu + windows — `npm ci` → `typecheck` → `build` → the hermetic
-  suites (share-link, store, runtime, ssrf, security-gates). The real-LLM suites
+  suites (store, runtime, ssrf, retry, security-gates). The real-LLM suites
   (`test:agent`, `test:steer`, `test:killstop`) and the Windows/pty-specific `term-smoke`
   stay opt-in; `compact`/`fork`/`shutdown` need a bash/pty host, so they are local too.
 - **Theme variables** come from the vendored `public/assets/app.css` (pi-web-ui's compiled
@@ -218,23 +218,28 @@ Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
     allowlist inside its own size-capped WSS (WS has no CORS — a drive-by page could otherwise
     dial the socket; DNS-rebinding presents a mismatched Origin/Host pair). 2026-10-21: the same
     allowlist now gates `/ws/sync` + `/ws/agent` WS upgrades and EVERY `/api/*` route except
-    `/api/health` (Host + Origin are compared as **hostnames** — port-insensitive, so a TLS proxy
-    on 443 and a portless Host both match; IPv6/trailing-dot normalized, malformed Origin fails
-    closed). Since 2026-10-23 the strictness is `PI_WEB_ORIGIN_GATE` (default `auto`): the gate
-    applies to **loopback peers only**, because loopback is the one trust path that skips the token
-    — a remote peer that presents the token is already authenticated and may use ANY hostname
-    (this is what makes a DDNS/domain work with zero config; a rebinding page arriving as loopback
-    is still rejected). Custom names can be added to `PI_WEB_TERM_ORIGIN` regardless. Session ids
-    must be unguessable (≥16 chars, not numeric) — the id is the reattach auth for loopback peers.
-    The token remains the trust boundary, exactly like `/api/exec/tool` (which, with `/api/pi/keys`
-    and the workspace file reads, requires the token even from loopback).
-  - **Accessing the UI on a custom domain / sharing a session**: open the server on that name and
-    paste the token once (Settings → Server token, stored as `pi.webToken`) — with the default
-    `auto` gate nothing else is needed. A share link is
-    `http://<host>:8787/?session=<id>#token=<TOKEN>` — the token rides in the **fragment** (never
-    sent to the server, never in a Referer); the client stores it and strips it from the address
-    bar. `?token=` in a query string is accepted **only on WS upgrades** (WS cannot set headers).
-    If `/api/sessions` answers 403, the UI shows an amber banner with the reason instead of an
+    `/api/health` (Host + Origin match **exactly** on `host:port`; a missing Origin port is the
+    scheme default — http→80, https→443 — a portless Host is tried as the app port plus 80/443,
+    IPv6/trailing-dot normalized, malformed Origin fails closed; `Origin: http://localhost:3000`
+    from another local app is NOT our origin and is rejected). Since 2026-10-23 the strictness is
+    `PI_WEB_ORIGIN_GATE` (default `auto`): the gate applies to **loopback peers only**, because
+    loopback is the one trust path that skips the token — a remote peer that presents the token is
+    already authenticated and may use ANY hostname (this is what makes a DDNS/domain work with zero
+    config; a rebinding page arriving as loopback is still rejected). The token exemption is tied to
+    the HOST: a loopback caller is trusted only when it addresses us by a LOCAL name (localhost /
+    hostname / interface IP), so a local reverse proxy serving a public name still has to send the
+    token, and the gate mode never changes that. Custom names go in `PI_WEB_TERM_ORIGIN` (spell the
+    public port for a TLS proxy). Session ids must be unguessable (≥16 chars, not numeric) — the id
+    is the reattach auth for loopback peers. The token remains the trust boundary, exactly like
+    `/api/exec/tool` (which, with `/api/pi/keys` and the workspace file reads, requires the token
+    even from loopback).
+  - **Accessing the UI on a custom domain**: open the server on that name and paste the token once
+    (Settings → Server token, stored as `pi.webToken`) — with the default `auto` gate nothing else
+    is needed. The token is a SETTINGS credential: it is never read from the URL and there are no
+    share links — a URL token would hand whoever opens it full control (bash/exec + every session);
+    a scoped read-only token is an open item. `?token=` in a query string is accepted **only on WS
+    upgrades** (WS cannot set headers), and the upgrade log prints the path without the query string.
+    If `/api/sessions` answers 401/403 the UI shows an amber banner with the reason instead of an
     empty list.
 - **Workspace file endpoints** (picker/attachments): `GET /api/ws/files?path=` (structured
   listing, dotfiles hidden, dotfile paths 403) and `GET /api/ws/file?path=` (text w/ NUL-sniff

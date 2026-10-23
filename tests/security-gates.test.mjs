@@ -126,6 +126,12 @@ const wsUp = (s, pathStr, headers = {}, via = "loopback") => new Promise((resolv
 		check("auto: loopback + suffix trick localhost.evil.com → 403", (await req(s, "/api/sessions", { Host: `localhost.evil.com:${s.port}` })) === 403);
 		check("auto: loopback + Origin null → 403 (fail closed)", (await req(s, "/api/sessions", { Host: `localhost:${s.port}`, Origin: "null" })) === 403);
 		check("auto: loopback + localhost Host → 200", (await req(s, "/api/sessions", { Host: `localhost:${s.port}` })) === 200);
+
+		// EXACT port matching (grok review must-fix 1): a page from ANOTHER local app
+		// (`http://localhost:3000`) must not be accepted as our own origin — otherwise any
+		// drive-by local page could POST to the non-always-token routes.
+		check("auto: loopback + localhost Host + Origin localhost:3000 → 403", (await req(s, "/api/sessions", { Host: `localhost:${s.port}`, Origin: "http://localhost:3000" })) === 403);
+		check("auto: loopback + Host on another local port → 403", (await req(s, "/api/sessions", { Host: "127.0.0.1:3000" })) === 403);
 		if (LAN) {
 			check("auto: remote + no token → 401", (await req(s, "/api/sessions", { Host: `${LAN}:${s.port}` }, "remote")) === 401);
 			check("auto: remote + token + ANY domain Host → 200 (the fix)", (await req(s, "/api/sessions", { Host: `pi.example.com:${s.port}`, "x-pi-web-token": s.token }, "remote")) === 200);
@@ -143,12 +149,20 @@ const wsUp = (s, pathStr, headers = {}, via = "loopback") => new Promise((resolv
 
 // --- PI_WEB_TERM_ORIGIN: portless (TLS proxy) shapes now match (PL-3)
 {
-	process.env.PI_WEB_TERM_ORIGIN = "pi.example.com";
+	process.env.PI_WEB_TERM_ORIGIN = "pi.example.com,pi.example.com:443";
 	const s = await startScratchServer();
 	try {
-		check("name: loopback + portless https Origin → 200", (await req(s, "/api/sessions", { Host: "pi.example.com", Origin: "https://pi.example.com" })) === 200);
-		check("name: loopback + https://evil.com → 403", (await req(s, "/api/sessions", { Host: "pi.example.com", Origin: "https://evil.com" })) === 403);
-		check("name: WS + portless https Origin → 101", (await wsUp(s, "/ws/sync", { Host: "pi.example.com", Origin: "https://pi.example.com" })) === 101);
+		// A portless Origin means the SCHEME DEFAULT (https→443), so the operator lists the
+		// public form explicitly — "any port on this name" is never accepted (must-fix 1).
+		check("name: loopback + portless https Origin, no token → 401", (await req(s, "/api/sessions", { Host: "pi.example.com", Origin: "https://pi.example.com" })) === 401);
+		check("name: loopback + portless https Origin + token → 200", (await req(s, "/api/sessions", { Host: "pi.example.com", Origin: "https://pi.example.com", "x-pi-web-token": s.token })) === 200);
+		check("name: loopback + https://evil.com + token → 403", (await req(s, "/api/sessions", { Host: "pi.example.com", Origin: "https://evil.com", "x-pi-web-token": s.token })) === 403);
+		check("name: WS loopback + allowlisted Origin, no token → 401", (await wsUp(s, "/ws/sync", { Host: "pi.example.com", Origin: "https://pi.example.com" })) === 401);
+		check("name: WS loopback + allowlisted Origin + token → 101", (await wsUp(s, "/ws/sync", { Host: "pi.example.com", Origin: "https://pi.example.com", "x-pi-web-token": s.token })) === 101);
+		// grok must-fix 2: a LOOPBACK peer naming a PUBLIC Host must still present the token
+		// (a local reverse proxy makes the peer loopback — that must not be a token-free path)
+		check("name: loopback + public Host + token → 200", (await req(s, "/api/sessions", { Host: `pi.example.com:${s.port}`, "x-pi-web-token": s.token })) === 200);
+		check("name: loopback + public Host, no token → 401", (await req(s, "/api/sessions", { Host: `pi.example.com:${s.port}` })) === 401);
 		if (LAN) check("name: remote + token + portless Origin → 200", (await req(s, "/api/sessions", { Host: "pi.example.com", Origin: "https://pi.example.com", "x-pi-web-token": s.token }, "remote")) === 200);
 	} finally { await s.stop(); delete process.env.PI_WEB_TERM_ORIGIN; }
 }
@@ -174,7 +188,11 @@ const wsUp = (s, pathStr, headers = {}, via = "loopback") => new Promise((resolv
 	process.env.PI_WEB_ORIGIN_GATE = "off";
 	const s = await startScratchServer();
 	try {
-		check("off: loopback + evil Host, no token → 200 (gate disabled)", (await req(s, "/api/sessions", { Host: "evil.com" })) === 200);
+		check("off: loopback + LOCAL Host, no token → 200 (gate disabled)", (await req(s, "/api/sessions", { Host: `localhost:${s.port}` })) === 200);
+		// the token rule is INDEPENDENT of the gate mode: with the gate off, a loopback caller
+		// that names a FOREIGN Host is still not trusted (grok review must-fix 2)
+		check("off: loopback + foreign Host, no token → 401", (await req(s, "/api/sessions", { Host: "evil.com" })) === 401);
+		check("off: loopback + foreign Host + token → 200", (await req(s, "/api/sessions", { Host: "evil.com", "x-pi-web-token": s.token })) === 200);
 		check("off: /api/pi/keys still requires the token → 401", (await req(s, "/api/pi/keys", { Host: "evil.com" })) === 401);
 		check("off: boot log carries the WARNING", s.log().includes("WARNING: PI_WEB_ORIGIN_GATE=off"));
 	} finally { await s.stop(); delete process.env.PI_WEB_ORIGIN_GATE; }

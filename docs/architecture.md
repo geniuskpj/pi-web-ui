@@ -118,9 +118,14 @@ refresh, `?session=` restore.
   honor CORS. **Browser-origin gate (2026-10-21 r2; retuned 2026-10-23)**: loopback trust is NOT a
   browser boundary (DNS rebinding / `*.nip.io` make an attacker page same-origin over a loopback
   socket), so the `Host` header AND the `Origin` header (when present) must name a host the server is
-  actually reachable on — `ALLOWED_HOSTS` (`host:port`) plus `ALLOWED_NAMES` (**bare hostnames**; the
-  comparison is port-insensitive, so `Origin: https://name` and a proxy-forwarded portless `Host` both
-  match, IPv6 bracketed, trailing dots stripped, a malformed Origin fails CLOSED, no suffix matching).
+  actually reachable on — an EXACT `ALLOWED_HOSTS` entry per name, IPv6 bracketed, trailing dots
+  stripped, a malformed Origin failing CLOSED, no suffix matching. A missing Origin port means the
+  SCHEME DEFAULT (http→80, https→443) and a portless `Host` is tried as the app port plus 80/443, so a
+  TLS reverse proxy works by listing its public form (`PI_WEB_TERM_ORIGIN=name:443`) — while
+  `Origin: http://localhost:3000` (another local app) stays rejected, which "ignore the port" would
+  have accepted (grok review 2026-10-23). The token exemption is ALSO tied to the Host: a loopback
+  caller is trusted only when it names a LOCAL host (`isLocalHost()`), so a local reverse proxy serving
+  a public name must present the token, in every gate mode.
   Strictness is `PI_WEB_ORIGIN_GATE`: **`auto` (default) applies the gate to LOOPBACK peers only** —
   loopback is the one trust path that skips the token, so a rebinding page still arrives as loopback and
   is still rejected, while a remote peer that presents the token may use ANY hostname (before this, every
@@ -163,7 +168,7 @@ refresh, `?session=` restore.
 | `PI_WEB_BASH` / `PI_WEB_BASH_SHELL` | on / `C:\Git\usr\bin\bash.exe` | bash tool on/off + shell path |
 | `PI_WEB_TERM_COLS/LINES` | 110/32 | terminal grid clamp (40–240 / 10–120) |
 | `PI_WEB_TERM_BRIDGE` | auto | `0`/`pipes` forces pipe tier; path uses that bridge exe |
-| `PI_WEB_TERM_ORIGIN` | — | extra names for the GLOBAL Host/Origin allowlist (every `/api/*` route + all three WS endpoints, not just the terminal); port-insensitive matching |
+| `PI_WEB_TERM_ORIGIN` | — | extra names for the GLOBAL Host/Origin allowlist (every `/api/*` route + all three WS endpoints, not just the terminal); exact `host:port` matching — spell the public form for a proxy (`name:443`) |
 | `PI_WEB_ORIGIN_GATE` | `auto` | origin-gate strictness: `auto` = loopback peers only (a valid token is enough for remote peers — this is what lets any domain work), `strict` = every peer, `off` = disabled (warns at boot) |
 | `PI_GIT_HOME` | — | override the Git root (terminal shell env; tar fallback in bridge provisioning) |
 | `PROXY_IDLE_MS` | 150000 | LLM proxy stall watchdog |

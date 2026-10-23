@@ -14,8 +14,7 @@ import { createApiKeyResolver, createProxyStreamFn } from "./ui/proxy-stream.js"
 import { defaultModelFromCache, fetchAndApplyConfig, loadCachedConfig, type PiConfig } from "./pi-import.js";
 import { ProxyAgent } from "./proxy-agent.js";
 import { sessionSync, type RuntimeRecord } from "./session-sync.js";
-import { getToken, installServerAuth, onServerAuth, retryServerAuth, setToken, type ServerAuthState } from "./server-auth.js";
-import { consumeUrlToken } from "./share-link.js";
+import { getToken, installServerAuth, onServerAuth, retryServerAuth, type ServerAuthState } from "./server-auth.js";
 import { LocalStorageBackend } from "./local-storage-backend.js";
 import { fetchPiServerTools } from "./pi-tools.js";
 import { termBus } from "./ui/terminal.js";
@@ -756,15 +755,11 @@ async function init() {
 		/* old browsers */
 	}
 
-	// share link: `?session=<id>#token=<tok>` — consume the one-time token ONCE, then
-	// strip it from the address bar (fragment never reaches the server; this keeps it
-	// out of history/screenshots). Runs before the auth patch and before the sync
-	// socket is created (sessionSync.connect() further down).
-	const urlTok = consumeUrlToken(window.location.search, window.location.hash);
-	if (urlTok) {
-		setToken(urlTok.token);
-		window.history.replaceState({}, "", `${window.location.pathname}${urlTok.search}${urlTok.hash}`);
-	}
+	// NOTE (2026-10-23, grok review): the API token is a SETTINGS credential — stored in
+	// localStorage as `pi.webToken` and never read from the URL. A share link carrying
+	// `#token=` would hand whoever opens it full control (bash/exec + every session), so
+	// that path was deliberately removed; hand out the token only to people who should
+	// have the whole server (and see the read-only-scope open item).
 
 	// server auth: auto-generated token gates every /api/* + /ws/* call from
 	// non-loopback peers. installServerAuth() attaches the stored token to same-origin

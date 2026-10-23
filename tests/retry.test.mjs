@@ -198,5 +198,42 @@ async function waitFor(fn, ms = 5000) {
 	check("transcript untouched", msgsOf(hub, id).length === 2 && faux.state.callCount === 1);
 }
 
+// --- 8) an error AFTER partial assistant content (the scary tail-surgery path) ---
+{
+	const { hub, faux } = makeHub();
+	faux.setResponses([
+		// a real 429 can land mid-stream: the partial assistant message must be dropped whole
+		fauxAssistantMessage([fauxText("I started answering but the provider cut me off")], { stopReason: "error", errorMessage: "429 Too Many Requests (mid-stream)" }),
+		ok("complete answer after the retry"),
+	]);
+	const id = "retrytest0000000000000000000008";
+	hub.getSession(id, { messages: [] });
+	await hub.prompt(id, "long question");
+	let msgs = msgsOf(hub, id);
+	check("partial content + error is the terminal message", msgs.length === 2 && msgs[1].stopReason === "error" && textOf(msgs[1]).includes("cut me off"), JSON.stringify(msgs.map((m) => [m.role, m.stopReason])));
+	await hub.retry(id);
+	msgs = msgsOf(hub, id);
+	check("the partial text is gone (whole message dropped, not appended to)", !textOf(msgs[1]).includes("cut me off") && textOf(msgs[1]).includes("complete answer"), textOf(msgs[1]).slice(0, 40));
+	check("still exactly one user turn", msgs.filter((m) => m.role === "user").length === 1);
+}
+
+// --- 9) Retry-After is honoured (bounded), instead of the flat delay ------------
+{
+	const { hub, faux } = makeHub();
+	hub.setAutoRetry({ enabled: true, attempts: 2, delayMs: 10 });
+	faux.setResponses([
+		fauxAssistantMessage("", { stopReason: "error", errorMessage: "429 Too Many Requests — retry after 1" }),
+		ok("after honouring retry-after"),
+	]);
+	const id = "retrytest0000000000000000000009";
+	hub.getSession(id, { messages: [] });
+	await hub.prompt(id, "hi");
+	await sleep(400);
+	const early = textOf(msgsOf(hub, id).at(-1)).includes("after honouring retry-after");
+	check("did NOT retry before the requested wait (10 ms delay overridden by retry-after: 1)", early === false, early ? "retried too early" : "");
+	const later = await waitFor(() => textOf(msgsOf(hub, id).at(-1)).includes("after honouring retry-after"), 4000);
+	check("retried after the requested wait", later);
+}
+
 console.log(`\n[retry] ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
