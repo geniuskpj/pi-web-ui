@@ -212,3 +212,14 @@ review workflow). Suites on this branch: `test:retry` 31/31, `test:security` 64/
 | 4 | **Note (positive) — the client token header only gates *same-origin-shaped* URLs today**, so the cross-origin exposure in reviewer1's finding 1 has a narrow practical surface (no absolute third-party URL is fetched by the app's own code paths I traced); the fix is still correct and cheap. | **note** — no action beyond reviewer1's own disposition. |
 
 **Merge gate:** hold for the strip + rebase (findings 1–2) and reviewer1's three open items.
+
+**Follow-up (reviewer2, 2026-10-23 later pass — after reading `session-sharing-report.md`,
+the predecessor artifact this PR implements):**
+
+| # | Item | Disposition |
+|---|---|---|
+| A | The predecessor report's §7.0 checklist marks **PL-2 (fragment share links) DONE** and PL-7 lists "share-link 14/14 tests" — but this PR's own review log (grok pass, finding 3) shows share links were **removed entirely** in `361746a` (user decision (b): a `#token=` link hands out full control). The report is **historical** — its PL-2/PL-7-share-link entries describe a state that no longer exists on this branch; do not use it as an implementation reference. | **noted** — report superseded by pr.md §3 for current behavior |
+| B | The report's §5/§10 security reasoning (token as the trust boundary for non-loopback peers; loopback-only origin gate; always-token privileged routes) is the basis of this PR's invariants and remains accurate. | **confirmed** |
+| C | The report's open decisions (§9: plain-HTTP vs TLS proxy; §7.5: read-only visitor token) are still **unanswered** and now live in this PR's §6. | **open — user decision** |
+| D | Meanwhile on `main`: the CI/build defects this PR fixes (npm 9/10 silently dropping `file:` overrides → real provider SDKs → red build) were **ported to main** in `6b9ec90` (build.mjs stub aliases + assertions, ci.yml v2, webpack.yml deleted), so the eventual rebase converges instead of conflicting. Main also fixed the edit tool's line-fuzzy indent corruption (`replace("\t")` → `replace(/\t/g)`) found via `edit-vs-splice.md` — relevant here because this PR's own edits were produced with the corrupted rebase. | **noted** — reduces the rebase surface |
+| E | Rechecking my earlier finding 1 (transcripts on origin): the stale "not pushed" claim in §Status came from this predecessor report's timeline — the push happened after it was written. My disposition stands: **rebase onto stripped main + force-push** remains the merge gate. | **stands — open** |
