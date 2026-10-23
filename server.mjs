@@ -2128,6 +2128,27 @@ function agentConn(ws) {
 				case "abort":
 					if (currentSession) agentHub.abort(currentSession);
 					break;
+				case "retry": {
+					// RETRY (2026-10-23, user request): resume a FAILED run at the failure
+					// point — the hub drops the 429/error message and continues the SAME
+					// transcript (pi agent.continue()), so the user turn appears exactly
+					// once and tool calls that already completed are not re-run. Parked
+					// versions survive (an ✎ edit whose resubmit hit a 429 keeps its delta).
+					// Reply is an ack: the run streams as normal agent events (like prompt).
+					if (!currentSession) { safeSend(ws, { type: "error", id: m.id, error: "attach first" }); break; }
+					safeSend(ws, { type: "retried", id: m.id, ok: true });
+					agentHub.retry(currentSession, { reason: m.reason === "auto" ? "auto" : "manual" })
+						.then((r) => { if (r && r.ok === false) safeSend(ws, { type: "error", id: m.id, error: r.reason }); })
+						.catch((err) => safeSend(ws, { type: "error", id: m.id, error: err.message }));
+					break;
+				}
+				case "set-auto-retry": {
+					// client setting (Settings → Retry): pushed on every (re)attach + change
+					const cfg = agentHub.setAutoRetry({ enabled: !!m.enabled, attempts: m.attempts, delayMs: m.delayMs });
+					safeSend(ws, { type: "auto-retry", id: m.id, ...cfg });
+					break;
+				}
+
 				case "fork": {
 					// llama.cpp-webui-style fork: clone the transcript prefix into a NEW
 					// session (original untouched); the client navigates to the new id

@@ -286,6 +286,28 @@ MAX-seq idle from discard()). `enrichedSessions()` embeds NON-IDLE runtime (idle
 
 ## Server-side agent hub (`agent-hub.mjs`, non-default path)
 
+**retry / auto-retry (2026-10-23, user request)**: `hub.retry(id, {reason})` resumes a FAILED
+run at the failure point instead of re-sending the prompt. `_dropFailedTail()` pops the trailing
+assistant message(s) with `stopReason` `"error"`/`"aborted"` plus toolResults left orphaned by
+them and repairs a half-finished tool call (dangling `toolCall` without `toolResult` — the same
+repair `prompt()` does), then `agent.continue()` re-issues the failed model call against the SAME
+transcript: the user turn stays exactly once and completed tool calls are NOT re-run. Fallback
+when the tail is an assistant message: re-send the last user turn, dropping it first so it is
+never duplicated. `dropped === 0` → `{ok:false, reason:"nothing to retry…"}` (never regenerates a
+healthy turn); guarded by promptLock + idle/not-compacting. Versions are untouched, so an ✎ edit
+whose resubmit failed keeps its parked delta (`data/sessions/<id>.versions.jsonl`). WS
+`{type:"retry"}` → ack `{type:"retried"}` (the run streams as normal agent events, like prompt).
+`hub.setAutoRetry({enabled, attempts=3, delayMs=3000})` — the client pushes its setting
+(`localStorage pi.autoRetry`, default ON) on every attach. `_maybeScheduleAutoRetry()` runs from
+the `agent_end` handler when `_isRetryableError(msg)` matches transient failures only
+(429/rate-limit/quota/overloaded, 5xx, ECONNRESET/ETIMEDOUT/"fetch failed"/socket hang up/…) and
+NOT auth (401/403/invalid key) or context overflow; `entry.retryAttempts` caps the chain and is
+reset by success or any user action (prompt/steer/abort/edit/retry), so it only ever retries the
+same failing turn. Runtime preview (`entry.retryNote`) carries "retrying (n/N)…" / "auto-retry gave
+up after N attempt(s)". Timers are cleared in `abort()`, `discard()`, `shutdown()`, `prompt()`,
+`editCommit()` and on an explicit manual retry.
+
+
 Agent per session (**the DEFAULT chat path since 2026-10-21**); `getApiKey` reads `.pi/auth.json`
 server-side (keys never sent to clients); `persist()` → worker store. **The loop is fully server-side**:
 tools = `builtinTools + extensionTools` run IN-PROCESS via `getTools()` (same objects as the exec
