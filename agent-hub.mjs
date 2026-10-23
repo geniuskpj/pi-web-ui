@@ -529,22 +529,49 @@ export class AgentHub {
 			if (!last) break;
 			const failedAssistant = last.role === "assistant" && (last.stopReason === "error" || last.stopReason === "aborted");
 			const orphanResult = last.role === "toolResult" && !msgs.slice(0, -1).some((m) => m.role === "assistant" && Array.isArray(m.content) && m.content.some((p) => p.type === "toolCall" && p.id === last.toolCallId));
-			if (!failedAssistant && !orphanResult) break;
+			// DEAD-END assistant (user report 2026-10-24): stopReason "toolUse" whose
+			// toolCall was already stripped (hydration/prompt repair) — pi cannot
+			// continue() from an assistant tail, so leaving it in place forces the
+			// RESEND fallback (full wipe to the user turn). Pop it so retry
+			// continues from the user turn instead. A HEALTHY assistant (stopReason
+			// "stop"/"aborted" with text, or toolUse that still has calls) never
+			// matches — retry must not regenerate healthy turns.
+			const deadEndAssistant = last.role === "assistant" && last.stopReason === "toolUse" && Array.isArray(last.content) && !last.content.some((p) => p.type === "toolCall");
+			if (!failedAssistant && !orphanResult && !deadEndAssistant) break;
 			msgs.pop();
 			dropped++;
 		}
 		if (dropped) {
-			// a stream that died mid-tool-call leaves toolCalls with no toolResult —
-			// invalid for the Anthropic/OpenAI tool protocol (the same repair
-			// prompt() performs before a run)
+			// REPAIR v2 (user report 2026-10-24: "toolcall and assistant turn removed
+			// after clicking retry after 429"): a run that died mid-tool-round leaves
+			// an assistant message whose toolCall never got a toolResult. The old
+			// repair STRIPPED the dangling call — leaving the transcript ending on an
+			// ASSISTANT message; retry()'s canContinue check (user/toolResult only)
+			// then fell into the RESEND fallback, which truncates the whole turn back
+			// to the user message. Thinking + tool round wiped. Now: keep the
+			// assistant message and SYNTHESIZE an interrupted toolResult per dangling
+			// call (pi's createToolResultMessage shape, isError) — the transcript
+			// stays protocol-valid AND continue()-able: the model sees the
+			// interrupted result and re-plans, i.e. exactly "retry from the toolcall
+			// after removing the 429 message".
+			const trIds = new Set(msgs.filter((x) => x.role === "toolResult").map((x) => x.toolCallId));
 			for (let i = msgs.length - 1; i >= 0; i--) {
 				const m = msgs[i];
 				if (m.role !== "assistant") continue;
-				if (!Array.isArray(m.content)) break;
-				const trIds = new Set(msgs.filter((x) => x.role === "toolResult").map((x) => x.toolCallId));
-				const filtered = m.content.filter((p) => p.type !== "toolCall" || trIds.has(p.id));
-				if (filtered.length !== m.content.length) msgs[i] = { ...m, content: filtered.length > 0 ? filtered : [{ type: "text", text: "(tool call interrupted by error)" }] };
-				break;
+				if (Array.isArray(m.content)) {
+					const dangling = m.content.filter((p) => p.type === "toolCall" && !trIds.has(p.id));
+					for (const tc of dangling) {
+						msgs.push({
+							role: "toolResult",
+							toolCallId: tc.id,
+							toolName: tc.name,
+							content: [{ type: "text", text: "(tool call interrupted by error — recovered by retry)" }],
+							isError: true,
+							timestamp: Date.now(),
+						});
+					}
+				}
+				break; // only the LAST assistant can dangle — earlier rounds are paired, else the run would have failed there
 			}
 			entry.mutateEpoch = (entry.mutateEpoch || 0) + 1;
 		}
