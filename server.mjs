@@ -856,7 +856,11 @@ const builtinTools = [
 						}
 						// apply bottom-up with indent rebase (file's indent wins, relative delta kept)
 						const outLines = [...fileLinesAll];
-						const leadW = (l) => { const m = l.match(/^[ \t]*/); return m ? m[0].replace("\t", "    ").length : 0; };
+						// leadW: tab = 4 spaces — replace(/\t/g) NOT replace("\\t"): the string form
+						// replaced only the FIRST tab, so multi-tab indents undercounted (3 tabs = 6,
+						// not 12) and nested blocks collapsed onto the anchor depth with SPACE padding
+						// (edit-vs-splice.md repro, fixed 2026-10-23)
+						const leadW = (l) => { const m = l.match(/^[ \t]*/); return m ? m[0].replace(/\t/g, "    ").length : 0; };
 						for (const step of [...plan].reverse()) {
 							const oldN = step.oldText.split("\n").length;
 							const newLines = step.newText.split("\n");

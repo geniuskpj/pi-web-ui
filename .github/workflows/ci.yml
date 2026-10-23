@@ -1,30 +1,65 @@
 name: CI
 
+# Replaces the first ci.yml attempt (2026-10-23), which ran `npm ci` + build but
+# inherited the same trap the feat/auth-gate-retry branch had already fixed:
+# npm 9/10 SILENTLY DROP `overrides` entries that use `file:` specifiers (npm 11
+# honours them), so on CI the provider SDKs resolve to the REAL packages and
+# the build follows them into missing transitive deps. build.mjs now aliases
+# the six provider SDKs to stubs/empty itself (ported from the branch with the
+# stub-assertion proof), so the bundle is independent of how npm resolved them.
+#
+# Real-LLM suites (test:agent, test:steer, test:killstop) are deliberately NOT
+# run here: they need provider keys and minutes of wall time. The Windows-only
+# term-smoke and the bash-dependent compact/fork/shutdown suites stay local —
+# compact/fork DID pass on ubuntu in local runs, but they shell out to bash and
+# are excluded here to keep CI node-only and hermetic (same policy as the branch).
+
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main", "master"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main", "master"]
+  workflow_dispatch:
 
 jobs:
-  verify:
-    runs-on: ubuntu-latest
+  build-and-test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node-version: ["22", "24"]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node-version }}
           cache: npm
-      - run: npm ci
+
+      - name: "Install (lockfile-pinned)"
+        run: npm ci
+
+      - name: Version report
+        run: |
+          node --version
+          npm --version
+
       - name: Typecheck
         run: npm run typecheck
-      - name: Fast test suites (no LLM, no network)
+
+      - name: "Build (esbuild bundle + provider-stub assertions)"
+        run: npm run build
+
+      # Hermetic, node-only suites (no provider keys, no pty/bash, scratch
+      # servers on random ports with a temp data dir where needed).
+      - name: "Tests (store, runtime, ssrf, zombie, versions)"
         run: |
-          npm run test:versions
-          npm run test:fork
-          npm run test:compact
-          npm run test:zombie
           npm run test:store
           npm run test:runtime
-      - name: Build
-        run: npm run build
+          npm run test:ssrf
+          npm run test:zombie
+          npm run test:versions
+      - name: "Tests (security gates — token + origin/Host allowlist)"
+        run: npm run test:security

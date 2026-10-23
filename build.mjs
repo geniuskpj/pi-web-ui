@@ -103,6 +103,24 @@ const compressPlugin = {
 const debug = process.argv.includes("--debug");
 const watch = process.argv.includes("--watch");
 
+// --- nvidia-only provider stubs (2026-10-23, CI fix) ---------------------------
+// pi-ai's dist imports every provider SDK eagerly, so the bundler needs SOMETHING at
+// those specifiers. package.json's `overrides` map them to stubs/empty — but npm 9/10
+// SILENTLY IGNORE `overrides` with `file:` specifiers (npm 11 honours them), so on
+// node 18/20/22 the real SDKs got installed instead and esbuild followed them into
+// missing transitive deps (@opentelemetry/api via the real @mistralai/mistralai) →
+// the CI build failed on EVERY matrix row, while a local npm 11 install worked.
+// Aliasing HERE makes the bundle independent of how npm resolved those packages: the
+// providers are never imported at runtime in this build (OpenAI-compatible only).
+const PROVIDER_STUBS = [
+	"@anthropic-ai/sdk",
+	"@aws-sdk/client-bedrock-runtime",
+	"@google/genai",
+	"@mistralai/mistralai",
+	"@lmstudio/sdk",
+	"ollama",
+];
+
 /** @type {import("esbuild").BuildOptions} */
 const options = {
 	entryPoints: [path.join(HERE, "src", "main.tsx")],
@@ -117,6 +135,10 @@ const options = {
 	platform: "browser",
 	jsx: "automatic",
 	jsxImportSource: "preact",
+	// the CJS stub is deliberate: esbuild's __toESM interop makes the providers' named
+	// imports (`import { GoogleGenAI } from "@google/genai"`) property reads on the
+	// Proxy, which answers every key — an ESM stub with dynamic names cannot do that
+	alias: Object.fromEntries(PROVIDER_STUBS.map((n) => [n, path.join(HERE, "stubs", "empty", "index.cjs")])),
 	// minify by default (8.7MB -> ~2.5MB); --debug keeps it readable + sourcemaps
 	minify: !debug,
 	sourcemap: debug,
@@ -133,6 +155,23 @@ if (watch) {
 	console.log("[build] watching for changes...");
 } else {
 	const result = await esbuild.build(options);
+	// PROVE the provider stubs are what got bundled (grok review 2026-10-23): a bundle that
+	// quietly picked up the REAL SDK (npm 9/10 ignore the file: overrides) drags in missing
+	// transitive deps and/or ships empty providers — fail the build instead of shipping it.
+	{
+		// 1) every stubbed provider must still be aliased (static)
+		const missingAlias = PROVIDER_STUBS.filter((p) => !options.alias || !options.alias[p]);
+		if (missingAlias.length) { console.error(`[build] FAIL: no alias for ${missingAlias.join(", ")} — the real SDK would be bundled (npm 9/10 ignore file: overrides)`); process.exit(1); }
+		// 2) whatever provider modules DID end up in the bundle must be the stub itself
+		const STUB_MARKER = "nvidia-only build stub";
+		const providerInputs = Object.keys(result.metafile.inputs).filter((k) => {
+			const norm = k.split("\\").join("/");
+			return PROVIDER_STUBS.some((p) => norm.includes(`node_modules/${p}/`)) || norm.endsWith("stubs/empty/index.cjs");
+		});
+		const notStub = providerInputs.filter((k) => !fs.readFileSync(k, "utf8").includes(STUB_MARKER));
+		if (notStub.length) { console.error(`[build] FAIL: bundled a NON-stub provider: ${notStub.join(", ")}`); process.exit(1); }
+		if (providerInputs.length === 0) { console.error("[build] FAIL: no provider stub reached the bundle — did pi-ai stop importing them, or did resolution change?"); process.exit(1); }
+	}
 	compressAssets(computeManifest(result.metafile));
 	console.log('[build] done -> public/assets/');
 }
