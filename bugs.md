@@ -407,3 +407,43 @@ console.log("depth:", d); // must be 0
 | HTTP proxy for LLM (not direct) | Browser CORS blocks direct provider calls. The proxy runs on the same origin, uses undici with stall watchdog + abort propagation. |
 | JSONL sessions (not single JSON) | One message per line, crash-safe partial writes, matches pi's native format. Metadata in line 1. |
 | Custom-only model selector | The built-in catalog (~900 models) is unusable without browser-side keys. Custom providers from pi config are the actual models. |
+
+## Retry after a provider error must resume at the failure point (2026-10-23)
+
+**Symptom:** after a 429 (nvidia rate limit) or network error, pressing Retry re-sent the user
+prompt: the transcript ended up with the SAME user message twice plus the error message, and for a
+server-side session the "repair" happened in the browser against a mirror the server never sees
+(the real transcript is on the server).
+
+**Root cause:** retry was implemented client-side (`chat.tsx`): find the last user message → take
+its text → `agent.prompt(text)`. `prompt()` always APPENDS a user message, so re-sending is a
+duplicate turn, not a retry.
+
+**Fix/pattern:** retry belongs to whoever owns the transcript (the hub). The semantics that match
+user expectation:
+1. drop the trailing failure artifacts — assistant messages with `stopReason` `"error"`/`"aborted"`
+   plus toolResults orphaned by them; repair a dangling `toolCall` (no `toolResult`) the way
+   `prompt()` already does;
+2. `agent.continue()` (pi-agent-core) — it re-issues the model call against the SAME transcript, so
+   the user turn stays exactly once and tool calls that already completed are NOT re-run;
+3. fallback when the tail cannot be continued (assistant tail): re-send the last user turn, dropping
+   it FIRST so it is never duplicated;
+4. refuse when nothing failed (`dropped === 0`) — a retry must never regenerate a healthy turn;
+5. leave the versions sidecar alone: an ✎ edit whose resubmit failed keeps its parked delta.
+Auto-retry (`setAutoRetry`) hooks the same op from the `agent_end` handler: only transient failures
+(429/rate-limit/quota/overloaded, 5xx, ECONNRESET/ETIMEDOUT/fetch failed/socket hang up), capped by
+`attempts` (3 × 3 s by default), counter reset by success or any user action — never on 401/403/
+invalid-key or context overflow.
+
+**Test pattern (worth reusing):** pi-ai ships a FAUX provider —
+`registerFauxProvider({api, provider, models})` → `setResponses([fauxAssistantMessage("", {stopReason:"error", errorMessage:"429 …"}), fauxAssistantMessage([fauxText("ok")])])` — so failure/retry
+paths can be tested hermetically (no network, no keys, deterministic) against the real hub:
+`npm run test:retry` (26 checks). See `tests/retry.test.mjs` for the hub harness
+(`modelsStore` pointing at the faux model + fake `persist`/`broadcast`/`versions` deps).
+
+**Editing pattern for this repo (agent-side):** an edit tool that "re-indents to match the anchor"
+will flatten the nesting of a multi-level replacement (it turned a 5-tab block into `tab + space`
+and collapsed a 130-line method block to one tab). For anything with nested levels, write the new
+block to a file and splice it with an anchored script instead — normalise CRLF→LF for matching,
+write back with the original EOL, and assert each anchor matches exactly once. Verify with
+`git diff --stat` vs `git diff -w --stat`: their stats must be identical (no whitespace-only churn).
