@@ -943,6 +943,10 @@ export class AgentHub {
 		if (!rec || !Array.isArray(rec.messages)) throw new Error(`version ${vid} not found`);
 		const active = entry.agent.state.messages;
 		const base = Math.max(0, Math.min(Number(rec.turn) || 0, active.length));
+		// NO-OP restore (user report 2026-10-24): clicking "switch to" on the
+		// version that already matches the live tail changed nothing but still
+		// bumped the epoch + re-persisted. Detect and return early.
+		if (JSON.stringify(active.slice(base)) === JSON.stringify(rec.messages)) return { ok: true, noop: true, restored: vid };
 		if (active.length > base) {
 			try {
 				await this.versions.append(sessionId, {
