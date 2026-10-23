@@ -266,10 +266,7 @@ export class AgentHub {
 					// state.isStreaming stayed true indefinitely — any device attaching in
 					// that window saw a frozen "streaming" transcript that never updates
 					// (no further events come). The terminal event is ground truth.
-					if (entry.agent.state.isStreaming) entry.agent.state.isStreaming = false;
-					const lastA = [...entry.agent.state.messages].reverse().find((m) => m.role === "assistant");
-					entry.runtime = { status: lastA?.stopReason === "error" ? "error" : "idle", startedAt: null, turn: 0, currentTool: null, lastText: null, pendingPrompts: entry.pendingPrompt ? 1 : 0 };
-					this.emitRuntime(sessionId); // explicit idle/error delta — the terminal state is never lost
+					this._settleRuntime(sessionId, entry);
 				}
 				const payload = { type: "agent-event", sessionId, seq: entry.seq, event };
 				// attach() buffering hook (2026-10-21: replaces the old global
@@ -457,6 +454,16 @@ export class AgentHub {
 			this.emitSteering(sessionId);
 		}
 		try { entry.agent.abort(); } catch { /* already dead */ }
+		// KILL ARCHITECTURE (LFP zombie 2026-10-23): abort alone is NOT enough when
+		// the run wedged on a tool promise — pi's flag flips but agent_end never
+		// fires, so runtime.status stayed "running" forever (the session "cannot
+		// be killed"). FORCE-SETTLE after a short grace (let a clean abort emit its
+		// own terminal state first), then make the runtime truthful regardless.
+		setTimeout(() => {
+			const e = this.sessions.get(sessionId);
+			if (!e) return;
+			if (!e.agent.state.isStreaming && e.runtime?.status !== "idle") this._settleRuntime(sessionId, e);
+		}, 1500).unref?.();
 	}
 
 	setModel(sessionId, modelId) {
@@ -725,7 +732,13 @@ export class AgentHub {
 		// "ui is not updated / had to press send again"). Reply immediately; the
 		// streamed response arrives as normal agent events on every device.
 		const pr = this.prompt(sessionId, String(text || ""));
-		pr.catch((err) => console.error(`[hub] edit-commit prompt failed for ${sessionId}:`, err?.message || err));
+		// visible failures (review P3): both the rejection AND the not-accepted
+		// result (lock/race/epoch rejection) surface in the server log — the
+		// truncated transcript is already visible on every device via the state
+		// frame above, so a rejected re-prompt shows as a missing turn, not silence
+		pr.then((r) => {
+			if (!r?.accepted) console.warn(`[hub] edit-commit prompt NOT accepted for ${sessionId}:`, r?.reason || r);
+		}).catch((err) => console.error(`[hub] edit-commit prompt failed for ${sessionId}:`, err?.message || err));
 		return { ok: true, version, accepted: true };
 	}
 
@@ -829,11 +842,37 @@ export class AgentHub {
 
 	/** Runtime for an existing entry — idle included, seq-stamped (the client's
 	 *  stale-frame guard needs seq even on terminal idle deltas). null = the hub
-	 *  has no entry. Other devices' discovery uses the non-idle subset. */
+	 *  has no entry. Other devices' discovery uses the non-idle subset.
+	 *
+	 *  ZOMBIE SELF-HEAL (2026-10-23 LFP incident): a run can die WITHOUT agent_end
+	 *  (tool promise wedged + abort — pi's flag flips but no terminal event),
+	 *  leaving runtime.status="running" forever; the alive list then showed 23
+	 *  ghost sessions, some days old, and Kill (abort) could not clear them
+	 *  ("cannot be killed even after server restarting"). Runtime is DERIVED
+	 *  liveness: if pi says not streaming, "running" is a lie — settle it. */
 	getRuntime(sessionId) {
 		const entry = this.sessions.get(sessionId);
 		if (!entry) return null;
+		if (entry.runtime?.status === "running" && !entry.agent.state.isStreaming) {
+			// settle to the TRUTHFUL terminal state (an errored run stays "error" —
+			// the alive dialog refuses Kill on error rows and colors them red)
+			const lastA = [...entry.agent.state.messages].reverse().find((m) => m.role === "assistant");
+			entry.runtime = { status: lastA?.stopReason === "error" ? "error" : "idle", startedAt: null, turn: 0, currentTool: null, lastText: null, pendingPrompts: entry.pendingPrompt ? 1 : 0 };
+			try { this.emitRuntime(sessionId); } catch { /* sink must not break reads */ }
+			console.log(`[hub] runtime zombie settled: ${sessionId} (last stop=${lastA?.stopReason || "none"} — no agent_end ever fired)`);
+		}
 		return { ...entry.runtime, sessionId, seq: entry.seq };
+	}
+
+	/** Authoritative force-settle: used by abort()/Kill — the terminal event may
+	 *  never come (wedged tool promise). Flips the runtime to idle + emits it so
+	 *  every device's alive row clears, and defensively clears pi's streaming
+	 *  flag (the phantom-streaming guard from a16f0b9, moved here per review). */
+	_settleRuntime(sessionId, entry) {
+		if (entry.agent.state.isStreaming) entry.agent.state.isStreaming = false;
+		const lastA = [...entry.agent.state.messages].reverse().find((m) => m.role === "assistant");
+		entry.runtime = { status: lastA?.stopReason === "error" ? "error" : "idle", startedAt: null, turn: 0, currentTool: null, lastText: null, pendingPrompts: entry.pendingPrompt ? 1 : 0 };
+		this.emitRuntime(sessionId);
 	}
 
 	/** Steering pending-state delta: broadcast to all attached /ws/agent clients

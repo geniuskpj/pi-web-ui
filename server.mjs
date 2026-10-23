@@ -1923,14 +1923,18 @@ function syncConn(ws) {
 	syncClients.add(client);
 	ws.isAlive = true;
 	ws.on("pong", () => { ws.isAlive = true; });
-	void listCached().then((sessions) => safeSend(ws, { type: "sessions", sessions }));
+	// connect frame = ENRICHED list (with non-idle runtimes): the client does a
+	// FULL-REPLACE of its runtime map from it — the raw list here left live runs
+	// invisible after a reconnect AND, combined with the hub's zombie self-heal
+	// (agent-hub getRuntime), clears restart ghosts on reconnect
+	void enrichedSessions().then((sessions) => safeSend(ws, { type: "sessions", sessions }));
 	ws.on("message", (raw) => {
 		if (raw.length > MAX_INBOUND) return;
 		let m;
 		try { m = JSON.parse(raw.toString()); } catch { return; }
 		void (async () => {
 			const id = String(m?.id || "");
-			if (m.type === "list") safeSend(ws, { type: "sessions", sessions: await listCached() });
+			if (m.type === "list") safeSend(ws, { type: "sessions", sessions: await enrichedSessions() });
 			else if (m.type === "put" && SESSION_ID_RE.test(id)) {
 				// Accept both formats: {jsonl} (native) and {data, metadata} (browser sessionSync legacy).
 				// bugs.md #13: convert to the worker's JSONL format here — ALL writers/reader shapes.

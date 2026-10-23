@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Fast test suites (no LLM, no network)
+        run: |
+          npm run test:versions
+          npm run test:fork
+          npm run test:compact
+          npm run test:zombie
+          npm run test:store
+          npm run test:runtime
+      - name: Build
+        run: npm run build

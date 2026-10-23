@@ -25,7 +25,8 @@
     "test:versions": "node tests/versions.test.mjs",
     "test:compact": "node tests/compact.test.mjs",
     "test:shutdown": "node tests/shutdown.test.mjs",
-    "test:killstop": "node tests/killstop.e2e.mjs"
+    "test:killstop": "node tests/killstop.e2e.mjs",
+    "test:zombie": "node tests/zombie.test.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.75.3",
@@ -58,5 +59,8 @@
   },
   "allowScripts": {
     "esbuild@0.25.12": true
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

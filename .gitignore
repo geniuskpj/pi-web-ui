@@ -64,3 +64,10 @@ credentials*.json
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# scratch probe output (P1 review 2026-10-23: two transcript dumps rode `git add -A`)
+tmp-*.json
+commit-review-*.md
+edit-vs-splice.md
+review-index.md
+session-sharing-report.md
