@@ -33,8 +33,8 @@
     "test:retry": "node tests/retry.test.mjs"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "0.75.3",
-    "@earendil-works/pi-ai": "0.75.3",
+    "@earendil-works/pi-agent-core": "1.4.0",
+    "@earendil-works/pi-ai": "1.4.0",
     "@hono/node-server": "^1.13.7",
     "diff": "^8.0.4",
     "domhandler": "^6.0.1",
@@ -63,8 +63,5 @@
   },
   "allowScripts": {
     "esbuild@0.25.12": true
-  },
-  "engines": {
-    "node": ">=22"
   }
 }

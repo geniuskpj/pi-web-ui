@@ -7,6 +7,10 @@
 //   - every connected device (laptop/phone) is a viewer/controller via /ws/agent
 // Clients can disconnect at any time — long jobs keep running server-side.
 import { Agent } from "@earendil-works/pi-agent-core";
+// pi-ai 1.4.0: AgentOptions.streamFn is REQUIRED — the compat subpath exports the
+// generic streamSimple dispatcher (routes on model.api) and auto-registers the
+// builtin api providers on import
+import { streamSimple } from "@earendil-works/pi-ai/compat";
 import crypto from "node:crypto";
 
 const HOT_AGENT_CAP = 10;
@@ -172,6 +176,7 @@ export class AgentHub {
 			const level = thinkingLevel || "high";
 			const systemPrompt = this.getSystemPrompt(); // undefined → pi's built-in chat default
 			const agent = new Agent({
+				streamFn: streamSimple, // pi-ai 1.4.0: streamFn required (compat generic dispatcher)
 				initialState: {
 					model,
 					thinkingLevel: level,
