@@ -20,6 +20,10 @@
 //      different text = version delta + truncate + re-prompt via the normal path
 import assert from "node:assert/strict";
 import { AgentHub } from "../agent-hub.mjs";
+import { makeVersionsStore } from "../lib/versions-sidecar.mjs";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 let pass = 0;
 const check = (name, cond, detail = "") => {
@@ -30,16 +34,11 @@ const check = (name, cond, detail = "") => {
 const asst = (text) => ({ role: "assistant", content: [{ type: "text", text }], stopReason: "stop", timestamp: 1 });
 const user = (text) => ({ role: "user", content: [{ type: "text", text }], timestamp: 1 });
 
-const versionStore = new Map(); // id -> records[]
-const versions = {
-	append: async (id, record) => {
-		const list = versionStore.get(id) || [];
-		const full = { ...record, vid: list.reduce((m, r) => Math.max(m, r.vid || 0), 0) + 1, at: Date.now() };
-		list.push(full); versionStore.set(id, list); return full;
-	},
-	list: async (id) => (versionStore.get(id) || []).map(({ messages, ...meta }) => meta),
-	get: async (id, vid) => (versionStore.get(id) || []).find((r) => r.vid === vid) || null,
-};
+// the REAL sidecar store (tmp dir) — exercises the production append/list/get
+// including the content-hash dedupe (user report 2026-10-24: every "switch to"
+// click re-parked a byte-identical tail)
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-versions-test-"));
+const versions = makeVersionsStore(tmpDir);
 
 const broadcasted = [];
 const hub = new AgentHub({
@@ -127,5 +126,26 @@ check("old tail verbatim in the delta", same(rc1.version.messages, base.slice(2)
 let threw2 = "";
 try { await hub.editCommit(S, 1, "x"); } catch (e) { threw2 = e.message; } // index 1 = assistant message
 check("edit-commit rejects non-user messages", /user messages/.test(threw2), threw2);
+
+// --- 9) SWITCH DEDUPE (user report 2026-10-24) --------------------------------
+// flipping between versions must not re-park byte-identical tails (live test
+// d9120621: vid3 == vid1, vid4 == vid2 — one edit + switches = 2 versions max)
+const S2 = "versionsdedupe000000000000000000000";
+hub.getSession(S2, { messages: [user("q1"), asst("a1"), user("q2"), asst("a2"), user("q3"), asst("a3")] });
+hub.sessions.get(S2).agent.prompt = async (content) => { hub.sessions.get(S2).agent.state.messages.push(user(content)); return { accepted: true, queued: false }; }; // stub the LLM run
+const rd = await hub.editCommit(S2, 2, "edited q2");
+check("one edit creates exactly ONE version", rd?.ok && (await versions.list(S2)).length === 1, `n=${(await versions.list(S2)).length}`);
+hub.sessions.get(S2).agent.state.messages.push(asst("a1x"), user("q2y"), asst("a2y")); // the run continues (3 more turns)
+await hub.restoreVersion(S2, rd.version.vid); // switch to the ORIGINAL
+check("switch to original captures the live tail once", (await versions.list(S2)).length === 2, `n=${(await versions.list(S2)).length}`);
+check("switched state = the original tail", same(hub.sessions.get(S2).agent.state.messages.slice(2), base.slice(2)));
+const swVid = (await versions.list(S2)).map((v) => v.vid).find((v) => v !== rd.version.vid);
+await hub.restoreVersion(S2, swVid); // switch BACK to the edited state
+check("switch back dedupes the re-parked original (still 2 versions)", (await versions.list(S2)).length === 2, `n=${(await versions.list(S2)).length}`);
+check("switched-back state = the edited tail", hub.sessions.get(S2).agent.state.messages.length === 6 && hub.sessions.get(S2).agent.state.messages[2]?.content?.[0]?.text === "edited q2");
+const rn = await hub.restoreVersion(S2, swVid); // click the version we are ALREADY on
+check("re-clicking the current version is a NOOP (no new version, no epoch bump)", rn?.ok && rn.noop === true && (await versions.list(S2)).length === 2, JSON.stringify(rn));
+await hub.restoreVersion(S2, rd.version.vid); // flip once more
+check("flip again — still exactly 2 versions", (await versions.list(S2)).length === 2, `n=${(await versions.list(S2)).length}`);
 
 console.log(`[versions] ${pass} check(s) passed`);
