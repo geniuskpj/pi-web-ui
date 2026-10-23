@@ -8,6 +8,10 @@ type Listener = (event: any) => void;
 type AnyRecord = Record<string, any>;
 import { makeId } from "./id.js";
 import { getCachedChunks, putChunk, gunzip, transferPolicy } from "./idb-cache.js";
+// BACKFILL step in MESSAGES (filledFrom is a seq, not bytes): generous ask —
+// the server clamps the response to 1MB serialized (~140 msgs on the 7.3MB
+// session) and reports the actual window in X-Range-* headers.
+const BACKFILL_MSGS = 400;
 
 export class ProxyAgent {
 	/** true = the loop runs server-side (agent-hub.mjs): runs survive browser
@@ -402,26 +406,29 @@ export class ProxyAgent {
 		if (!sparse || this.state.isStreaming) return;
 		while ((this.state as any).sparse && (this.state as any).sparse.filledFrom > 0 && !this.state.isStreaming) {
 			const filled = (this.state as any).sparse.filledFrom as number;
-			const from = Math.max(0, filled - 1024 * 1024); // BACKFILL_BYTES = 1MB (measured optimum)
+			// ask for a generous message window — the server CLAMPS to 1MB serialized
+			// (X-Range-* headers report the actual window; filledFrom advances to its top)
+			const from = Math.max(0, filled - BACKFILL_MSGS);
 			const ok = await this.fillWindow(from, filled);
 			if (!ok) return; // network/cache dead — the expand button remains
 		}
 	}
 
-	/** EXPAND (banner button / one 1MB step): fill the window above the loaded
-	 *  prefix — IDB first, network for the miss-set — and splice into the array. */
+	/** EXPAND (banner button / one server-clamped step): fill the window above the
+	 *  loaded prefix — IDB first, network for the miss-set. */
 	async expandEarlier(): Promise<boolean> {
 		const sparse = (this.state as any).sparse as { fromSeq: number; messageCount: number; rewriteSeq: number } | undefined;
 		if (!sparse) return false;
 		const filled = (this.state as any).sparse.filledFrom as number;
-		const from = Math.max(0, filled - 1024 * 1024);
+		const from = Math.max(0, filled - BACKFILL_MSGS);
 		return this.fillWindow(from, filled);
 	}
 
-	/** Fill [from,to): IDB cache first, then /range for the miss-set; splice into
-	 *  the sparse array (index = seq) and advance filledFrom. Returns false when
-	 *  a rewrite raced the fill (epoch/filledFrom moved) or the network failed. */
+	/** Fill [from,to): IDB cache first, then /range for the miss-set. The server
+	 *  may return a SMALLER window than asked (1MB serialized cap) — X-Range-From/
+	 *  To-Seq are authoritative and filledFrom advances to the returned top. */
 	private async fillWindow(from: number, to: number): Promise<boolean> {
+		const requestedTo = to;
 		try {
 			let msgs: any[] = [];
 			const cached = await getCachedChunks(this.sessionId, from, to);
@@ -432,7 +439,7 @@ export class ProxyAgent {
 			}
 			if (!fullyCached) {
 				const res = await fetch(`/api/agent/session/${encodeURIComponent(this.sessionId)}/range?fromSeq=${from}&toSeq=${to}`, { signal: AbortSignal.timeout(15000) });
-				if (!res.ok && res.status !== 204) return false;
+				if (!res.ok && res.status !== 204) { console.warn("[backfill] range fetch failed:", res.status); return false; }
 				const buf = await res.arrayBuffer();
 				const rs = Number(res.headers.get("x-range-from-seq") || from);
 				const re = Number(res.headers.get("x-range-to-seq") || to);
@@ -441,20 +448,20 @@ export class ProxyAgent {
 				// cache write-through: the SAME raw gzip bytes into IDB (decompress on read)
 				try { await putChunk(this.sessionId, rs, re, rsq, count, new Blob([buf], { type: "application/gzip" })); } catch { /* cache is best-effort */ }
 				const text = await gunzip(new Blob([buf], { type: "application/gzip" }));
-				if (text == null) return false;
-				const fetched = text.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-				msgs = fetched;
-				from = rs;
+				if (text == null) { console.warn("[backfill] gunzip failed"); return false; }
+				msgs = text.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+				from = rs; // SERVER-AUTHORITATIVE window (may be smaller than requested)
 				to = re;
 			}
-			// splice: PREPEND the older window to the dense array + advance filledFrom
+			// splice: PREPEND the older window to the dense array; filledFrom advances
+			// to the top of the RETURNED window. Race check against the REQUESTED top.
 			const sp = (this.state as any).sparse;
-			if (!sp || sp.filledFrom !== to) return false; // a rewrite raced the fill — abort
+			if (!sp || sp.filledFrom !== requestedTo) { console.warn("[backfill] raced a rewrite — window dropped"); return false; }
 			this.state.messages = [...msgs, ...this.state.messages];
 			sp.filledFrom = from;
 			this.notifyListeners({ type: "state-snapshot" });
 			return true;
-		} catch { return false; }
+		} catch (err: any) { console.warn("[backfill] fillWindow failed:", err?.message || err); return false; }
 	}
 
 	cancelSteering(): void {

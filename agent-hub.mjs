@@ -347,11 +347,11 @@ export class AgentHub {
 			const msgs = entry.agent.state.messages;
 			const count = msgs.length;
 			let bytes = 0, from = count;
-			while (from > 0 && (bytes < 512 * 1024 || from === count)) {
+			while (from > 0 && (bytes < 1024 * 1024 || from === count)) { // TAIL_BYTES = 1MB (user: 512KB felt too short)
 				from--;
 				try { bytes += JSON.stringify(msgs[from]).length; } catch { bytes += 256; }
 			}
-			if (from > 0 && bytes > 384 * 1024) { // only worth it when the tail is meaningfully smaller
+			if (from > 0 && bytes > 768 * 1024) { // only worth it when the tail is meaningfully smaller
 				state.messages = msgs.slice(from);
 				state.sparse = { fromSeq: from, messageCount: count, rewriteSeq: entry.rewriteSeq || 0, rewrittenFrom: entry.rewrittenFrom || 0 };
 			}
