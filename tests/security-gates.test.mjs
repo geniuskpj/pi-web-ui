@@ -7,6 +7,7 @@
 // are delivered fine by the ws client.
 // Usage: node tests/security-gates.test.mjs
 import http from "node:http";
+import os from "node:os";
 import WebSocket from "ws";
 import { startScratchServer } from "./_scratch-server.mjs";
 
@@ -86,5 +87,98 @@ try {
 } finally {
 	await srv.stop();
 }
+
+// ---------------------------------------------------------------------------
+// 2026-10-23 (session-sharing incident): the origin gate became MODE-dependent and
+// hostname-based. Row groups below are the regression set from the grok review —
+// loopback must stay locked down, remote peers with a token must work on ANY name.
+// ---------------------------------------------------------------------------
+const LAN = Object.values(os.networkInterfaces()).flat().find((n) => n && !n.internal && n.family === "IPv4")?.address;
+
+/** Request against an arbitrary scratch server. `via` switches the SOURCE address:
+ *  connecting to the machine's own LAN IP makes the server see a NON-loopback peer
+ *  (verified: remote + no token → 401), which is how the remote rows are exercised. */
+const req = (s, pathStr, headers = {}, via = "loopback") => new Promise((resolve) => {
+	const host = via === "remote" ? LAN : "127.0.0.1";
+	const r = http.request({ host, port: s.port, path: pathStr, method: "GET", headers }, (res) => {
+		res.resume();
+		res.on("end", () => resolve(res.statusCode));
+	});
+	r.on("error", () => resolve(-1));
+	r.setTimeout(15000, () => { r.destroy(); resolve(-2); });
+	r.end();
+});
+const wsUp = (s, pathStr, headers = {}, via = "loopback") => new Promise((resolve) => {
+	const r = http.request({ host: via === "remote" ? LAN : "127.0.0.1", port: s.port, path: pathStr, headers: { ...headers, Connection: "Upgrade", Upgrade: "websocket", "Sec-WebSocket-Version": "13", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==" } });
+	r.on("upgrade", () => resolve(101));
+	r.on("response", (x) => { x.resume(); resolve(x.statusCode); });
+	r.on("error", () => resolve(-1));
+	r.on("socket", (sock) => sock.on("error", () => {}));
+	r.end();
+});
+
+// --- auto (default): rebinding defense intact on loopback, token is enough remotely
+{
+	const s = await startScratchServer();
+	try {
+		check("auto: loopback + evil Host → 403 (rebinding)", (await req(s, "/api/sessions", { Host: "evil.com" })) === 403);
+		check("auto: loopback + evil Host + VALID token → still 403", (await req(s, "/api/sessions", { Host: "evil.com", "x-pi-web-token": s.token })) === 403);
+		check("auto: loopback + suffix trick localhost.evil.com → 403", (await req(s, "/api/sessions", { Host: `localhost.evil.com:${s.port}` })) === 403);
+		check("auto: loopback + Origin null → 403 (fail closed)", (await req(s, "/api/sessions", { Host: `localhost:${s.port}`, Origin: "null" })) === 403);
+		check("auto: loopback + localhost Host → 200", (await req(s, "/api/sessions", { Host: `localhost:${s.port}` })) === 200);
+		if (LAN) {
+			check("auto: remote + no token → 401", (await req(s, "/api/sessions", { Host: `${LAN}:${s.port}` }, "remote")) === 401);
+			check("auto: remote + token + ANY domain Host → 200 (the fix)", (await req(s, "/api/sessions", { Host: `pi.example.com:${s.port}`, "x-pi-web-token": s.token }, "remote")) === 200);
+			check("auto: remote + token + evil Origin → 200 (token is the boundary)", (await req(s, "/api/sessions", { Host: `pi.example.com:${s.port}`, Origin: "http://evil.com", "x-pi-web-token": s.token }, "remote")) === 200);
+			check("auto: remote + ?token= on HTTP → 401 (WS-only query token)", (await req(s, `/api/sessions?token=${encodeURIComponent(s.token)}`, { Host: `pi.example.com:${s.port}` }, "remote")) === 401);
+			check("auto: remote + X-Forwarded-For:127.0.0.1 → 401 (never trusted)", (await req(s, "/api/sessions", { Host: `${LAN}:${s.port}`, "X-Forwarded-For": "127.0.0.1" }, "remote")) === 401);
+			check("auto: remote + token + WS /ws/sync → 101", (await wsUp(s, "/ws/sync", { Host: `pi.example.com:${s.port}`, Origin: `http://pi.example.com:${s.port}`, "x-pi-web-token": s.token }, "remote")) === 101);
+			check("auto: remote + no token + WS → 401", (await wsUp(s, "/ws/sync", { Host: `pi.example.com:${s.port}` }, "remote")) === 401);
+		}
+		// always-token routes stay always-token, mode notwithstanding
+		check("auto: /api/pi/keys loopback no token → 401", (await req(s, "/api/pi/keys", { Host: `localhost:${s.port}` })) === 401);
+		check("auto: /api/ws/file loopback no token → 401", (await req(s, "/api/ws/file?path=README.md", { Host: `localhost:${s.port}` })) === 401);
+	} finally { await s.stop(); }
+}
+
+// --- PI_WEB_TERM_ORIGIN: portless (TLS proxy) shapes now match (PL-3)
+{
+	process.env.PI_WEB_TERM_ORIGIN = "pi.example.com";
+	const s = await startScratchServer();
+	try {
+		check("name: loopback + portless https Origin → 200", (await req(s, "/api/sessions", { Host: "pi.example.com", Origin: "https://pi.example.com" })) === 200);
+		check("name: loopback + https://evil.com → 403", (await req(s, "/api/sessions", { Host: "pi.example.com", Origin: "https://evil.com" })) === 403);
+		check("name: WS + portless https Origin → 101", (await wsUp(s, "/ws/sync", { Host: "pi.example.com", Origin: "https://pi.example.com" })) === 101);
+		if (LAN) check("name: remote + token + portless Origin → 200", (await req(s, "/api/sessions", { Host: "pi.example.com", Origin: "https://pi.example.com", "x-pi-web-token": s.token }, "remote")) === 200);
+	} finally { await s.stop(); delete process.env.PI_WEB_TERM_ORIGIN; }
+}
+
+// --- strict: the pre-2026-10-23 behaviour must remain selectable (Host pinned even
+// for token holders — only names in the allowlist pass)
+{
+	process.env.PI_WEB_ORIGIN_GATE = "strict";
+	process.env.PI_WEB_TERM_ORIGIN = "pi.example.com";
+	const s = await startScratchServer();
+	try {
+		check("strict: loopback + evil Host → 403", (await req(s, "/api/sessions", { Host: "evil.com" })) === 403);
+		if (LAN) {
+			check("strict: remote + token + UNLISTED name → 403 (old behaviour)", (await req(s, "/api/sessions", { Host: `other.example.net:${s.port}`, "x-pi-web-token": s.token }, "remote")) === 403);
+			check("strict: remote + token + ALLOWLISTED name → 200", (await req(s, "/api/sessions", { Host: `pi.example.com:${s.port}`, "x-pi-web-token": s.token }, "remote")) === 200);
+			check("strict: remote + token + WS unlisted Origin → 403", (await wsUp(s, "/ws/sync", { Host: `pi.example.com:${s.port}`, Origin: "http://other.example.net", "x-pi-web-token": s.token }, "remote")) === 403);
+		}
+	} finally { await s.stop(); delete process.env.PI_WEB_ORIGIN_GATE; delete process.env.PI_WEB_TERM_ORIGIN; }
+}
+
+// --- off: the documented foot-gun (must be LOUD at boot)
+{
+	process.env.PI_WEB_ORIGIN_GATE = "off";
+	const s = await startScratchServer();
+	try {
+		check("off: loopback + evil Host, no token → 200 (gate disabled)", (await req(s, "/api/sessions", { Host: "evil.com" })) === 200);
+		check("off: /api/pi/keys still requires the token → 401", (await req(s, "/api/pi/keys", { Host: "evil.com" })) === 401);
+		check("off: boot log carries the WARNING", s.log().includes("WARNING: PI_WEB_ORIGIN_GATE=off"));
+	} finally { await s.stop(); delete process.env.PI_WEB_ORIGIN_GATE; }
+}
+
 console.log(`\n[security-gates] ${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

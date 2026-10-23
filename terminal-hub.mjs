@@ -335,7 +335,8 @@ export function createTerminalHub({
 	agentDir,
 	dataDir,
 	killTree,
-	allowedOrigins, // Set<host:port> — browsers' Origin must match (see header)
+	allowedOrigins, // Set — allowlisted hostnames (server.mjs hostName()); a `host:port`
+	//                 entry still matches, the port is stripped before the lookup
 	isLoopback, // (req) => boolean
 	debug = () => {},
 	stripWs = (s) => s,
@@ -958,7 +959,10 @@ export function createTerminalHub({
 			} catch {
 				/* reject below */
 			}
-			if (!host || !origins.has(host)) {
+			// port-insensitive (2026-10-23): a TLS proxy on 443 sends Origin `https://name`
+			// (`host` = "name", no port) while the allowlist may hold "name:PORT"
+			const name = host ? (host.startsWith("[") ? host.replace(/\]:\d+$/, "]") : host.split(":")[0]) : null;
+			if (!host || !(origins.has(host) || (name && origins.has(name)))) {
 				debug("[term] rejected cross-origin WS from", origin);
 				socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
 				socket.destroy();

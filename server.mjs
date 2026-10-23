@@ -141,8 +141,19 @@ function isLoopback(req) {
 	const ra = String(req?.socket?.remoteAddress || "");
 	return ra === "127.0.0.1" || ra === "::1" || ra === "::ffff:127.0.0.1";
 }
+// The ?token= QUERY form exists for WebSocket upgrades only (WS cannot set custom
+// headers). Plain HTTP must use the header: query tokens leak via Referer, browser
+// history and reverse-proxy logs, and WS has NO CORS — a foreign page could
+// otherwise dial ws://host/ws/…?token=… if the URL ever escaped (grok review
+// 2026-10-23). Loopback peers are unaffected (they skip the token gate).
+const QUERY_TOKEN_PATH = /^\/ws\//;
 function requestToken(req) {
-	return String(req?.headers?.["x-pi-web-token"] || new URL(req.url, "http://x").searchParams.get("token") || "");
+	const h = req?.headers?.["x-pi-web-token"];
+	if (h) return String(h);
+	let u = null;
+	try { u = new URL(String(req?.url || "/"), "http://x"); } catch { return ""; }
+	if (!QUERY_TOKEN_PATH.test(u.pathname)) return "";
+	return String(u.searchParams.get("token") || "");
 }
 function tokenMatches(req) {
 	// constant-time compare (timing side-channel is low-severity here, but it's one line)
@@ -154,6 +165,27 @@ function authorized(req) {
 	return isLoopback(req) || (AUTH_TOKEN && tokenMatches(req));
 }
 
+// --- origin-gate mode (2026-10-23, grok-reviewed) -----------------------------
+// The Host/Origin allowlist defends the LOOPBACK TRUST EXEMPTION (a rebinding page
+// served from evil.com:PORT whose DNS flips to 127.0.0.1 arrives as a loopback peer
+// and would otherwise skip the token). It is NOT a second factor on the token: for a
+// remote peer that presents the token it added no security and broke every custom
+// DNS name (the 2026-10-23 session-sharing incident). So the strictness is a knob:
+//   auto   (default) — gate loopback peers only; remote peers need the token
+//   strict           — gate every /api/* + WS peer (the pre-2026-10-23 behaviour)
+//   off              — no gate at all — FOOT-GUN: a rebinding page can then read
+//                      /api/sessions and friends with NO token (warned at boot)
+const ORIGIN_GATE = (() => {
+	const v = String(process.env.PI_WEB_ORIGIN_GATE || "auto").trim().toLowerCase();
+	return v === "strict" || v === "off" ? v : "auto";
+})();
+/** Should the Host/Origin allowlist be enforced for this request? */
+function originGateApplies(req) {
+	if (ORIGIN_GATE === "off") return false;
+	if (ORIGIN_GATE === "strict") return true;
+	return isLoopback(req);
+}
+
 // --- browser-origin allowlist (DNS-rebinding defense) ------------------------
 // Loopback-trust alone is not a browser boundary: a rebinding hostname (or a
 // public DNS name that already points at 127.0.0.1, e.g. *.nip.io / localtest.me)
@@ -163,10 +195,29 @@ function authorized(req) {
 // sends one) to name a host this server is ACTUALLY reachable on. The same set
 // backs the /ws/sync + /ws/agent upgrade gates and the terminal hub. Custom DNS
 // names / reverse proxies: add them via PI_WEB_TERM_ORIGIN.
+// `ALLOWED_HOSTS` keeps the exact `host:port` form (logs, terminal hub, docs) while
+// `ALLOWED_NAMES` holds the bare hostnames — matching is done on the HOSTNAME so a
+// portless Origin (TLS reverse proxy on 443: `new URL("https://x").host` === "x")
+// and any-port Host both resolve. Both sets get every entry.
 const ALLOWED_HOSTS = new Set();
+const ALLOWED_NAMES = new Set();
+/** Canonical hostname: lowercase, trailing FQDN dot stripped, port stripped,
+ *  IPv6 kept bracketed (`[::1]:8787` → `[::1]`). Returns "" when there is nothing. */
+function hostName(h) {
+	let v = String(h || "").toLowerCase().trim().replace(/\.+$/, "");
+	if (!v) return "";
+	if (v.startsWith("[")) { const i = v.indexOf("]"); return i < 0 ? v : v.slice(0, i + 1); }
+	const i = v.lastIndexOf(":");
+	return i < 0 ? v : v.slice(0, i);
+}
 (function buildAllowedHosts() {
 	const port = String(PORT);
-	const add = (h) => ALLOWED_HOSTS.add(`${String(h).toLowerCase()}:${port}`);
+	const add = (h) => {
+		const hp = `${String(h).toLowerCase()}:${port}`;
+		ALLOWED_HOSTS.add(hp);
+		const n = hostName(hp);
+		if (n) ALLOWED_NAMES.add(n);
+	};
 	add("localhost");
 	add("127.0.0.1");
 	add("[::1]");
@@ -188,13 +239,20 @@ const ALLOWED_HOSTS = new Set();
 		const isV6 = !v.includes("]") && (v.match(/:/g) || []).length > 1;
 		if (isV6) v = `[${v}]`;
 		const hasPort = isV6 ? v.includes("]:") : v.includes(":");
-		ALLOWED_HOSTS.add(hasPort ? v : `${v}:${port}`);
+		const hp = hasPort ? v : `${v}:${port}`;
+		ALLOWED_HOSTS.add(hp);
+		const n = hostName(hp);
+		if (n) ALLOWED_NAMES.add(n);
 	}
 })();
 function headerHostAllowed(hostHeader) {
 	let h = String(hostHeader || "").toLowerCase().trim();
 	if (!h) return false;
 	h = h.replace(/\.+$/, ""); // FQDN trailing dot: "localhost." → "localhost"
+	// port-insensitive match first: an allowlisted NAME accepts any port (a TLS proxy
+	// forwards `Host: name` and the browser omits :443 from the Origin)
+	const name = hostName(h);
+	if (name && ALLOWED_NAMES.has(name)) return true;
 	// portless Host (browsers omit :80/:443): normalize to host:PORT before the set lookup
 	if (/^\[[^\]]+\]$/.test(h)) h = `${h}:${PORT}`; // bracketed IPv6 without port
 	else if (!h.includes(":")) h = `${h}:${PORT}`;
@@ -207,8 +265,10 @@ function browserOriginAllowed(req) {
 	const origin = req?.headers?.origin;
 	if (!origin) return true; // non-browser — token gate still applies where required
 	let oh = null;
-	try { oh = new URL(origin).host.toLowerCase(); } catch { return false; } // malformed Origin
-	return !!oh && ALLOWED_HOSTS.has(oh);
+	try { oh = new URL(origin).host.toLowerCase(); } catch { return false; } // malformed Origin ("null") → fail closed
+	if (!oh) return false;
+	const n = hostName(oh);
+	return ALLOWED_HOSTS.has(oh) || !!(n && ALLOWED_NAMES.has(n));
 }
 
 // --- MIME types -------------------------------------------------------------
@@ -223,21 +283,18 @@ const MIME = {
 const app = new Hono();
 
 app.use("*", async (c, next) => {
+	const incoming = c.env?.incoming;
+	const guarded = c.req.path.startsWith("/api/") && c.req.path !== "/api/health";
 	// blanket auth gate: every /api/* call from a non-loopback peer needs the token
 	// (health is exempt — it only reports build/uptime, no secrets)
-	if (c.req.path.startsWith("/api/") && c.req.path !== "/api/health" && !authorized(c.env?.incoming)) {
+	if (guarded && !authorized(incoming)) {
 		return c.json({ error: "unauthorized — set x-pi-web-token (see data/auth-token.txt)" }, 401);
 	}
-	// browser-origin gate for privileged routes (DNS-rebinding defense — see
-	// browserOriginAllowed above): Host and Origin must be allowlisted even for
-	// loopback peers. Runs AFTER the token gate: a valid non-loopback token holder
-	// still needs a real Host.
-	if (
-		c.req.path.startsWith("/api/") &&
-		c.req.path !== "/api/health" &&
-		!browserOriginAllowed(c.env?.incoming)
-	) {
-		return c.json({ error: "forbidden — Host/Origin not allowlisted for /api/* routes (custom names: PI_WEB_TERM_ORIGIN)" }, 403);
+	// browser-origin gate (DNS-rebinding defense — see originGateApplies above):
+	// auto = loopback peers only (a remote peer already proved the token); strict =
+	// every peer; off = disabled. Runs AFTER the token gate.
+	if (guarded && originGateApplies(incoming) && !browserOriginAllowed(incoming)) {
+		return c.json({ error: "forbidden — Host/Origin not allowlisted for /api/* routes (custom names: PI_WEB_TERM_ORIGIN; disable with PI_WEB_ORIGIN_GATE=off)" }, 403);
 	}
 	const start = Date.now();
 	await next();
@@ -1834,7 +1891,7 @@ const wss = new WebSocketServer({ noServer: true, maxPayload: 25 * 1024 * 1024 }
 // against the Host header would NOT stop DNS-rebinding (attacker.com rebinds to
 // 127.0.0.1, Host stays attacker.com — equal Origin+Host, game over). Compare
 // against the hosts this server is ACTUALLY reachable on instead.
-const TERM_ALLOWED_ORIGINS = ALLOWED_HOSTS;
+const TERM_ALLOWED_ORIGINS = ALLOWED_NAMES; // bare hostnames — the hub strips the port too
 
 const terminalHub = createTerminalHub({
 	workspaceDir: WORKSPACE_DIR,
@@ -2335,12 +2392,17 @@ const httpServer = serve({ fetch: app.fetch, port: PORT, hostname: HOST }, (info
 	console.log(`[pi-web] open:      http://localhost:${info.port}`);
 	for (const ip of lan) console.log(`[pi-web]      also: http://${ip}:${info.port}   (mobile / LAN)`);
 	if (lan.length > 0) console.log(`[auth] non-loopback callers need the API token: ${AUTH_TOKEN_FILE} (localhost is exempt)`);
+	console.log(`[auth] origin gate: ${ORIGIN_GATE}${ORIGIN_GATE === "auto" ? " (loopback peers only; remote peers need the token)" : ORIGIN_GATE === "strict" ? " (every peer)" : ""}`);
+	if (ORIGIN_GATE === "off") console.warn("[auth] WARNING: PI_WEB_ORIGIN_GATE=off — a DNS-rebinding page (evil.com → 127.0.0.1) can read /api/sessions and friends with NO token. Use auto (default) unless you know why you need this.");
+	if (ORIGIN_GATE === "off" && /^(0\.0\.0\.0|::|\*)$/.test(HOST)) console.warn(`[auth] WARNING: origin gate is off AND the server listens on ${HOST} — every interface is exposed without the rebinding defense.`);
 }).on("upgrade", (req, socket, head) => {
 	const { pathname } = new URL(req.url, "http://localhost");
+	const loopbackPeer = isLoopback(req);
+	const tokenOk = !!AUTH_TOKEN && tokenMatches(req);
 	// /ws/* carries session metadata + agent streams — token-gate non-loopback peers
 	// (rejections are LOGGED — silent 401/403 upgrades made the 2026-10-23 mobile
 	// stranding incident needlessly hard to diagnose)
-	if (!isLoopback(req) && !authorized(req)) {
+	if (!loopbackPeer && !tokenOk) {
 		console.log(`[ws] 401 upgrade rejected: ${pathname} host=${req.headers.host} token=${requestToken(req) ? "present" : "missing"}`);
 		socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n"); socket.destroy(); return;
 	}
@@ -2349,11 +2411,13 @@ const httpServer = serve({ fetch: app.fetch, port: PORT, hostname: HOST }, (info
 	// Origin over a loopback socket (token-gated paths never fire for loopback).
 	// Missing Origin = non-browser client: allowed (the token gate above still
 	// applies to non-loopback peers). /ws/terminal does its own stricter check.
-	if ((pathname === "/ws/sync" || pathname === "/ws/agent") && req.headers.origin) {
+	// Mode-dependent: auto gates loopback peers only (a remote peer proved the token).
+	if ((pathname === "/ws/sync" || pathname === "/ws/agent") && req.headers.origin && originGateApplies(req)) {
 		let oh = null;
 		try { oh = new URL(String(req.headers.origin)).host.toLowerCase(); } catch { oh = null; }
-		if (!oh || !ALLOWED_HOSTS.has(oh)) {
-			console.log(`[ws] 403 upgrade rejected: ${pathname} origin=${String(req.headers.origin)} (not in Host allowlist)`);
+		const on = oh ? hostName(oh) : null;
+		if (!oh || !(ALLOWED_HOSTS.has(oh) || (on && ALLOWED_NAMES.has(on)))) {
+			console.log(`[ws] 403 upgrade rejected: ${pathname} origin=${String(req.headers.origin)} (not in Host allowlist; mode=${ORIGIN_GATE})`);
 			socket.write("HTTP/1.1 403 Forbidden\r\n\r\n"); socket.destroy(); return;
 		}
 	}
