@@ -2047,3 +2047,25 @@ html.dark .pw-retry-giveup-note { color: #fbbf24; }
 	.pw-retry-actions .pw-retry-cancel { width: 100%; min-height: 44px; }
 	.pw-set-subrow { margin-left: 6px; }
 }
+
+/* --- mobile multi-line entry: long-press edit + Enter=newline (2026-10-24) --- */
+/* long-press feedback on the user bubble (sonnet-5 design): slight shrink+dim  */
+.pw-msg.pw-user { transition: transform 0.08s ease, opacity 0.08s ease; }
+.pw-msg.pw-user.pw-msg--pressed { transform: scale(0.98); opacity: 0.85; }
+/* our long-press owns the hold gesture on mutable user bubbles — suppress the
+   iOS Copy/Share callout + Android text-selection menu (double-tap select and
+   drag handles still work; the ✎ + Copy controls remain for copy) */
+.pw-msg.pw-user { -webkit-touch-callout: none; }
+/* ✎ must be reachable WITHOUT hover on touch — always visible, 44px target */
+@media (pointer: coarse) {
+	.pw-msg-actions { opacity: 1; pointer-events: auto; }
+	.pw-msg-act { min-width: 44px; min-height: 44px; }
+}
+/* model pill: hide the "provider/" prefix on narrow screens (user request) —
+   "z-ai/glm-5.3-flash" becomes "glm-5.3-flash"; tooltip + picker keep the id */
+@media (max-width: 48rem) {
+	.pw-pill-provider { display: none; }
+}
+/* attach button: SVG paperclip inherits the pill color (the emoji was dark in
+   both themes) — size matches the pill text */
+.pw-attach-btn svg { width: 13px; height: 13px; vertical-align: -2px; }

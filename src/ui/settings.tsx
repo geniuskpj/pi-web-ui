@@ -9,6 +9,7 @@ import type { Agent } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import { useEffect, useState } from "preact/hooks";
 import { getAppStorage } from "../storage.js";
+import { enterSendsPref } from "./chat.js";
 import { getProxyUrlSync } from "./proxy-stream.js";
 import { retryServerAuth } from "../server-auth.js"; // re-probe after a token change (clears the banner)
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
@@ -42,6 +43,9 @@ export function SettingsDialog({
 		try { return Math.max(1000, Math.min(60000, Number(localStorage.getItem("pi.autoRetryDelayMs")) || 3000)); } catch { return 3000; }
 	});
 	const [keys, setKeys] = useState<string[]>([]);
+	// Enter-key behavior (mobile multi-line, sonnet-5 design): tri-state pref read
+	// from the same localStorage key the Editor consumes (pi.enterSends)
+	const [enterPref, setEnterPref] = useState<string>(() => enterSendsPref());
 	const [quota, setQuota] = useState<{ usage: number; percent: number } | null>(null);
 	const [saved, setSaved] = useState("");
 	// thinking level is read from agent.state at render (no stale local snapshot —
@@ -227,6 +231,28 @@ export function SettingsDialog({
 								add key
 							</button>
 						</div>
+					</section>
+
+					<section class="pw-set-section">
+						<h3>Composer</h3>
+						<label class="pw-set-row">
+							<span>Enter key</span>
+							<select
+								class="pi-input pw-set-input"
+								value={enterPref}
+								onChange={(e) => {
+									const v = (e.target as HTMLSelectElement).value;
+									setEnterPref(v as any);
+									try { localStorage.setItem("pi.enterSends", v); } catch { /* quota */ }
+									flash(v === "always" ? "Enter sends — Shift+Enter for newline" : v === "never" ? "Enter makes a newline — send with the button" : "Enter: auto (newline on touch, send on desktop)");
+								}}
+							>
+								<option value="auto">Auto — newline on touch, send on desktop</option>
+								<option value="always">Always send</option>
+								<option value="never">Always newline (send with the button)</option>
+							</select>
+						</label>
+						<div class="pw-hint">Long-press one of YOUR messages to edit it on touch screens. Ctrl/Cmd+Enter always sends, in every mode.</div>
 					</section>
 
 					<section class="pw-set-section">

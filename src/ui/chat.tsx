@@ -138,6 +138,47 @@ function UserBubble({ message, onOpenFile, index, canMutate, onEditMessage, edit
 		setTimeout(() => editBtnRef.current?.focus(), 0);
 	};
 	const actions = canMutate && typeof index === "number" && onEditMessage && !editing;
+	// LONG-PRESS → edit (mobile multi-line entry, sonnet-5 design 2026-10-24):
+	// touch/pen only (mouse long-press fights text-drag-select), 480ms (~native
+	// window), 10px move-slop cancels on scroll, fire-time selection check (the OS
+	// mid-selection-drag wins), haptic tick, ✎ stays as the explicit control.
+	const pressRef = useRef<{ x: number; y: number; id: number } | null>(null);
+	const pressTimer = useRef<number | null>(null);
+	const [pressed, setPressed] = useState(false);
+	const clearPress = () => {
+		if (pressTimer.current) { clearTimeout(pressTimer.current); pressTimer.current = null; }
+		pressRef.current = null;
+		setPressed(false);
+	};
+	useEffect(() => clearPress, []); // unmount mid-press: no late onEditMessage
+	const pressFire = () => {
+		const sel = window.getSelection?.()?.toString();
+		clearPress();
+		if (sel) return; // user was selecting text, not requesting edit
+		if (typeof index !== "number") return;
+		if (navigator.vibrate) { try { navigator.vibrate(12); } catch { /* unsupported */ } }
+		onEditMessage?.(index);
+	};
+	const onBubblePointerDown = (e: any) => {
+		if (!canMutate) return;
+		if (e.pointerType !== "touch" && e.pointerType !== "pen") return; // desktop: ✎ only
+		if ((e.target as HTMLElement)?.closest?.(".pw-msg-act")) return; // press ON ✎ = tap
+		if (pressRef.current) return; // defensive multitouch: one pointer at a time
+		pressRef.current = { x: e.clientX, y: e.clientY, id: e.pointerId };
+		setPressed(true);
+		pressTimer.current = window.setTimeout(pressFire, 480);
+	};
+	const onBubblePointerMove = (e: any) => {
+		const s = pressRef.current;
+		if (!s || s.id !== e.pointerId) return;
+		if (Math.hypot(e.clientX - s.x, e.clientY - s.y) > 10) clearPress(); // scroll
+	};
+	const onBubblePointerEnd = (e: any) => {
+		if (pressRef.current?.id === e.pointerId) clearPress();
+	};
+	const onBubbleContextMenu = (e: any) => {
+		if (canMutate && !editing) e.preventDefault(); // our long-press owns the hold gesture (iOS callout / Android menu)
+	};
 	return (
 		<div class={"pw-msg-row pw-user-row" + (dimmed ? " pw-will-replace" : "")}>
 			{editing ? (
@@ -167,7 +208,14 @@ function UserBubble({ message, onOpenFile, index, canMutate, onEditMessage, edit
 						{onEditMessage && <button ref={editBtnRef} type="button" class="pw-msg-act" aria-label="Edit message" title="Edit message — the old turn becomes a restorable version when you save a different text" onClick={() => onEditMessage(index)}>✎</button>}
 					</div>
 				)}
-				<div class="pw-msg pw-user">
+				<div
+					class={"pw-msg pw-user" + (pressed ? " pw-msg--pressed" : "")}
+					onPointerDown={onBubblePointerDown}
+					onPointerMove={onBubblePointerMove}
+					onPointerUp={onBubblePointerEnd}
+					onPointerCancel={onBubblePointerEnd}
+					onContextMenu={onBubbleContextMenu}
+				>
 					<div class="pw-text-plain">{text}</div>
 				{files.length > 0 && onOpenFile && (
 					<div class="pw-user-files">
@@ -481,6 +529,11 @@ function renderMarkdownCached(text: string): string {
 // makes the opened dropdown options invisible on Windows Chrome).
 // ----------------------------------------------------------------------------
 function ModelPill({ model, onPickModel }: { model?: any; onPickModel: () => void }) {
+	// mobile (user request 2026-10-24): hide the "provider/" prefix — narrow
+	// screens show just the model name ("glm-5.3-flash", not "z-ai/glm-5.3-flash");
+	// the tooltip + the picker keep the full id. CSS hides pw-pill-provider <48rem.
+	const id = String(model?.id || "");
+	const slash = id.indexOf("/");
 	return (
 		<button
 			type="button"
@@ -489,7 +542,10 @@ function ModelPill({ model, onPickModel }: { model?: any; onPickModel: () => voi
 			aria-haspopup="dialog"
 			onClick={onPickModel}
 		>
-			<span class="pw-pill-text">{model ? model.id : "model"}</span>
+			<span class="pw-pill-text">
+				{slash > 0 && <span class="pw-pill-provider" aria-hidden="true">{id.slice(0, slash + 1)}</span>}
+				{slash > 0 ? id.slice(slash + 1) : (id || "model")}
+			</span>
 			<span class="pw-pill-caret" aria-hidden="true" />
 		</button>
 	);
@@ -1133,6 +1189,34 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 const DRAFT_KEY = "pi.web.draft";
 const MAX_TEXT_ATTACH = 6;
 const MAX_IMAGE_ATTACH = 4;
+/** Feather-style paperclip (stroke=currentColor) — an emoji 📎 renders
+ *  fixed-size and dark in BOTH themes (user report); SVG inherits the pill's
+ *  color and scales with it. Same pattern as main.tsx's Icon. */
+const PaperclipIcon = () => (
+	<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+		<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+	</svg>
+);
+// ENTER BEHAVIOR (mobile multi-line, sonnet-5 design 2026-10-24): desktop
+// Enter=send is unchanged; on coarse pointers (phones) Enter inserts a newline —
+// the soft keyboard has no Shift/Ctrl, so Enter=send made multi-line IMPOSSIBLE
+// (user report). Tri-state pref for the counter-case (bluetooth keyboard on a
+// tablet): "auto" | "always" | "never" in pi.enterSends. Ctrl/Cmd+Enter always
+// sends in every mode — one muscle-memory shortcut app-wide (mirrors the edit
+// textarea's Ctrl+Enter=Resubmit). enterkeyhint relabels the soft key to match.
+type EnterSendsPref = "auto" | "always" | "never";
+export const enterSendsPref = (): EnterSendsPref => {
+	try {
+		const v = localStorage.getItem("pi.enterSends");
+		if (v === "always" || v === "never" || v === "auto") return v;
+	} catch { /* private mode */ }
+	return "auto";
+};
+const computeEnterSends = (pref: EnterSendsPref) => {
+	if (pref === "always") return true;
+	if (pref === "never") return false;
+	try { return !window.matchMedia("(pointer: coarse)").matches; } catch { return true; }
+};
 
 export function Editor({
 	agent,
@@ -1275,6 +1359,9 @@ export function Editor({
 	};
 	const ext = (p: string) => (p.match(/\.([a-z0-9]+)$/i)?.[1] || "").toLowerCase();
 	const fenceLang = (p: string) => ({ ts: "ts", tsx: "tsx", js: "js", jsx: "jsx", py: "python", json: "json", md: "md", css: "css", html: "html", yml: "yaml", yaml: "yaml", sh: "bash", bat: "bat", sql: "sql", rs: "rust", go: "go", java: "java", c: "c", cpp: "cpp", cs: "csharp" } as Record<string, string>)[ext(p)] || "";
+	// recomputed per render (cheap matchMedia) — a settings change applies on the
+	// next keystroke without any event plumbing
+	const enterSends = computeEnterSends(enterSendsPref());
 
 	const send = async () => {
 		const text = value.trim();
@@ -1391,13 +1478,22 @@ export function Editor({
 
 	const onKeyDown = (e: KeyboardEvent) => {
 		if (e.key !== "Enter") return;
-		// IME-safe: never send while composing
+		// IME-safe: never send while composing (checked FIRST — unchanged)
 		if (composing.current || (e as any).isComposing || e.keyCode === 229) return;
-		if (!e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+		// Ctrl/Cmd+Enter always sends — universal override in every enterSends mode
+		if (e.ctrlKey || e.metaKey) {
 			e.preventDefault();
-			// streaming + server-side ⇒ Enter STEERS (held until the step completes)
 			if (!streaming || (agent as any).serverSide) send();
+			return;
 		}
+		// newline mode (coarse pointer / "never" pref): let the browser insert \n —
+		// this is the fix for "can't use return key" on mobile
+		if (!enterSends) return;
+		// desktop Shift+Enter / Alt+Enter still insert a newline
+		if (e.shiftKey || e.altKey) return;
+		e.preventDefault();
+		// streaming + server-side ⇒ Enter STEERS (held until the step completes)
+		if (!streaming || (agent as any).serverSide) send();
 	};
 
 	return (
@@ -1439,6 +1535,7 @@ export function Editor({
 					class="pw-input"
 					placeholder={streaming ? "Generating… (Stop to interrupt)" : "Message pi…"}
 					rows={1}
+					enterkeyhint={enterSends ? "send" : "enter"}
 					value={value}
 					onInput={(e) => setValue((e.target as HTMLTextAreaElement).value)}
 					onKeyDown={onKeyDown}
@@ -1453,7 +1550,7 @@ export function Editor({
 						title="Attach workspace files (or paste an image)"
 						onClick={onOpenPicker}
 					>
-						+ files
+						<PaperclipIcon />
 					</button>
 					<ModelPill model={agent.state.model} onPickModel={() => onPickModel?.()} />
 					<EffortPill agent={agent} />
