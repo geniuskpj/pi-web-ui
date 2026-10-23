@@ -361,7 +361,17 @@ app.use("*", async (c, next) => {
 	}
 });
 
-app.get("/api/health", (c) => c.json({ ok: true, bootId: BOOT_ID, buildId: BUILD_ID, piDir: PI_DIR }));
+app.get("/api/health", (c) => {
+	// TRANSFER POLICY (tail-first plan, 2026-10-24): the client decides tail-only
+	// vs full backfill from navigator.connection + this netClass fallback (the
+	// HTTP layer cannot see the client's link type — peer/Host classification is
+	// the server's only signal; the browser's NIA outranks it client-side).
+	const peer = c.env?.incoming?.socket?.remoteAddress || c.req.header("x-forwarded-for")?.split(",")[0]?.trim() || "";
+	const host = c.req.header("host") || "";
+	const isPrivate = (s) => /^(localhost|127\.|\[::1\]|::1|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.)/.test(s);
+	const netClass = isPrivate(peer) || isPrivate(host.split(":")[0]) ? "lan" : "remote";
+	return c.json({ ok: true, bootId: BOOT_ID, buildId: BUILD_ID, piDir: PI_DIR, netClass });
+});
 app.get("/api/version", (c) => c.json({ buildId: BUILD_ID, bootId: BOOT_ID }));
 app.get("/api/pi/config", (c) => { refreshModelsStore(); agentHub.defaultModelId = piDefaultModelId(); return c.json(piConfig()); });
 // pi system-prompt files — mirror pi-coding-agent resource-loader resolution exactly:
@@ -1954,7 +1964,7 @@ import { SESSION_ID_RE } from "./session-id.mjs"; // shared with session-worker.
 let legacySyncPuts = 0; // count of legacy {data,metadata} puts — compat shim (bugs.md #15)
 let lastLegacyPutAt = 0; // epoch ms of last legacy put — decides when the shim can be removed
 const agentClients = new Map();
-const wss = new WebSocketServer({ noServer: true, maxPayload: 25 * 1024 * 1024 });
+const wss = new WebSocketServer({ noServer: true, maxPayload: 25 * 1024 * 1024, perMessageDeflate: process.env.PI_WEB_WS_DEFLATE === "off" ? false : { threshold: 1024, zlibDeflateOptions: { level: 6 } } });
 
 // --- pseudo-terminal hub (NO node-pty): winpty.exe ships with Git for Windows
 // (real hidden console → echo/colors/^C/history); falls back to bash -i over
@@ -2173,6 +2183,8 @@ function agentConn(ws) {
 							modelId: prev.metadata.modelId,
 							thinkingLevel: prev.metadata.thinkingLevel,
 							messages: prev.messages,
+							rewriteSeq: prev.metadata.rewriteSeq,
+							rewrittenFrom: prev.metadata.rewrittenFrom,
 						});
 						} else {
 						// fresh session: honor the client's chosen model/effort (grok r3:
@@ -2180,8 +2192,10 @@ function agentConn(ws) {
 						agentHub.getSession(currentSession, { modelId: m.modelId, thinkingLevel: m.thinkingLevel });
 						}
 					} catch (err) { console.warn("[agent-ws] cold-load:", err.message); }
-					const state = agentHub.getState(currentSession);
-					safeSend(ws, { type: "state", sessionId: currentSession, ...state });
+					// TAIL-FIRST ATTACH (2026-10-24): a client that advertises tailFirst gets
+					// the last ~512KB + a sparse envelope (fromSeq/messageCount) and backfills
+					// the prefix via /range into IDB — instead of every attach shipping 2-7MB.
+					agentHub.attach(currentSession, (msg) => safeSend(ws, msg), { tailFirst: !!m.tailFirst });
 					break;
 				}
 				case "prompt": {
@@ -2401,11 +2415,75 @@ app.get("/api/agent/session/:id", async (c) => {
 		if (!agentHub.has(id)) {
 			const stored = await storeOp("get", { id });
 			if (stored?.metadata && stored?.messages) {
-				agentHub.getSession(id, { modelId: stored.metadata.modelId, thinkingLevel: stored.metadata.thinkingLevel, messages: stored.messages });
+				agentHub.getSession(id, { modelId: stored.metadata.modelId, thinkingLevel: stored.metadata.thinkingLevel, messages: stored.messages, rewriteSeq: stored.metadata.rewriteSeq, rewrittenFrom: stored.metadata.rewrittenFrom });
 			}
 		}
 		const state = agentHub.getState(id);
-		return c.json({ sessionId: id, ...state });
+		const payload = JSON.stringify({ sessionId: id, ...state });
+		// wire compression (transfer plan, 2026-10-24): these bodies reach 2-7.3MB
+		// and the browser decompresses Content-Encoding natively — zero client code
+		const accept = c.req.header("accept-encoding") || "";
+		if (payload.length > 2048 && /gzip/.test(accept)) {
+			return c.body(zlib.gzipSync(payload), 200, { "Content-Type": "application/json", "Content-Encoding": "gzip", Vary: "Accept-Encoding" });
+		}
+		return c.body(payload, 200, { "Content-Type": "application/json", Vary: "Accept-Encoding" });
+	} catch (err) { return c.json({ error: err.message }, 500); }
+});
+
+// RANGE endpoint (tail-first client cache, 2026-10-24): a seq window of the
+// CURRENT transcript, raw application/gzip so the client can put the SAME
+// bytes into IndexedDB and DecompressionStream them on read (Content-Encoding
+// would strip gzip before JS). X-headers carry the cache identity.
+app.get("/api/agent/session/:id/range", async (c) => {
+	try {
+		const id = c.req.param("id");
+		if (!agentHub.has(id)) {
+			const stored = await storeOp("get", { id });
+			if (stored?.metadata && stored?.messages) {
+				agentHub.getSession(id, { modelId: stored.metadata.modelId, thinkingLevel: stored.metadata.thinkingLevel, messages: stored.messages, rewriteSeq: stored.metadata.rewriteSeq, rewrittenFrom: stored.metadata.rewrittenFrom });
+			}
+		}
+		const tailBytes = Number(c.req.query("tailBytes")) || 0;
+		let fromSeq = Number(c.req.query("fromSeq")) || 0;
+		let toSeq = c.req.query("toSeq") ? Number(c.req.query("toSeq")) : Infinity;
+		if (tailBytes > 0) {
+			// tail: walk backwards accumulating serialized size (server-side mirror
+			// of the hub's attach tail slice)
+			const st = agentHub.getState(id);
+			const msgs = st.exists ? st.messages : [];
+			let acc = 0, from = msgs.length;
+			while (from > 0 && (acc < tailBytes || from === msgs.length)) {
+				from--;
+				try { acc += JSON.stringify(msgs[from]).length; } catch { acc += 256; }
+			}
+			fromSeq = from;
+			toSeq = Infinity;
+		}
+		// cap uncompressed JSON at 1MB per response (BACKFILL_BYTES)
+		const range = agentHub.getRange(id, { fromSeq, toSeq });
+		if (!range) return c.json({ error: "session not found" }, 404);
+		const MAX = 1024 * 1024;
+		let bytes = 0, end = range.fromSeq;
+		while (end < range.toSeq) {
+			let sz = 0;
+			try { sz = JSON.stringify(range.messages[end - range.fromSeq]).length; } catch { sz = 256; }
+			if (bytes + sz > MAX && end > range.fromSeq) break;
+			bytes += sz;
+			end++;
+		}
+		const slice = range.messages.slice(0, end - range.fromSeq);
+		const ndjson = slice.map((m) => JSON.stringify(m)).join("\n");
+		const gz = zlib.gzipSync(ndjson);
+		return c.body(gz, slice.length === 0 ? 204 : 200, {
+			"Content-Type": "application/x-ndjson",
+			"X-Pi-Encoding": "gzip",
+			"X-Session-Mutate-Epoch": String(range.rewriteSeq),
+			"X-Session-Message-Count": String(range.messageCount),
+			"X-Range-From-Seq": String(range.fromSeq),
+			"X-Range-To-Seq": String(range.fromSeq + slice.length),
+			"X-Rewritten-From": String(range.rewrittenFrom),
+			Vary: "Accept-Encoding",
+		});
 	} catch (err) { return c.json({ error: err.message }, 500); }
 });
 app.post("/api/agent/session", async (c) => {

@@ -753,7 +753,11 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 	 // gate the UI (hub.prompt resolves at run end; the old await left the editor
 	 // open + the region dimmed while the response streamed invisibly)
 	 try {
-	  const r = await (agent as any).editCommit(i, text);
+	  // TAIL-FIRST (2026-10-24): the client array index is window-relative — the
+	  // server's editCommit wants the ABSOLUTE seq = arrayIndex + fromSeq (the
+	  // dense window starts at sparse.fromSeq; 0 when fully loaded).
+	  const fromSeq = Number((agent.state as any).sparse?.fromSeq) || 0;
+	  const r = await (agent as any).editCommit(i + fromSeq, text);
 	  if (!r?.ok) throw new Error(r?.reason || r?.error || "edit failed");
 	  note(`✎ saved — the old turn was parked as version #${r.version?.vid ?? "?"} (🕘 picker); the edited message is on its way`);
 	  forceStick(); // the response streams at the bottom — follow it
@@ -1068,6 +1072,17 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 				   <button type="button" class="pw-continuation-open" onClick={() => { setContinuation(null); window.dispatchEvent(new CustomEvent("pi-open-session", { detail: continuation.id })); }}>open it</button>
 				  </div>
 				 )}
+					{(state as any).sparse && (state as any).sparse.filledFrom > 0 && (
+					<div class="pw-expand">
+						<button
+							type="button"
+							class="pw-expand-btn"
+							onClick={() => { const a: any = agent; void a?.expandEarlier?.(); }}
+						>
+							⤒ Load earlier messages ({(state as any).sparse.filledFrom})
+						</button>
+					</div>
+					)}
 					{state.messages.map((m: any, i: number) => (
 					<Fragment key={keyOf(m)}>
 					{editingIdx !== null && i === editingIdx + 1 && (

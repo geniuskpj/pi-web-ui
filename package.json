@@ -26,6 +26,7 @@
     "test:fetch": "node tests/fetch-tool.test.mjs",
     "test:fork": "node tests/fork-rewrite.test.mjs",
     "test:versions": "node tests/versions.test.mjs",
+    "test:range": "node tests/range.test.mjs",
     "test:compact": "node tests/compact.test.mjs",
     "test:shutdown": "node tests/shutdown.test.mjs",
     "test:killstop": "node tests/killstop.e2e.mjs",

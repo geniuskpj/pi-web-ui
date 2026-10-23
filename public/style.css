@@ -2069,3 +2069,18 @@ html.dark .pw-retry-giveup-note { color: #fbbf24; }
 /* attach button: SVG paperclip inherits the pill color (the emoji was dark in
    both themes) — size matches the pill text */
 .pw-attach-btn svg { width: 13px; height: 13px; vertical-align: -2px; }
+
+/* --- expand banner (tail-first cache, 2026-10-24) ---------------------------- */
+.pw-expand { text-align: center; padding: 6px 0 2px; }
+.pw-expand-btn {
+	appearance: none;
+	border: 1px dashed rgba(128, 128, 128, 0.45);
+	background: transparent;
+	color: inherit;
+	font-size: 12px;
+	padding: 7px 18px;
+	border-radius: 999px;
+	cursor: pointer;
+	min-height: 32px;
+}
+.pw-expand-btn:hover { border-color: #f5a524; color: #f5a524; }

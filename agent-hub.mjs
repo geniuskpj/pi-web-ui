@@ -167,7 +167,7 @@ export class AgentHub {
 		return undefined;
 	}
 
-	getSession(sessionId, { modelId, thinkingLevel, title, messages } = {}) {
+	getSession(sessionId, { modelId, thinkingLevel, title, messages, rewriteSeq, rewrittenFrom } = {}) {
 		this.discarded.delete(sessionId); // explicit re-open undeletes
 		let entry = this.sessions.get(sessionId);
 		if (!entry) {
@@ -208,6 +208,13 @@ export class AgentHub {
 				userPersisted: false,
 				followUpCount: 0,
 				mutateEpoch: 0, // bumped by rewriteSession — invalidates prompts queued pre-truncate
+				// TAIL-FIRST CACHE (2026-10-24): persisted rewrite generation + the seq
+				// where the last rewrite started. seqs < rewrittenFrom are identity-stable
+				// across epochs (this product never rewrites a prefix in place), so client
+				// IDB chunks strictly below rewrittenFrom survive edits/restores/retries.
+				// MAX_SAFE_INTEGER = no rewrite yet ("everything stable") — Math.min-safe.
+				rewriteSeq: rewriteSeq || 0,
+				rewrittenFrom: rewrittenFrom ?? Number.MAX_SAFE_INTEGER,
 				pendingPrompt: null, // steering UI payload {text, images, queuedAt} while held
 				pendingPromptMessage: null, // the exact AgentMessage — consumed on message_end
 			};
@@ -320,7 +327,7 @@ export class AgentHub {
 	 *  2026-10-21: per-session entry.buffer hook — the old implementation swapped
 	 *  the GLOBAL this.broadcast, which was not reentrant when two attaches
 	 *  interleaved (one restore clobbered the other's interception). */
-	attach(sessionId, deliver) {
+	attach(sessionId, deliver, { tailFirst = false } = {}) {
 		const entry = this.getSession(sessionId);
 		const queue = (entry.buffer = []); // emit path buffers while non-null
 		const state = {
@@ -332,8 +339,25 @@ export class AgentHub {
 			seq: entry.seq,
 			pendingPrompt: entry.pendingPrompt ?? null,
 		};
+		// TAIL-FIRST ATTACH (2026-10-24): a capable client (tailFirst) gets the last
+		// ~512KB of serialized messages instead of the whole 2-7.3MB transcript; the
+		// sparse envelope tells it where the window sits (index = seq) so it can
+		// backfill older messages via /range into IDB. Small sessions: full attach.
+		if (tailFirst) {
+			const msgs = entry.agent.state.messages;
+			const count = msgs.length;
+			let bytes = 0, from = count;
+			while (from > 0 && (bytes < 512 * 1024 || from === count)) {
+				from--;
+				try { bytes += JSON.stringify(msgs[from]).length; } catch { bytes += 256; }
+			}
+			if (from > 0 && bytes > 384 * 1024) { // only worth it when the tail is meaningfully smaller
+				state.messages = msgs.slice(from);
+				state.sparse = { fromSeq: from, messageCount: count, rewriteSeq: entry.rewriteSeq || 0, rewrittenFrom: entry.rewrittenFrom || 0 };
+			}
+		}
 		entry.buffer = null; // stop buffering BEFORE delivering (synchronous — no interleave)
-		deliver({ type: "state", sessionId, ...state });
+		deliver({ type: "state", sessionId, ...state, rewriteSeq: entry.rewriteSeq || 0, rewrittenFrom: entry.rewrittenFrom || 0 });
 		for (const msg of queue) deliver(msg);
 		return entry;
 	}
@@ -635,6 +659,7 @@ export class AgentHub {
 				break; // only the LAST assistant can dangle — earlier rounds are paired, else the run would have failed there
 			}
 			entry.mutateEpoch = (entry.mutateEpoch || 0) + 1;
+			this._bumpRewrite(entry, msgs.length); // tail-first cache: rewrite point = post-drop length
 		}
 		return dropped;
 	}
@@ -788,6 +813,9 @@ export class AgentHub {
 			model: state.model,
 			thinkingLevel: state.thinkingLevel,
 			isStreaming: state.isStreaming,
+			// tail-first cache: rewrite generation + seq floor (client IDB invalidation)
+			rewriteSeq: entry.rewriteSeq || 0,
+			rewrittenFrom: entry.rewrittenFrom || 0,
 			streamingMessage: state.streamingMessage ?? null,
 			pendingToolCalls: state.pendingToolCalls instanceof Set ? [...state.pendingToolCalls] : [],
 			compacting: !!entry.compacting, // all devices show the progress banner
@@ -840,6 +868,40 @@ export class AgentHub {
 		return entry;
 	}
 
+	/** Rewrite-generation tracking (tail-first client cache, 2026-10-24): bumped
+	 *  on EVERY transcript rewrite (edit/restore/retry-drop/compact). rewrittenFrom
+	 *  = the seq where the rewrite started — the client may keep cached chunks
+	 *  strictly below it (monotonic min: a later EARLIER rewrite shrinks it; a
+	 *  later LATER one keeps the smaller — conservative and safe). */
+	_bumpRewrite(entry, from) {
+		entry.rewriteSeq = (entry.rewriteSeq || 0) + 1;
+		entry.rewrittenFrom = Math.min(entry.rewrittenFrom ?? from, from);
+		return { rewriteSeq: entry.rewriteSeq, rewrittenFrom: entry.rewrittenFrom };
+	}
+
+	/** Range slice of the CURRENT transcript — the authority for the client's
+	 *  tail-first cache (the live entry IS the truth; the mirror may lag). Seqs
+	 *  are 0-based message indices; the returned window may be shorter than
+	 *  requested (clamped to [0, messageCount)). */
+	getRange(sessionId, { fromSeq = 0, toSeq = Infinity } = {}) {
+		const entry = this.sessions.get(sessionId);
+		if (!entry) return null;
+		const msgs = entry.agent.state.messages;
+		const count = msgs.length;
+		const from = Math.max(0, Math.min(Number(fromSeq) || 0, count));
+		const toRaw = Number(toSeq);
+		const to = Math.max(from, Math.min(!toRaw || toRaw === Infinity ? count : Math.floor(toRaw), count));
+		return {
+			sessionId,
+			fromSeq: from,
+			toSeq: to,
+			messageCount: count,
+			rewriteSeq: entry.rewriteSeq || 0,
+			rewrittenFrom: entry.rewrittenFrom || 0,
+			messages: msgs.slice(from, to),
+		};
+	}
+
 	/** Mirror metadata builder (shared by _writeSession and empty forks). */
 	_buildMetadata(sessionId) {
 		const entry = this.sessions.get(sessionId);
@@ -869,6 +931,9 @@ export class AgentHub {
 			messageCount: state.messages.length,
 		};
 		if (entry.forkedFrom) metadata.forkedFrom = entry.forkedFrom; // lineage (pi header: parentSession)
+		// tail-first cache: the client's IDB chunks are keyed on this generation
+		metadata.rewriteSeq = entry.rewriteSeq || 0;
+		metadata.rewrittenFrom = entry.rewrittenFrom ?? Number.MAX_SAFE_INTEGER;
 		if (!entry.createdAt) entry.createdAt = now;
 		return metadata;
 	}
@@ -941,6 +1006,7 @@ export class AgentHub {
 			} catch { /* best-effort — the edit proceeds without a version */ }
 		}
 		entry.agent.state.messages = msgs.slice(0, n);
+		this._bumpRewrite(entry, n); // tail-first cache: chunks below n survive
 		entry.mutateEpoch = (entry.mutateEpoch || 0) + 1;
 		entry.pendingPrompt = null;
 		entry.pendingPromptMessage = null;
@@ -994,6 +1060,7 @@ export class AgentHub {
 			} catch { /* best-effort */ }
 		}
 		entry.agent.state.messages = msgs.slice(0, i);
+		this._bumpRewrite(entry, i); // tail-first cache: chunks below i survive
 		entry.mutateEpoch = (entry.mutateEpoch || 0) + 1;
 		entry.pendingPrompt = null; entry.pendingPromptMessage = null; entry.followUpCount = 0; entry.runtime.pendingPrompts = 0;
 		this.emitRuntime(sessionId); this.emitSteering(sessionId);
@@ -1048,6 +1115,7 @@ export class AgentHub {
 			} catch { /* best-effort */ }
 		}
 		entry.agent.state.messages = [...active.slice(0, base), ...JSON.parse(JSON.stringify(rec.messages))];
+		this._bumpRewrite(entry, base); // tail-first cache: chunks below base survive
 		entry.mutateEpoch = (entry.mutateEpoch || 0) + 1;
 		entry.pendingPrompt = null;
 		entry.pendingPromptMessage = null;
@@ -1104,6 +1172,7 @@ export class AgentHub {
 			const keptMsgs = msgs.slice(cut).map((m) => { const c = { ...m }; if (Array.isArray(c.content)) c.content = JSON.parse(JSON.stringify(c.content)); return c; });
 			entry.agent.state.messages = [summaryMsg, ...keptMsgs];
 			entry.mutateEpoch = (entry.mutateEpoch || 0) + 1;
+			this._bumpRewrite(entry, 0); // tail-first cache: compaction invalidates everything
 			entry.pendingPrompt = null; entry.pendingPromptMessage = null; entry.followUpCount = 0; entry.runtime.pendingPrompts = 0;
 			this.emitRuntime(sessionId); this.emitSteering(sessionId);
 			await this.persistSession(sessionId, true);

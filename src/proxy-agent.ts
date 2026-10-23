@@ -7,6 +7,7 @@
 type Listener = (event: any) => void;
 type AnyRecord = Record<string, any>;
 import { makeId } from "./id.js";
+import { getCachedChunks, putChunk, gunzip, transferPolicy } from "./idb-cache.js";
 
 export class ProxyAgent {
 	/** true = the loop runs server-side (agent-hub.mjs): runs survive browser
@@ -76,7 +77,7 @@ export class ProxyAgent {
 				if (gen !== this.generation || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 				// attach carries the client's chosen model/effort so a FRESH server
 				// session runs what the UI shows (grok r3: model desync)
-				this.sendMsg({ type: "attach", sessionId: this.sessionId, modelId: this.state.model?.id, thinkingLevel: this.state.thinkingLevel });
+				this.sendMsg({ type: "attach", sessionId: this.sessionId, modelId: this.state.model?.id, thinkingLevel: this.state.thinkingLevel, tailFirst: true });
 				const cbs = this.readyCallbacks.splice(0);
 				cbs.forEach((cb) => cb(this.attached));
 			}, 50);
@@ -120,7 +121,22 @@ export class ProxyAgent {
 			// retry policy lives client-side (Settings → Retry): re-push on every attach
 			// so a hub restart/reconnect picks it up
 			this.pushAutoRetrySetting();
-			this.state.messages = [...(msg.messages || [])];
+			// TAIL-FIRST STATE (2026-10-24): a sparse attach delivers the last ~512KB +
+			// an envelope {fromSeq, messageCount}. CRITICAL (live crash 1f725ee): keep
+			// state.messages DENSE — exactly the loaded window, no null holes. Nulls
+			// leaked into chat.tsx iterators ([agent] listener TypeError m.role) — this
+			// app assumes a dense message array in a dozen places. The window position
+			// lives in state.sparse (filledFrom); editCommit indices get translated by
+			// +fromSeq at the single call site (saveEdit). Backfill PREPENDS older wins.
+			const sparse = (msg as any).sparse as { fromSeq: number; messageCount: number; rewriteSeq: number } | undefined;
+			if (sparse && Array.isArray(msg.messages)) {
+				this.state.messages = [...(msg.messages || [])]; // DENSE tail window
+				(this.state as any).sparse = { ...sparse, filledFrom: sparse.fromSeq };
+				void this.scheduleBackfill(sparse);
+			} else {
+				this.state.messages = [...(msg.messages || [])];
+				(this.state as any).sparse = null;
+			}
 			this.state.model = msg.model;
 			this.state.thinkingLevel = msg.thinkingLevel || "high";
 			this.state.isStreaming = !!msg.isStreaming;
@@ -356,6 +372,89 @@ export class ProxyAgent {
 	async cancelRetry(): Promise<any> {
 		await this.whenReady(3000);
 		return this.sendAwait({ type: "cancel-retry" }, 8000);
+	}
+
+	// --- TAIL-FIRST BACKFILL (transfer plan 2026-10-24) -------------------------
+	private backfillRunning = false;
+
+	private async netClass(): Promise<string> {
+		try { const r = await fetch("/api/health", { signal: AbortSignal.timeout(3000) }); const j = await r.json(); return String(j.netClass || "remote"); } catch { return "remote"; }
+	}
+
+	/** Policy-gated background 1MB backfill (wired/wifi → whole session into IDB;
+	 *  metered → manual expand only). Runs after a sparse attach; fetches only
+	 *  the holes (range-aware IDB — never re-downloads a cached chunk). */
+	private async scheduleBackfill(sparse: { fromSeq: number; messageCount: number; rewriteSeq: number }): Promise<void> {
+		if (this.backfillRunning) return;
+		this.backfillRunning = true;
+		try {
+			const net = await this.netClass();
+			const policy = await transferPolicy(net);
+			if (policy !== "fast") return; // metered: expand stays manual (button)
+			await this.backfillAll();
+		} catch { /* best-effort — the tail is already rendered */ }
+		finally { this.backfillRunning = false; }
+	}
+
+	/** Fill every hole above the currently loaded prefix from IDB-then-network. */
+	private async backfillAll(): Promise<void> {
+		const sparse = (this.state as any).sparse as { fromSeq: number; messageCount: number; rewriteSeq: number } | undefined;
+		if (!sparse || this.state.isStreaming) return;
+		while ((this.state as any).sparse && (this.state as any).sparse.filledFrom > 0 && !this.state.isStreaming) {
+			const filled = (this.state as any).sparse.filledFrom as number;
+			const from = Math.max(0, filled - 1024 * 1024); // BACKFILL_BYTES = 1MB (measured optimum)
+			const ok = await this.fillWindow(from, filled);
+			if (!ok) return; // network/cache dead — the expand button remains
+		}
+	}
+
+	/** EXPAND (banner button / one 1MB step): fill the window above the loaded
+	 *  prefix — IDB first, network for the miss-set — and splice into the array. */
+	async expandEarlier(): Promise<boolean> {
+		const sparse = (this.state as any).sparse as { fromSeq: number; messageCount: number; rewriteSeq: number } | undefined;
+		if (!sparse) return false;
+		const filled = (this.state as any).sparse.filledFrom as number;
+		const from = Math.max(0, filled - 1024 * 1024);
+		return this.fillWindow(from, filled);
+	}
+
+	/** Fill [from,to): IDB cache first, then /range for the miss-set; splice into
+	 *  the sparse array (index = seq) and advance filledFrom. Returns false when
+	 *  a rewrite raced the fill (epoch/filledFrom moved) or the network failed. */
+	private async fillWindow(from: number, to: number): Promise<boolean> {
+		try {
+			let msgs: any[] = [];
+			const cached = await getCachedChunks(this.sessionId, from, to);
+			let fullyCached = false;
+			if (cached.length > 0) {
+				fullyCached = true;
+				for (const c of cached) msgs.push(...c.messages);
+			}
+			if (!fullyCached) {
+				const res = await fetch(`/api/agent/session/${encodeURIComponent(this.sessionId)}/range?fromSeq=${from}&toSeq=${to}`, { signal: AbortSignal.timeout(15000) });
+				if (!res.ok && res.status !== 204) return false;
+				const buf = await res.arrayBuffer();
+				const rs = Number(res.headers.get("x-range-from-seq") || from);
+				const re = Number(res.headers.get("x-range-to-seq") || to);
+				const count = Number(res.headers.get("x-session-message-count") || 0);
+				const rsq = Number(res.headers.get("x-session-mutate-epoch") || 0);
+				// cache write-through: the SAME raw gzip bytes into IDB (decompress on read)
+				try { await putChunk(this.sessionId, rs, re, rsq, count, new Blob([buf], { type: "application/gzip" })); } catch { /* cache is best-effort */ }
+				const text = await gunzip(new Blob([buf], { type: "application/gzip" }));
+				if (text == null) return false;
+				const fetched = text.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+				msgs = fetched;
+				from = rs;
+				to = re;
+			}
+			// splice: PREPEND the older window to the dense array + advance filledFrom
+			const sp = (this.state as any).sparse;
+			if (!sp || sp.filledFrom !== to) return false; // a rewrite raced the fill — abort
+			this.state.messages = [...msgs, ...this.state.messages];
+			sp.filledFrom = from;
+			this.notifyListeners({ type: "state-snapshot" });
+			return true;
+		} catch { return false; }
 	}
 
 	cancelSteering(): void {
