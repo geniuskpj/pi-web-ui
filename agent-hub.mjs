@@ -194,6 +194,12 @@ export class AgentHub {
 			};
 			entry = {
 				agent,
+				// HYDRATION FLAG (2026-10-24): an entry created BEFORE the transcript is
+				// loaded must not look hydrated — a fresh entry legitimately carries one
+				// message (the materialized system prompt), so "messages.length > 0" is
+				// NOT a usable proxy. The caller-supplied `messages` argument is the
+				// authoritative signal: when it is present the caller HAS the transcript.
+				hydrated: messages !== undefined,
 				model,
 				thinkingLevel: level,
 				seq: 0, // monotonic event sequence for attach dedup
@@ -327,7 +333,13 @@ export class AgentHub {
 	 *  2026-10-21: per-session entry.buffer hook — the old implementation swapped
 	 *  the GLOBAL this.broadcast, which was not reentrant when two attaches
 	 *  interleaved (one restore clobbered the other's interception). */
-	attach(sessionId, deliver, { tailFirst = false } = {}) {
+	async attach(sessionId, deliver, { tailFirst = false } = {}) {
+		// HYDRATE FIRST (2026-10-24): the attach used to build its snapshot from
+		// whatever entry existed — so a session whose entry was created before the
+		// transcript loaded (a raced store read, a prompt, an earlier attach) shipped
+		// an empty window for the life of the process. Awaiting the load here makes
+		// the snapshot correct no matter which path created the entry.
+		await this._ensureEntry(sessionId);
 		const entry = this.getSession(sessionId);
 		const queue = (entry.buffer = []); // emit path buffers while non-null
 		const state = {
@@ -844,7 +856,7 @@ export class AgentHub {
 	 *  messages for existing entries, so fill it in place here, normalized). */
 	async _ensureEntry(sessionId) {
 		let entry = this.sessions.get(sessionId);
-		if (entry && entry.agent.state.messages.length > 0) return entry;
+		if (entry?.hydrated) return entry;
 		if (this.loadMessages) {
 			try {
 				const stored = await this.loadMessages(sessionId);
@@ -856,14 +868,27 @@ export class AgentHub {
 							title: stored.metadata?.title,
 							messages: stored.messages,
 						});
-					} else {
+					} else if (entry.agent.state.messages.filter((m) => m.role !== "system").length === 0) {
+						// An entry with NO real messages is safe to fill — that is the
+						// poisoned case (created by an attach/prompt that raced the store).
+						// One with messages is a LIVE transcript: never overwrite it.
 						entry.agent.state.messages = normalizeRestoredMessages(stored.messages);
+						entry.hydrated = true;
 						if (stored.metadata?.modelId) { const m = this._getModel(stored.metadata.modelId); if (m) entry.agent.state.model = m; }
 						if (stored.metadata?.thinkingLevel) entry.agent.state.thinkingLevel = stored.metadata.thinkingLevel;
 						if (stored.metadata?.title) entry.title = stored.metadata.title;
+					} else {
+						entry.hydrated = true; // live transcript wins; nothing to load
 					}
+				} else {
+					// the store has nothing (a genuinely new session): create it if needed and
+					// mark it, so every later attach does not re-query the store for nothing
+					entry = this.getSession(sessionId);
+					entry.hydrated = true;
 				}
-			} catch { /* store miss → the caller's guards handle it */ }
+			} catch { /* store miss → leave the flag alone so a later call retries */ }
+		} else if (entry) {
+			entry.hydrated = true;
 		}
 		return entry;
 	}

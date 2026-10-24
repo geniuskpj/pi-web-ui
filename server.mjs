@@ -2195,7 +2195,9 @@ function agentConn(ws) {
 					// TAIL-FIRST ATTACH (2026-10-24): a client that advertises tailFirst gets
 					// the last ~512KB + a sparse envelope (fromSeq/messageCount) and backfills
 					// the prefix via /range into IDB — instead of every attach shipping 2-7MB.
-					agentHub.attach(currentSession, (msg) => safeSend(ws, msg), { tailFirst: !!m.tailFirst });
+					// attach() now hydrates the entry itself before snapshotting (2026-10-24) —
+					// await it so the first frame can never be an empty pre-hydration state
+					await agentHub.attach(currentSession, (msg) => safeSend(ws, msg), { tailFirst: !!m.tailFirst });
 					break;
 				}
 				case "prompt": {
