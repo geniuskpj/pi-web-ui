@@ -1172,7 +1172,10 @@ export class AgentHub {
 			const keptMsgs = msgs.slice(cut).map((m) => { const c = { ...m }; if (Array.isArray(c.content)) c.content = JSON.parse(JSON.stringify(c.content)); return c; });
 			entry.agent.state.messages = [summaryMsg, ...keptMsgs];
 			entry.mutateEpoch = (entry.mutateEpoch || 0) + 1;
-			this._bumpRewrite(entry, 0); // tail-first cache: compaction invalidates everything
+			// tail-first cache: the summary is INSERTED at index `from` — seqs [0, from)
+			// keep their lines (identity-stable), everything from `from` on is renumbered.
+			// Chunks below `from` survive; chunks overlapping the span are invalidated.
+			this._bumpRewrite(entry, from);
 			entry.pendingPrompt = null; entry.pendingPromptMessage = null; entry.followUpCount = 0; entry.runtime.pendingPrompts = 0;
 			this.emitRuntime(sessionId); this.emitSteering(sessionId);
 			await this.persistSession(sessionId, true);

@@ -402,7 +402,7 @@ export class ProxyAgent {
 				const sp = (this.state as any).sparse;
 				if (!sp) return; // session switched / full state frame arrived
 				const filled = sp.filledFrom as number;
-				const covered = await cachedRanges(this.sessionId);
+				const covered = await cachedRanges(this.sessionId, sp.rewriteSeq);
 				const holes = intervalDiff(0, filled, covered);
 				if (holes.length === 0) return; // fully warm
 				const h = holes[0]; // oldest hole first; server clamps to 1MB per response
@@ -449,7 +449,8 @@ export class ProxyAgent {
 		const sessionIdAtStart = this.sessionId;
 		try {
 			let msgs: any[] = [];
-			const cached = await getCachedChunks(this.sessionId, from, to);
+			const sparseAtStart = (this.state as any).sparse as { rewriteSeq: number } | undefined;
+			const cached = await getCachedChunks(this.sessionId, from, to, sparseAtStart?.rewriteSeq);
 			let fullyCached = false;
 			if (cached.length > 0) {
 				fullyCached = true;

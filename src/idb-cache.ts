@@ -133,20 +133,33 @@ export function intervalDiff(from: number, to: number, ranges: Array<{ fromSeq: 
 	return holes.filter((h) => h.toSeq > h.fromSeq);
 }
 
-/** Which parts of [from,to) are already cached — the client fetches only the rest. */
-export async function cachedRanges(sessionId: string): Promise<Array<{ fromSeq: number; toSeq: number }>> {
+/** Which parts of [from,to) are already cached — the client fetches only the rest.
+ *  expectRewriteSeq: when provided, a generation mismatch (compaction/edits
+ *  renumbered the transcript) invalidates the session and reports NO coverage —
+ *  stale pre-rewrite chunks must never satisfy a read (COMPACT CHECK). */
+export async function cachedRanges(sessionId: string, expectRewriteSeq?: number): Promise<Array<{ fromSeq: number; toSeq: number }>> {
 	const meta = await coverage(sessionId);
-	return meta?.ranges ?? [];
+	if (!meta) return [];
+	if (expectRewriteSeq !== undefined && (meta.rewriteSeq || 0) !== expectRewriteSeq) {
+		await invalidateSession(sessionId);
+		return [];
+	}
+	return meta.ranges ?? [];
 }
 
 /** Get CACHED decompressed message arrays covering [from,to) ENTIRELY — returns
  *  [] when any part of the window is a hole (grok review 01a16a54 #4: the old
  *  check was inverted — the cache could never hit). Ranges are 1:1 with chunk
- *  records (no merging — a merged meta range would read only its first blob). */
-export async function getCachedChunks(sessionId: string, from: number, to: number): Promise<Array<{ fromSeq: number; toSeq: number; messages: any[] }>> {
+ *  records (no merging — a merged meta range would read only its first blob).
+ *  expectRewriteSeq: generation mismatch (compaction/edits) → invalidate + []. */
+export async function getCachedChunks(sessionId: string, from: number, to: number, expectRewriteSeq?: number): Promise<Array<{ fromSeq: number; toSeq: number; messages: any[] }>> {
 	const result = await withTimeout(async (db) => {
 		const meta = await coverage(sessionId);
 		if (!meta) return [];
+		if (expectRewriteSeq !== undefined && (meta.rewriteSeq || 0) !== expectRewriteSeq) {
+			await invalidateSession(sessionId); // COMPACT CHECK: stale content must never render
+			return [];
+		}
 		const holes = intervalDiff(from, to, meta.ranges);
 		if (holes.length > 0) return []; // partial coverage → caller fetches the whole window
 		const out: Array<{ fromSeq: number; toSeq: number; messages: any[] }> = [];
