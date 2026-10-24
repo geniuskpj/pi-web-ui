@@ -112,6 +112,7 @@ Workspace file attach + image paste are BACK (plan.md §12–14) — see the exp
 | `PI_WEB_DEBUG` | off | verbose server logging |
 | `PI_WEB_LOG_DIR` | `<PI_WEB_DATA_DIR>/logs` | console tee target — daily `server-YYYYMMDD.log` (ISO timestamps + info/warn/error); broken dir falls back to console-only |
 | `PI_WEB_EXIT_ON_STDIN_CLOSE` | off | run the full graceful-shutdown sequence when the parent closes the server's stdin pipe (pipe-friendly Ctrl+C equivalent; used by tests — on Windows a cross-process `kill(SIGINT)` TerminateProcesses without running handlers) |
+| `PI_WEB_WS_DEFLATE` | on | `off` disables permessage-deflate on the agent/sync WebSockets (state frames are the multi-MB path — leave on unless profiling) |
 | `PI_WEB_TERM_COLS` / `PI_WEB_TERM_LINES` | `110` / `32` | terminal grid size (stty in the pty tier, COLUMNS/LINES env in the pipe tier) |
 | `PI_WEB_TERM_BRIDGE` | auto | `0`/`pipes` forces the pipe tier; a path uses that exe as an msys-pty-bridge; unset → auto-provision msys2 `util-linux` `script.exe` into `data/bin/script/` (sha256-pinned `util-linux-2.40.2-2` package from repo.msys2.org, 8MB size cap, extracts a 63KB exe — once) |
 | `PI_WEB_TERM_ORIGIN` | auto | extra `host[:port]` **names for the global Host/Origin allowlist** — every `/api/*` route and all three WS endpoints (`/ws/sync`, `/ws/agent`, `/ws/terminal`), not just the terminal. Comma-separated, scheme stripped. Matching is EXACT on `host:port`: a missing Origin port means the scheme default (http→80, https→443) and a portless Host is tried as the app port plus 80/443 — so a TLS reverse proxy needs its public form spelled out (`PI_WEB_TERM_ORIGIN=name:443`). Localhost, `os.hostname()` and every interface IP are always allowed |
@@ -119,6 +120,46 @@ Workspace file attach + image paste are BACK (plan.md §12–14) — see the exp
 | `PROXY_IDLE_MS` | `150000` | LLM proxy stall timeout |
 
 Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
+
+## Session loading (tail-first) & IndexedDB cache
+
+Large sessions (2–7.3MB observed) no longer re-download their whole body on every open.
+Layered design — the server decides transfer sizes, the client decides display granularity:
+
+- **Wire compression (every chat):** the full session GET gzips (>2KB bodies, 7.3MB → 1.92MB
+  measured); WS state frames use permessage-deflate (`PI_WEB_WS_DEFLATE=off` to disable).
+- **Tail-first attach (large chats):** a client advertising `tailFirst` receives only the last
+  ~1MB of serialized messages plus a sparse envelope `{fromSeq, messageCount, rewriteSeq,
+  rewrittenFrom}`; small chats attach fully as before.
+- **`GET /api/agent/session/:id/range`** serves a seq window (`fromSeq`/`toSeq`, or `tailBytes=`)
+  as **raw application/gzip** NDJSON (write-through: the same bytes go into IndexedDB and
+  DecompressionStream on read). The 1MB cap keeps the HIGH end of the requested window (windows
+  stay adjacent to the loaded tail) and aligns the start down to the nearest **user turn**.
+  Identity headers: `X-Session-Mutate-Epoch` (rewrite generation), `X-Session-Message-Count`,
+  `X-Range-From/To-Seq`, `X-Rewritten-From` (chunks strictly below this seq survive rewrites).
+- **IndexedDB cache** (`pi-session-cache`): per-chunk gzip blobs keyed `[sessionId, fromSeq]` + a
+  tiny per-session coverage record. Miss-set = interval diff (one small meta get). LRU 200MB.
+  Wedge-proof by design: lazy open (boot never touches IDB), 2s timeout on every op (a timeout
+  is a MISS, not an error), 3-failure circuit breaker, per-session serialized writes, server
+  fallback always available.
+- **Rewrite invalidation:** every transcript rewrite (✎ edit / 🕘 restore / retry tail-drop /
+  compact) bumps a persisted `rewriteSeq` and records `rewrittenFrom` — the seq where the rewrite
+  started. Cached chunks strictly below it survive (an edit at 950 of 976 keeps chunks 0–799;
+  compaction keeps the prefix below its span start). The client validates the generation on
+  every cache read and refetches on mismatch. The generation also survives server restarts.
+- **Display by user turn:** sparse (large) sessions render ONE conversational turn (from its
+  user message down); “⤒ Load earlier turns” reveals the previous turn per click — pure view
+  change when it is in memory, a range fetch when it isn't. Small chats display fully.
+- **Transfer policy:** `navigator.connection` (saveData / effectiveType / type) decides — fast
+  links background-warm the whole body into IDB; metered links stay manual (expand per click).
+  Server fallback: `/api/health` reports `netClass: lan | remote` (peer/Host classification).
+- **UI:** the session list shows each session's IDB footprint (“IDB 1.2MB (7 chunks)”); the
+  active-sessions dialog has a 🧹 clear button beside Kill — safe during a live run (the cache
+  is read-only data; in-flight backfill writes are dropped via a generation guard).
+
+Measured on real sessions: gzip chunking ratio penalty nil (26.4% single vs 26.5–26.6% chunked);
+per-chunk browser decompress 3.4–5ms (512KB–1MB); repeat open of a warm 7.3MB session = zero
+network. Full analysis: `pr-idb.md`.
 
 ## Notes
 
