@@ -137,6 +137,10 @@ Layered design — the server decides transfer sizes, the client decides display
   stay adjacent to the loaded tail) and aligns the start down to the nearest **user turn**.
   Identity headers: `X-Session-Mutate-Epoch` (rewrite generation), `X-Session-Message-Count`,
   `X-Range-From/To-Seq`, `X-Rewritten-From` (chunks strictly below this seq survive rewrites).
+- **Aligned windows + no re-send (C4)**: `/range` windows and live-written chunks share one 64-message
+  boundary (`lib/chunk-window.mjs`, imported by both sides — no seam), and the WS attach takes the
+  client's cached reach (`haveTo`) so it does not re-send it: measured, the 1.49MB tail → **0 bytes** when
+  the cache covers it, with the client filling that prefix from IndexedDB (a miss falls back to `/range`).
 - **IndexedDB cache** (`pi-session-cache`, **schema v2**): per-chunk gzip blobs keyed
   `[sessionId, rewriteSeq, fromSeq]` + a tiny coverage record PER GENERATION. Miss-set = interval diff
   (one small meta get). LRU 200MB (superseded generations evicted first). A rewrite never erases

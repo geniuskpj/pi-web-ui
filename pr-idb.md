@@ -42,7 +42,9 @@ are the recorded v2 options; brotli wasm (150KB–1.8MB) rejected — wire brotl
 - `GET /api/agent/session/:id/range` (`fromSeq`/`toSeq` or `tailBytes=`): seq window of the LIVE
   entry, 1MB serialized cap **keeping the HIGH end** (grok #1 — windows must stay adjacent to the
   loaded tail), start aligned DOWN to the nearest **user turn** (user request: "reach until
-  previous user turn"). Body: raw `application/gzip` NDJSON (write-through into IDB).
+  previous user turn"). Body: raw `application/gzip` NDJSON (write-through into IDB). (C4) Both ends
+  are then snapped to the **CHUNK_INTERVAL** (64-message) boundary, so a fetched window and a
+  live-written chunk describe the same key.
   Headers: `X-Session-Mutate-Epoch`, `X-Session-Message-Count`, `X-Range-From/To-Seq`,
   `X-Rewritten-From`.
 - Full session GET gzips (`Content-Encoding`, 7.3MB → 1.92MB); `?meta=1` returns metadata only
@@ -195,6 +197,35 @@ Notes:
      sparse: [924,1056]`). **Fixed** — see the log entry: `entry.hydrated`, a hydrating `attach()`, and
      a store miss that no longer looks like a fresh session.
 
+## 8. C4 — aligned windows + don't re-send the tail (2026-10-24)
+
+The last item from the audit below. Two halves, both measured end-to-end on a scratch instance with the
+real 9.6MB / 1056-message session (`data/tmp/c4-probe.mjs`).
+
+**A. One boundary definition, aligned windows.** The chunk boundary lives in **`lib/chunk-window.mjs`**
+(`CHUNK_INTERVAL = 64`, `chunkIndexOf/FromSeq/ToSeq`, `isChunkAligned`, `alignDown/alignUp`);
+`src/idb-cache.ts` re-exports it (client API unchanged) and `server.mjs` + `agent-hub.mjs` import it
+directly, so the two sides cannot drift. `/range` snaps the LOW end DOWN (after the user-turn pass, so a
+turn is never cut) and the HIGH end UP (capped at the session end); the attach tail snaps DOWN too — but
+never to 0, which would turn a huge-message tail into a full attach. A fetched window and a live-written
+chunk now describe the SAME key: the seam is gone and a warm cache can serve a later attach.
+Measured: `[300,700)` → **[576,704)**, `[1000,…)` → **[960,1056)**, `tailBytes=1MB` → **[896,1056)** —
+all aligned, all still adjacent to the loaded tail.
+
+**B. `haveTo` — the client says what it already has.** The attach carries `haveTo` (the end of this
+device's cached coverage, read from the IDB meta). The hub trims the low end to `alignDown(claim)` — a
+sub-chunk claim snaps DOWN, so the server never forces a client to fetch a partial chunk it cannot use —
+and a claim that **reaches the session end sends nothing at all**. The envelope gains `sentFrom`; the
+client treats `sentFrom` as the start of its dense window (`filledFrom`) and fills `[fromSeq, sentFrom)`
+from IDB via `fillWindow`, which falls back to `/range` on a miss — so a stale or wrong claim costs one
+fetch, never a wrong window. A return visit with new turns pays only for the new turns plus at most one
+partial chunk.
+Measured (WS state frame for the 1MB tail): `haveTo=0` → **160 msgs / 1,489,906 bytes**; a claim below
+the window start → unchanged; `haveTo=count` → **0 msgs / 0 bytes (100% off)**.
+
+The render path is untouched: dense window, `filledFrom`, the turn-gated display and the edit-index
+translation keep their semantics — the cache only supplies the prefix.
+
 ---
 
 # PR 2 — retry + mobile: the branch base (`c461dee`, `b8f1aca`, `916c0ef`, `7bdcd03`)
@@ -337,7 +368,7 @@ each one rests on today:
 | 16 | no list virtualization for a fully expanded 7.3MB session | **deferred** (separate UI project; the sparse gate mitigates) |
 | 17 | brotli on ranges / CBOR / gzip-at-rest / zstd | **deferred by measurement** (§2/§6) |
 | 18 | mobile-decode numbers are desktop-derived | **open — needs a real device** (rides with PL-12; not closable from here) |
-| 19 | C4: server-side `/range` alignment + "don't re-send a cached tail" | **deferred/optional** — buys ~276KB/open and removes the seam; nothing needs it for correctness |
+| 19 | C4: server-side `/range` alignment + "don't re-send a cached tail" | **DONE (`6fe0924`)** — see §8: aligned windows + `haveTo`; measured: the 1.49MB attach tail → **0 bytes** when the client has it |
 | 20 | PR 2: auto-retry A1 (disable cancels timers) / A2 (fire-time re-check, synchronous attempt commit) | **fixed in `b8f1aca`**; PR 2's suites cover it |
 
 Rebased onto the new main (auth merged) before this audit and re-verified there with the branch's own
