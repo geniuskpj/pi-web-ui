@@ -178,19 +178,19 @@ Notes:
   `tests/idb-cache.test.mjs` T1–T7 — `saveData` ⇒ metered, 2g/3g ⇒ metered, `type: cellular` ⇒ metered,
   wifi/4g ⇒ fast, and with no Network Information API the server's `netClass` decides (`lan` ⇒ fast, else
   metered). A metered link therefore skips warming entirely and pays only the tail.
-- **Two defects found while measuring (out of scope for this cache work, worth their own fix):**
+- **Two defects found while measuring — BOTH NOW FIXED (see the log entry below):**
   1. **A fresh origin cannot open an existing session.** Opening `?session=<existing big id>` in a
      browser profile with no local state for that session rendered an EMPTY chat and made **zero**
      network requests for the body (observed twice, on two fresh origins, with the bundle that otherwise
      works). The stored transcript is not touched (the mirror stayed byte-identical), so this is a
      load-path gap on new devices/incognito — precisely the case the IDB cache exists for.
-  2. **A hub entry created before hydration is never re-hydrated.** `agent-hub.mjs` `_ensureEntry()` opens
+  2. **A hub entry created before hydration is never re-hydrated.** `agent-hub.mjs` `_ensureEntry()` opened
      with `if (entry && entry.agent.state.messages.length > 0) return entry;` — and a freshly created
      entry already holds one message (the materialized system prompt). So an attach that lands before the
-     body load leaves that session EMPTY for the life of the process (reproduced: attach reported
+     body load left that session EMPTY for the life of the process (reproduced: attach reported
      `messages: 1, sparse: null`; after a hub restart the same instance reported `messages: 132,
-     sparse: [924,1056]`). Candidate fix: track `entry.hydrated` explicitly (or compare against the
-     expected system-message count) instead of using `length > 0` as the proxy.
+     sparse: [924,1056]`). **Fixed** — see the log entry: `entry.hydrated`, a hydrating `attach()`, and
+     a store miss that no longer looks like a fresh session.
 
 ---
 
@@ -415,4 +415,18 @@ the transfer PR's §2 table stay out of the tree.
     cache off for the rest of the session.
   - Note for the user's own browser: the v1 → v2 upgrade discards the existing v1 chunks (~13MB observed)
     on the first load of the new bundle — by design (the cache is disposable); the warm loop refills it.
+- **2026-10-24 — fix (hydration; the defect that faked a measurement, author):** `agent-hub.mjs` no
+  longer uses `messages.length > 0` as a hydration proxy. `getSession()` marks `entry.hydrated` when the
+  caller SUPPLIES messages; `_ensureEntry()` gates on that flag, fills an entry only when it holds no
+  real (non-system) messages — a live transcript is never overwritten — and marks the entry hydrated when
+  the store genuinely has nothing (a store *throw* still leaves it unmarked so a later call retries).
+  `attach()` is now async and awaits hydration before building its snapshot (the WS call site awaits it),
+  so the first frame can never be a pre-hydration empty state. `tests/hub-hydration.test.mjs` (12 checks,
+  `npm run test:hydration`) pins the exact regressions: attach-before-hydration delivers the transcript,
+  a pre-created empty entry gets filled, a live transcript survives `_ensureEntry`, a store miss does not
+  cause a reload per attach, and a SPARSE attach on a pre-created entry carries the tail +
+  `{fromSeq, messageCount}` envelope with the LAST messages. Finding #1 ("a fresh origin cannot open an
+  existing session") turned out to be a CONSEQUENCE of this one — no client change was needed: on a new
+  port with a pre-seeded 9.6MB session, the same attach-first scenario that used to render an empty chat
+  now renders the session (4569 chars, session content visible) and fills the cache (6 chunks, 1.69MB).
 - **2026-10-24 — measurements (C3, author):** cold/warm pair on the real 9.6MB session from a fresh origin: **cold = 6 /range requests ≈ 2193 KB, warm = 0 requests / 0 KB**, IDB written 2.62MB (27% of the raw body, 1.36x the gzipped body), 9 readwrite txns per load and 0/s idle, framing 4.9-7.9ms and gzip 4.1-15.1ms per closed 242-523KB window. Full table + threshold verdicts in §7. Two threshold corrections in the write-up: grok’s “<3ms gzip per close” is unreachable for a 64-message window (restated as main-thread framing <10ms, gzip off the critical path), and the warm 0 KB covers HTTP session traffic only — the tail still rides the WS attach (~276KB deflated), which is what C4 would address. §7 also records two defects found while measuring (fresh-origin ?session= never fetches the body; _ensureEntry’s length>0 guard leaves a pre-hydration entry empty for the process’s life) — both pre-existing, neither caused by this work, both recommended for a separate fix.

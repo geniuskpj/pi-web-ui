@@ -474,3 +474,28 @@ request naming a foreign Host still reports 403 (rebinding defence) instead of 4
 server.mjs, and the terminal hub receives the same origin rule as a PREDICATE (`originAllowed`) so the
 two checks cannot drift. Tests: `npm run test:security` (64 checks — other-port Origin, loopback +
 public Host without token, portless proxy form, `off`-mode token independence).
+
+## `length > 0` is not a hydration flag (2026-10-24)
+
+**Symptom that exposed it:** a fresh browser origin opening `?session=<a 1056-message session>` rendered
+an EMPTY chat; a direct WS attach probe against the same server reported `messages: 1, sparse: null`.
+The mirror on disk was intact — the transcript was simply never loaded into that process.
+
+**Cause:** `agent-hub.mjs` guarded hydration with `if (entry && entry.agent.state.messages.length > 0)
+return entry;`. A freshly created entry ALREADY holds one message (pi materializes the system prompt into
+`state.messages`), so a pre-hydration entry looked hydrated forever. Any path that creates the entry
+before the transcript load — an attach that loses a race with the store read, a prompt on a cold hub, an
+earlier attach — poisoned that session for the life of the process. A hub restart "fixed" it, which is
+the tell: the data was never lost, only never loaded.
+
+**Fix:** an explicit flag, plus let the attach do the loading. `entry.hydrated` is set when the caller
+SUPPLIES messages (`getSession(id, {messages})` — the caller asserts the transcript), set after a
+successful store load, and set on a store MISS (so a new session does not re-query the store on every
+attach); a store *error* leaves it unset so a later call retries. Hydration fills an entry only when it
+has no non-system messages, so a live transcript is never clobbered. And `attach()` became async: it
+awaits `_ensureEntry()` before snapshotting, which makes the fix independent of WHO created the entry.
+
+**Lesson:** never infer "this object is populated" from a count that includes an always-present element.
+Track the fact you actually mean (`hydrated`) — and fix the *ordering* at the entry point (attach) rather
+than only patching the guard, because the guard alone still lets the first frame be empty. Regression
+suite: `npm run test:hydration` (12 checks, incl. the sparse-attach-on-a-pre-created-entry case).
