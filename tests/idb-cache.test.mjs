@@ -16,7 +16,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { intervalDiff, chunkKey, mergeRanges, pickSweepCandidates, verifyChunkText } from "../src/idb-cache.ts";
+import {
+	intervalDiff, chunkKey, mergeRanges, pickSweepCandidates, verifyChunkText,
+	CHUNK_INTERVAL, chunkIndexOf, chunkFromSeq, chunkToSeq, isChunkAligned, planLiveChunk, toNdjson,
+} from "../src/idb-cache.ts";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 let passed = 0, failed = 0;
@@ -122,6 +125,62 @@ const disjoint = (rs) => rs.every((r, i) => i === 0 || rs[i - 1].toSeq <= r.from
 		/oldVersion \|\| 0/.test(cacheSrc) && /from < 2/.test(cacheSrc) && /deleteObjectStore\(name\)/.test(cacheSrc));
 	check("R5 the read path verifies integrity and drops a bad chunk instead of rendering it",
 		/verifyChunkText\(text, r\.fromSeq, r\.toSeq\)/.test(cacheSrc) && /dropChunk\(sessionId, gen, r\.fromSeq\)/.test(cacheSrc));
+}
+
+// ───────────────────────────────────── live write-through (C2): boundaries (B)
+{
+	check("B1 interval is 64 and maps seq → chunk", CHUNK_INTERVAL === 64 && chunkIndexOf(0) === 0 && chunkIndexOf(63) === 0 && chunkIndexOf(64) === 1 && chunkIndexOf(700) === 10,
+		`700 → chunk ${chunkIndexOf(700)}`);
+	check("B2 window bounds are [index*64, (index+1)*64)", chunkFromSeq(0) === 0 && chunkToSeq(0) === 64 && chunkFromSeq(10) === 640 && chunkToSeq(10) === 704);
+	check("B3 alignment test", isChunkAligned(0) && isChunkAligned(64) && !isChunkAligned(63) && !isChunkAligned(700));
+}
+
+// ─────────────────────────────────── live write-through (C2): flush plans (P)
+{
+	const none = planLiveChunk(128, 10);
+	check("P1 an aligned window that is not full yet is NOT written", none.write === null && none.consumed === 0);
+
+	const full = planLiveChunk(128, 64);
+	check("P2 a full aligned window closes exactly at the boundary",
+		JSON.stringify(full.write) === JSON.stringify({ fromSeq: 128, toSeq: 192, final: true }) && full.consumed === 64 && full.nextFromSeq === 192);
+
+	const over = planLiveChunk(128, 70);
+	check("P3 extra messages are left for the next chunk",
+		over.write.toSeq === 192 && over.consumed === 64 && over.nextFromSeq === 192);
+
+	const head = planLiveChunk(700, 10);
+	check("P4 a partial head closes at the next boundary (700 → 704), not at 64 messages",
+		JSON.stringify(head.write) === JSON.stringify({ fromSeq: 700, toSeq: 704, final: true }) && head.consumed === 4 && head.nextFromSeq === 704);
+
+	const headShort = planLiveChunk(700, 3);
+	check("P5 a partial head that has not reached the boundary stays buffered", headShort.write === null && headShort.consumed === 0);
+	check("P6 an empty buffer decides nothing", planLiveChunk(700, 0).write === null);
+
+	// the invariant that keeps keys honest: every decided window starts where it says and
+	// consumes exactly the messages it claims
+	const plan = planLiveChunk(700, 10);
+	check("P7 consumed messages exactly fill the decided window", plan.write.toSeq - plan.write.fromSeq === plan.consumed && plan.nextFromSeq === plan.write.toSeq);
+}
+
+// ──────────────────────────── live write-through (C2): framing + source (F, L)
+{
+	const msgs = [{ role: "user", content: "a" }, { role: "assistant", content: "b" }];
+	const nd = toNdjson(msgs);
+	check("F1 NDJSON framing matches the server (one JSON per line, no trailing newline)",
+		nd === JSON.stringify(msgs[0]) + "\n" + JSON.stringify(msgs[1]) && !nd.endsWith("\n") && nd.split("\n").length === 2);
+	check("F2 a live-written body passes the reader's own integrity check", verifyChunkText(nd, 100, 102).ok === true);
+
+	const proxySrc = fs.readFileSync(path.join(ROOT, "src/proxy-agent.ts"), "utf8");
+	check("L1 message_end feeds the live buffer", /this\.state\.messages\.push\(ev\.message\);\s*\n\s*this\.liveCapture\(ev\.message\)/.test(proxySrc));
+	check("L2 the run end, tab hide and page hide flush the open tail",
+		/this\.liveFlush\("agent_end"\)/.test(proxySrc) && /this\.liveFlush\("hidden"\)/.test(proxySrc) && /addEventListener\("pagehide"/.test(proxySrc));
+	check("L3 the attach window is seeded (that is the 1MB every open used to re-download)",
+		/this\.liveSeed\(sparse\.fromSeq, msg\.messages \|\| \[\], Number\(\(sparse as any\)\.rewriteSeq/.test(proxySrc));
+	check("L4 the buffer is keyed by the attach generation and a new one starts a new buffer",
+		/this\.liveGen !== gen\) \{ this\.liveBuf = \{ fromSeq: seq, messages: \[\] \}; this\.liveGen = gen; \}/.test(proxySrc));
+	check("L5 writes are integrity-checked, gzipped and stored under the generation",
+		/verifyChunkText\(text, fromSeq, toSeq\)/.test(proxySrc) && /gzipText\(text\)/.test(proxySrc) && /putChunk\(sessionId, fromSeq, toSeq, gen, toSeq, blob\)/.test(proxySrc));
+	check("L6 an idle debounce exists so a quiet tail still lands", /LIVE_IDLE_MS = 5000/.test(proxySrc) && /liveScheduleIdle/.test(proxySrc));
 }
 
 console.log(`\n[idb-cache] ${passed} passed, ${failed} failed`);
