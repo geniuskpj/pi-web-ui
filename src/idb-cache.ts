@@ -38,6 +38,11 @@ const META_STORE = "meta";
 const CHUNK_STORE = "chunks";
 const OP_TIMEOUT_MS = 2000;
 const CIRCUIT_THRESHOLD = 3;
+// BREAKER BACKOFF (review follow-up, live-verification caveat): the breaker used to open
+// for the REST OF THE PAGE LOAD — heavy work in another tab (or a slow disk) could
+// silently switch the cache off until a reload. It now retries after this delay, and a
+// success closes it. net effect: a transient stall costs one 30s window, not the session.
+const BREAKER_BACKOFF_MS = 30_000;
 const MAX_CACHE_BYTES = 200 * 1024 * 1024; // LRU cap (gzip blob bytes)
 
 export interface IdbChunk {
@@ -60,7 +65,7 @@ export interface IdbMeta {
 }
 
 let dbPromise: Promise<IDBDatabase> | null = null;
-let degraded = false;
+let degradedUntil = 0; // 0 = closed; Date.now()+BREAKER_BACKOFF_MS while open
 let failureStreak = 0;
 // Highest generation seen per session (in memory): a write for an OLDER
 // generation is pointless (unreachable by design) and is dropped, so a stale
@@ -87,8 +92,13 @@ function memPut(sessionId: string, fromSeq: number, messages: any[]) {
 	}
 }
 
+/** PURE: is the breaker open at `now`? (unit-tested; until === 0 means closed) */
+export function breakerOpenAt(until: number, now: number): boolean {
+	return until > now;
+}
+
 function withTimeout<T>(op: (db: IDBDatabase) => Promise<T>): Promise<T | null> {
-	if (degraded || !("indexedDB" in window)) return Promise.resolve(null);
+	if (!("indexedDB" in window) || breakerOpenAt(degradedUntil, Date.now())) return Promise.resolve(null);
 	const MISS = Symbol("miss"); // sentinel: op itself failed/threw — distinct from a null RESULT
 	dbPromise ??= new Promise<IDBDatabase>((resolve, reject) => {
 		const req = indexedDB.open(DB_NAME, DB_VERSION);
@@ -124,10 +134,12 @@ function withTimeout<T>(op: (db: IDBDatabase) => Promise<T>): Promise<T | null> 
 		// legitimately return null/undefined (grok review 01a16a54 #3: putChunk's
 		// `return null` used to trip the circuit after 3 successful warms)
 		if (timedOut || r === MISS) {
-			if (++failureStreak >= CIRCUIT_THRESHOLD) degraded = true; // stop trying until next page load
+			// OPEN, but only for BREAKER_BACKOFF_MS — the next op after that tries again
+			if (++failureStreak >= CIRCUIT_THRESHOLD) degradedUntil = Date.now() + BREAKER_BACKOFF_MS;
 			return null;
 		}
 		failureStreak = 0;
+		degradedUntil = 0; // success closes the breaker early
 		return r;
 	});
 }

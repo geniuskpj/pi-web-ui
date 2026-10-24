@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 import {
 	intervalDiff, chunkKey, mergeRanges, pickSweepCandidates, verifyChunkText,
 	CHUNK_INTERVAL, chunkIndexOf, chunkFromSeq, chunkToSeq, isChunkAligned, planLiveChunk, toNdjson,
-	transferPolicy,
+	transferPolicy, breakerOpenAt,
 } from "../src/idb-cache.ts";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -211,6 +211,56 @@ const disjoint = (rs) => rs.every((r, i) => i === 0 || rs[i - 1].toSeq <= r.from
 		// restore
 		if (realNav) Object.defineProperty(globalThis, "navigator", realNav); else delete globalThis.navigator;
 	}
+}
+
+// ───────────── breaker recovery (review: "let degraded recover after a backoff") (BR)
+{
+	check("BR1 closed while until is 0 or past", breakerOpenAt(0, 1000) === false && breakerOpenAt(999, 1000) === false);
+	check("BR2 open before the backoff elapses", breakerOpenAt(1000, 999) === true);
+	const src = fs.readFileSync(path.join(ROOT, "src/idb-cache.ts"), "utf8");
+	check("BR3 the breaker carries an expiry instead of a permanent flag",
+		/BREAKER_BACKOFF_MS = 30_000/.test(src) && /let degradedUntil = 0/.test(src) && !/let degraded = false/.test(src));
+	check("BR4 tripping sets the expiry, a success closes it early",
+		/degradedUntil = Date\.now\(\) \+ BREAKER_BACKOFF_MS/.test(src) && /degradedUntil = 0; \/\/ success closes the breaker early/.test(src) &&
+		/breakerOpenAt\(degradedUntil, Date\.now\(\)\)/.test(src));
+}
+
+// ───────────── overlapping coverage: disjoint, blob-backed, never duplicated (P8)
+{
+	// The review asked for this before any fix: a warmed hole and a later attach tail can
+	// OVERLAP (server-chosen alignment), so verify that repeated overlapping puts keep the
+	// coverage pairwise disjoint, that every range still has a blob behind it (the replaced
+	// ones are deleted), and that a read over the final coverage can never hand out the same
+	// message twice.
+	let failure = null;
+	for (let seed = 1; seed <= 40 && !failure; seed++) {
+		let rnd = seed;
+		const next = (n) => { rnd = (rnd * 1103515245 + 12345) % 2147483648; return rnd % n; };
+		let ranges = [];
+		const store = new Map(); // fromSeq → the message seqs that blob covers
+		for (let step = 0; step < 12; step++) {
+			const from = next(200);
+			const to = from + 1 + next(40);
+			const { ranges: merged, replaced } = mergeRanges(ranges, { fromSeq: from, toSeq: to, bytes: to - from });
+			for (const r of replaced) store.delete(r.fromSeq); // putChunk deletes them in the same txn
+			store.set(from, Array.from({ length: to - from }, (_, k) => from + k));
+			ranges = merged;
+			if (!disjoint(ranges)) { failure = `seed ${seed} step ${step}: overlapping ranges ${JSON.stringify(ranges)}`; break; }
+			if (ranges.some((r) => !store.has(r.fromSeq))) { failure = `seed ${seed} step ${step}: a range has no blob`; break; }
+			if (ranges.some((r) => store.get(r.fromSeq).length !== r.toSeq - r.fromSeq)) { failure = `seed ${seed} step ${step}: blob length ≠ range`; break; }
+		}
+		if (failure) break;
+		const seen = new Map();
+		for (const r of ranges) for (const seq of store.get(r.fromSeq)) seen.set(seq, (seen.get(seq) || 0) + 1);
+		const dupes = [...seen.entries()].filter(([, c]) => c > 1);
+		if (dupes.length) failure = `seed ${seed}: seq(s) ${dupes.slice(0, 3).map(([s]) => s)} appear in more than one chunk`;
+		// and the read path agrees: the covered windows have no holes, the rest is one hole
+		const covered = ranges.flatMap((r) => [r.fromSeq, r.toSeq]);
+		const lo = Math.min(...covered), hi = Math.max(...covered);
+		const holes = intervalDiff(lo, hi, ranges);
+		if (holes.some((h) => ranges.some((r) => h.fromSeq < r.toSeq && r.fromSeq < h.toSeq))) failure = `seed ${seed}: a hole overlaps a claimed range`;
+	}
+	check("P8 random overlapping puts stay disjoint, blob-backed and duplicate-free", !failure, failure || "40 seeds × 12 puts");
 }
 
 console.log(`\n[idb-cache] ${passed} passed, ${failed} failed`);

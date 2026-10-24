@@ -10,6 +10,7 @@ import http from "node:http";
 import os from "node:os";
 import WebSocket from "ws";
 import { startScratchServer } from "./_scratch-server.mjs";
+import { netClassOf } from "../lib/net-class.mjs";
 
 let passed = 0, failed = 0;
 const check = (name, ok, extra = "") => {
@@ -108,6 +109,18 @@ const req = (s, pathStr, headers = {}, via = "loopback") => new Promise((resolve
 	r.setTimeout(15000, () => { r.destroy(); resolve(-2); });
 	r.end();
 });
+/** GET that returns the parsed JSON body (netClass assertions need the body). */
+const jsonOf = (s, pathStr, headers = {}, via = "loopback") => new Promise((resolve) => {
+	const r = http.request({ host: via === "remote" ? LAN : "127.0.0.1", port: s.port, path: pathStr, method: "GET", headers }, (res) => {
+		let body = "";
+		res.setEncoding("utf8");
+		res.on("data", (d) => (body += d));
+		res.on("end", () => { try { resolve({ status: res.statusCode, json: JSON.parse(body) }); } catch { resolve({ status: res.statusCode, json: null }); } });
+	});
+	r.on("error", () => resolve({ status: -1, json: null }));
+	r.setTimeout(15000, () => { r.destroy(); resolve({ status: -2, json: null }); });
+	r.end();
+});
 const wsUp = (s, pathStr, headers = {}, via = "loopback") => new Promise((resolve) => {
 	const r = http.request({ host: via === "remote" ? LAN : "127.0.0.1", port: s.port, path: pathStr, headers: { ...headers, Connection: "Upgrade", Upgrade: "websocket", "Sec-WebSocket-Version": "13", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==" } });
 	r.on("upgrade", () => resolve(101));
@@ -133,6 +146,22 @@ const wsUp = (s, pathStr, headers = {}, via = "loopback") => new Promise((resolv
 		check("auto: loopback + localhost Host + Origin localhost:3000 → 403", (await req(s, "/api/sessions", { Host: `localhost:${s.port}`, Origin: "http://localhost:3000" })) === 403);
 		check("auto: loopback + Host on another local port → 403", (await req(s, "/api/sessions", { Host: "127.0.0.1:3000" })) === 403);
 		if (LAN) {
+			// netClass (the tail-first transfer-policy hint). The HOST branch of this
+			// classification is unreachable from a local test (the socket peer is always
+			// loopback/LAN, and the peer term wins), so the classifier is a pure module
+			// and its cases are asserted directly — the regression that mattered is
+			// IPv6: the old split(":")[0] reported EVERY IPv6 LAN host as "remote".
+			const NC = netClassOf;
+			check("netClass(host): IPv6 ULA / link-local / loopback → lan",
+				NC("", "[fd00::1]:8787") === "lan" && NC("", "[fe80::1]:8787") === "lan" && NC("", "[::1]:8787") === "lan");
+			check("netClass(host): IPv4 LAN + loopback → lan",
+				NC("", "192.168.1.10:8787") === "lan" && NC("", "10.1.2.3:8787") === "lan" && NC("", "127.0.0.1:8787") === "lan" && NC("", "localhost:8787") === "lan");
+			check("netClass(host): public names + public IPv6 → remote",
+				NC("", "pi.example.com:8787") === "remote" && NC("", "[2606:4700::1111]:8787") === "remote" && NC("", "8.8.8.8:8787") === "remote" && NC("", "") === "remote");
+			check("netClass(peer) wins: a LAN peer is lan whatever the Host says",
+				NC("192.168.123.5", "pi.example.com:8787") === "lan" && NC("::ffff:192.168.1.5", "pi.example.com:8787") === "lan");
+			// and the route really uses it (LAN peer ⇒ the same value the module returns)
+			check("netClass: /api/health reports lan for a LAN peer", (await jsonOf(s, "/api/health", { Host: `${LAN}:${s.port}` }, "remote")).json?.netClass === "lan");
 			check("auto: remote + no token → 401", (await req(s, "/api/sessions", { Host: `${LAN}:${s.port}` }, "remote")) === 401);
 			check("auto: remote + token + ANY domain Host → 200 (the fix)", (await req(s, "/api/sessions", { Host: `pi.example.com:${s.port}`, "x-pi-web-token": s.token }, "remote")) === 200);
 			check("auto: remote + token + evil Origin → 200 (token is the boundary)", (await req(s, "/api/sessions", { Host: `pi.example.com:${s.port}`, Origin: "http://evil.com", "x-pi-web-token": s.token }, "remote")) === 200);

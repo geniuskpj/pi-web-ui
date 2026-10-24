@@ -47,6 +47,7 @@ import { getBuiltinProviders, getBuiltinModels } from "@earendil-works/pi-ai/pro
 import { AgentHub } from "./agent-hub.mjs";
 import { createTerminalHub } from "./terminal-hub.mjs";
 import { stripBoilerplate } from "./lib/hp2.mjs";
+import { netClassOf } from "./lib/net-class.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, "public");
@@ -368,8 +369,9 @@ app.get("/api/health", (c) => {
 	// the server's only signal; the browser's NIA outranks it client-side).
 	const peer = c.env?.incoming?.socket?.remoteAddress || c.req.header("x-forwarded-for")?.split(",")[0]?.trim() || "";
 	const host = c.req.header("host") || "";
-	const isPrivate = (s) => /^(localhost|127\.|\[::1\]|::1|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.)/.test(s);
-	const netClass = isPrivate(peer) || isPrivate(host.split(":")[0]) ? "lan" : "remote";
+	// Host parsing + private-range classification live in lib/net-class.mjs: pure,
+	// unit-tested, IPv6-aware (the old inline split(":")[0] broke every IPv6 host).
+	const netClass = netClassOf(peer, host);
 	return c.json({ ok: true, bootId: BOOT_ID, buildId: BUILD_ID, piDir: PI_DIR, netClass });
 });
 app.get("/api/version", (c) => c.json({ buildId: BUILD_ID, bootId: BOOT_ID }));
