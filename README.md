@@ -137,8 +137,12 @@ Layered design — the server decides transfer sizes, the client decides display
   stay adjacent to the loaded tail) and aligns the start down to the nearest **user turn**.
   Identity headers: `X-Session-Mutate-Epoch` (rewrite generation), `X-Session-Message-Count`,
   `X-Range-From/To-Seq`, `X-Rewritten-From` (chunks strictly below this seq survive rewrites).
-- **IndexedDB cache** (`pi-session-cache`): per-chunk gzip blobs keyed `[sessionId, fromSeq]` + a
-  tiny per-session coverage record. Miss-set = interval diff (one small meta get). LRU 200MB.
+- **IndexedDB cache** (`pi-session-cache`, **schema v2**): per-chunk gzip blobs keyed
+  `[sessionId, rewriteSeq, fromSeq]` + a tiny coverage record PER GENERATION. Miss-set = interval diff
+  (one small meta get). LRU 200MB (superseded generations evicted first). A rewrite never erases
+  anything — the new generation is a fresh key space and the old one is unreachable — a date-based
+  `sweepStale()` collects it (5-minute grace once superseded, 30-day hard TTL) on attach and on tab
+  focus, and a chunk that fails the on-read integrity check is dropped so the next read refetches.
   Wedge-proof by design: lazy open (boot never touches IDB), 2s timeout on every op (a timeout
   is a MISS, not an error), 3-failure circuit breaker, per-session serialized writes, server
   fallback always available.

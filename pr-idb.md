@@ -51,10 +51,25 @@ are the recorded v2 options; brotli wasm (150KB–1.8MB) rejected — wire brotl
   the full snapshot. WS permessage-deflate (`PI_WEB_WS_DEFLATE=off` escape hatch).
 
 **Client**
-- `src/idb-cache.ts`: chunk-granular IDB cache (`pi-session-cache` v1): per-chunk gzip blobs keyed
-  `[sessionId, fromSeq]` (1:1 with coverage ranges — no merging, grok #5) + a tiny per-session meta
-  record (coverage = sorted disjoint ranges). Miss-set = interval diff from ONE small meta get.
-  LRU 200MB with coverage punch-out (one txn). Guardrails: lazy open, 2s timeouts (timeout = miss),
+- `src/idb-cache.ts`: chunk-granular IDB cache — **schema v2 (2026-10-24, C1)**: per-chunk gzip blobs
+  keyed `[sessionId, rewriteSeq, fromSeq]` (1:1 with coverage ranges — no merging, grok #5) + a tiny meta
+  record PER GENERATION (coverage = sorted disjoint ranges, `updatedAt` for the GC). Miss-set = interval
+  diff from ONE small meta get. LRU 200MB with coverage punch-out (one txn; superseded generations are
+  evicted first).
+  **v2 = generations instead of erasure** (design update grok `01a16c29`; user asks "chunk should be
+  updated automatically without request", "local cache don't need to be erased immediately … after
+  checking integrity (date, reload)", "only for cache"): a rewrite bumps `rewriteSeq`, the new
+  generation gets its own meta and chunk keys, so the old one is simply **unreachable** — the
+  `invalidateSession()` wipe is gone (the epoch-mismatch path now just refuses to splice and lets
+  `sweepStale()` collect it). `sweepStale()` = date GC: superseded generations go after a 5-minute grace,
+  anything (current generation included) after a 30-day hard TTL; triggers are attach (a newer generation
+  proves the old is stale) and tab focus. Integrity is checked on READ: `verifyChunkText()` (every line is
+  JSON + line count == the claimed window) and a failing chunk is dropped with its coverage punched
+  (`dropChunk`) so the next read refetches instead of rendering corrupt bytes. Overlapping windows
+  (a turn-aligned fetched range meeting an aligned live chunk) REPLACE the older range via
+  `mergeRanges()` — ranges stay disjoint and 1:1 with keys, the replaced chunk is deleted in the same txn.
+  A write for an OLDER generation than one already seen is dropped, so a stale in-flight fetch cannot
+  resurrect a collected generation. Guardrails unchanged: lazy open, 2s timeouts (timeout = miss),
   3-failure circuit breaker, per-session write serialization, clear-vs-inflight generation guard.
 - Sparse state: `state.messages` stays **DENSE** (the loaded window — the first attempt with null
   holes crashed UI listeners and was user-reset); the window position lives in `state.sparse
@@ -62,8 +77,8 @@ are the recorded v2 options; brotli wasm (150KB–1.8MB) rejected — wire brotl
   single call site (grok #2: use filledFrom, not the frozen attach fromSeq).
 - Backfill vs expand split: policy=fast warms **IDB only** (never the render — user complaint
   "loading all of chat at once"); the ⤒ button grows the render one server-clamped step per click,
-  IDB-first, epoch-guarded (stale generation → invalidate via rewrittenFrom, refuse to splice),
-  single-flight, session-pinned.
+  IDB-first, epoch-guarded (stale generation → refuse to splice; nothing is erased in v2 — the old
+  generation is unreachable by key and the GC collects it), single-flight, session-pinned.
 - Transfer policy: `navigator.connection` (saveData / 2g-3g / cellular → metered; wifi/ethernet/4g
   → fast) over the server's `netClass` fallback (peer/Host private-range classification — the
   user's `192.x` vs `xxxx.iptime.org` heuristic, demoted to second place).
@@ -109,8 +124,10 @@ security 64, store 7, runtime 6, typecheck + build. Live: range tail 909–977 (
 ## 6. Known limitations / deferred
 
 - Two tabs: last-writer-wins per chunk key; meta races self-heal on read. No BroadcastChannel sync.
-- Stale generations DROP the whole cache conservatively when `rewrittenFrom = MAX` (no rewrite
-  info); partial survival needs the server's `rewrittenFrom` on every response (present).
+- A rewrite starts an EMPTY generation: the unchanged prefix below the rewrite span is re-warmed by the
+  backfill loop instead of being carried over. Prefix survival (the server's `X-Rewritten-From` hint) is
+  deliberately deferred — it needs the surviving chunks copied into the new generation, and a rewrite is
+  rare next to the cost of getting identity wrong.
 - IDB unavailable (private mode / disabled) → circuit opens → today's fetch-every-time behavior.
 - No list virtualization: a fully-expanded 7.3MB session renders all nodes (the sparse display
   gate mitigates; full virtualization is a separate UI project).
@@ -246,6 +263,18 @@ the transfer PR's §2 table stay out of the tree.
   expand banner inside the chat flow; coarse-pointer/mobile patterns. Response: adopted.
 - **2026-10-24 — grok-4.6-high (implementation review, 01a16a54):** 3 critical + 4 high findings —
   ALL FIXED in `e4ac970` (see §4). Residual: IPv6-ULA netClass nit (open, low).
+- **2026-10-24 — review (C1 implemented, author):** the four user requirements landed in the cache only
+  (`feat/idb-live-cache`): (1) generation-keyed chunks + `sweepStale()` + the `invalidateSession` wipe
+  deleted — "don't erase immediately" is now structural, not a promise; (2) `verifyChunkText` on read and
+  a dropped chunk refetches, so a corrupt/short blob can never render; (3) `mergeRanges` gives the
+  overlapping-seam case explicit semantics (new window replaces the old range, replaced chunk deleted in
+  the same txn) — this closes the open item from the 2026-10-24 growing-session review; (4) render path
+  untouched (`filledFrom`/`messageCount`/`getCachedChunks` hole logic unchanged; reads simply miss for an
+  unknown generation). `tests/idb-cache.test.mjs` (27 checks) pins keys, coverage math incl. the seam,
+  sweep selection (grace period, hard TTL, current generation protected) and the integrity checker —
+  plus source assertions that the wipe is gone and the v2 keys are what ships. Deferred to C2: automatic
+  live write-through (aligned 64-message chunks + a rewritten-in-place partial tail, flush on boundary /
+  `agent_end` / tab-hide) and the server-side alignment of `/range` windows to those boundaries.
 - **2026-10-24 — user live test:** "loading all of chat at once" (backfill touched the render) →
   warming is IDB-only; "512KB too short" → 1MB tail; "button not responding" → unit-mismatch fixed;
   "display by user turn" → view gate + turn-aligned ranges; "how it works with compaction" →
