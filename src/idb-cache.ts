@@ -49,6 +49,24 @@ let dbPromise: Promise<IDBDatabase> | null = null;
 let degraded = false;
 let failureStreak = 0;
 const writeQueues = new Map<string, Promise<unknown>>();
+// CLEAR-vs-INFLIGHT GUARD (user request: "click clear while chat is in progress"):
+// clearSession bumps the generation; queued writes capture it at call time and
+// skip their txn if it moved — a clear can never be resurrected by an older write.
+const clearGen = new Map<string, number>();
+// MEMORY WORKING SET (shader-cache style, user request): decompressed chunks the
+// page already paid gunzip for — reads skip DecompressionStream entirely. Bounded
+// (LRU), page-lifetime only (never persisted — localStorage would re-hit the 5MB
+// quota this whole design exists to escape).
+const memTier = new Map<string, { messages: any[]; at: number }>();
+const MEM_TIER_MAX = 24;
+const memKey = (sessionId: string, fromSeq: number) => `${sessionId}:${fromSeq}`;
+function memPut(sessionId: string, fromSeq: number, messages: any[]) {
+	memTier.set(memKey(sessionId, fromSeq), { messages, at: Date.now() });
+	if (memTier.size > MEM_TIER_MAX) {
+		const oldest = [...memTier.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+		if (oldest) memTier.delete(oldest[0]);
+	}
+}
 
 function withTimeout<T>(op: (db: IDBDatabase) => Promise<T>): Promise<T | null> {
 	if (degraded || !("indexedDB" in window)) return Promise.resolve(null);
@@ -134,11 +152,15 @@ export async function getCachedChunks(sessionId: string, from: number, to: numbe
 		const out: Array<{ fromSeq: number; toSeq: number; messages: any[] }> = [];
 		for (const r of meta.ranges) {
 			if (r.toSeq <= from || r.fromSeq >= to) continue;
+			// MEMORY TIER first (shader-cache): skip gunzip entirely on re-reads
+			const hit = memTier.get(memKey(sessionId, r.fromSeq));
+			if (hit) { hit.at = Date.now(); out.push({ fromSeq: r.fromSeq, toSeq: r.toSeq, messages: hit.messages }); continue; }
 			const rec = await txReq(db, [CHUNK_STORE], "readonly", (tx) => tx.objectStore(CHUNK_STORE).get([sessionId, r.fromSeq]) as IDBRequest<IdbChunk>);
 			if (!rec || rec.toSeq !== r.toSeq) return []; // ghost range (blob gone) → fetch instead
 			const text = await gunzip(rec.blob);
 			if (text == null) return [];
 			const msgs = text.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+			memPut(sessionId, rec.fromSeq, msgs);
 			out.push({ fromSeq: rec.fromSeq, toSeq: rec.toSeq, messages: msgs });
 		}
 		return out;
@@ -154,7 +176,9 @@ export async function getCachedChunks(sessionId: string, from: number, to: numbe
  *  rewrittenFrom survive (same identity rule as the server). Serialized per
  *  session; overwrites of the same key adjust totalBytes (no LRU inflation). */
 export async function putChunk(sessionId: string, fromSeq: number, toSeq: number, rewriteSeq: number, messageCount: number, gzipBlob: Blob, rewrittenFrom = Number.MAX_SAFE_INTEGER): Promise<void> {
+	const genAtCall = clearGen.get(sessionId) || 0; // clear-vs-inflight guard
 	const run = () => withTimeout(async (db) => {
+		if ((clearGen.get(sessionId) || 0) !== genAtCall) return true; // cleared mid-flight — drop silently
 		const chunk: IdbChunk = { sessionId, fromSeq, toSeq, rewriteSeq, blob: gzipBlob, bytes: gzipBlob.size, storedAt: Date.now() };
 		await new Promise<null>((resolve) => {
 			try {
@@ -197,6 +221,16 @@ export async function putChunk(sessionId: string, fromSeq: number, toSeq: number
  *  Resolves on tx COMPLETE (the old version never resolved on the done path
  *  and always rode the 2s timeout — grok review 01a16a54 #6). */
 export async function invalidateSession(sessionId: string): Promise<void> {
+	await clearSession(sessionId);
+}
+
+/** USER-FACING CLEAR (session-list UI, "🧹 beside Kill"): wipes one session's
+ *  IDB cache + memory tier. SAFE DURING A LIVE RUN — the run streams via WS
+ *  and persists server-side; this cache is read-only data. An in-flight
+ *  backfill write for this session is dropped (generation guard in putChunk). */
+export async function clearSession(sessionId: string): Promise<void> {
+	clearGen.set(sessionId, (clearGen.get(sessionId) || 0) + 1);
+	for (const k of [...memTier.keys()]) if (k.startsWith(sessionId + ":")) memTier.delete(k);
 	await withTimeout(async (db) => {
 		await new Promise<null>((resolve) => {
 			try {
@@ -217,6 +251,14 @@ export async function invalidateSession(sessionId: string): Promise<void> {
 		});
 		return null;
 	});
+}
+
+/** IDB footprint per session (session-list UI: "IDB 1.2MB" badges). */
+export async function idbStats(): Promise<Map<string, { bytes: number; chunks: number }>> {
+	const out = new Map<string, { bytes: number; chunks: number }>();
+	const metas = await withTimeout(async (db) => txReq(db, [META_STORE], "readonly", (tx) => tx.objectStore(META_STORE).getAll() as IDBRequest<IdbMeta[]>));
+	for (const m of metas || []) out.set(m.sessionId, { bytes: m.totalBytes || 0, chunks: m.ranges?.length || 0 });
+	return out;
 }
 
 async function evictIfNeeded(db: IDBDatabase): Promise<void> {

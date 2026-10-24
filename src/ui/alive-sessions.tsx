@@ -18,6 +18,7 @@
 //   only reorder on status transitions, so Kill targets don't jitter).
 import { useEffect, useRef, useState } from "preact/hooks";
 import { sessionSync, type RuntimeRecord } from "../session-sync.js";
+import { clearSession as clearIdbCache } from "../idb-cache.js";
 
 type RowState = "running" | "error" | "done";
 
@@ -150,6 +151,19 @@ export function AliveSessionsDialog({
 		}).catch(() => {});
 	};
 
+	// IDB CLEAR beside Kill (user request 2026-10-24): wipes the session's IDB
+	// body cache + memory tier. SAFE DURING A LIVE RUN — the run streams via WS
+	// and persists server-side; the cache is read-only data and an in-flight
+	// backfill write is dropped (generation guard). One click, no confirm — a
+	// cleared cache self-heals on the next open (worst case: one range refetch).
+	const [clearedId, setClearedId] = useState<string | null>(null);
+	const clearCache = (id: string) => {
+		void clearIdbCache(id).then(() => {
+			setClearedId(id);
+			setTimeout(() => setClearedId((c) => (c === id ? null : c)), 1500);
+		});
+	};
+
 	const openSession = (id: string) => {
 		if (id === currentSessionId) { onClose(); return; } // already there — don't reload
 		onLoad(id);
@@ -205,6 +219,15 @@ export function AliveSessionsDialog({
 										onClick={(e) => { e.stopPropagation(); kill(r.sessionId); }}
 									>
 										{confirming === r.sessionId ? "Confirm?" : "Kill"}
+									</button>
+								)}
+								{clearedId === r.sessionId ? <span class="pw-alive-stopping">cache cleared ✓</span> : (
+									<button
+										class="pw-mini-btn"
+										title="Clear this session's IndexedDB body cache — safe during a live run (the cache self-heals on the next open)"
+										onClick={(e) => { e.stopPropagation(); clearCache(r.sessionId); }}
+									>
+										🧹 clear
 									</button>
 								)}
 								{isStopping && <span class="pw-alive-stopping">stopping…</span>}
