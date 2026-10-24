@@ -1081,7 +1081,7 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 							class="pw-expand-btn"
 							onClick={() => { const a: any = agent; void a?.expandEarlier?.()?.then?.((ok: boolean) => { if (!ok) note("could not load earlier messages — check the server log"); }); }}
 						>
-							⤒ Load earlier messages ({(state as any).sparse.filledFrom})
+							⤒ Load earlier turns ({(state as any).sparse.filledFrom} msgs left)
 						</button>
 					</div>
 					)}

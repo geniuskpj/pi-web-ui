@@ -2487,6 +2487,16 @@ app.get("/api/agent/session/:id/range", async (c) => {
 			bytes += sz;
 			start--;
 		}
+		// USER-TURN ALIGNMENT (user request 2026-10-24: "reach until previous user
+		// turn"): a window that begins MID-TURN (inside an assistant's tool chain)
+		// reads broken. Walk the start DOWN to the nearest user message — each expand
+		// delivers whole conversational turns. Bounded scan (≤200 msgs / to fromSeq)
+		// so a monster turn can only stretch the window, never loop.
+		let aligned = start;
+		for (let k = 0; k < 200 && aligned > range.fromSeq; k++, aligned--) {
+			if (range.messages[aligned - range.fromSeq]?.role === "user") break;
+		}
+		start = aligned;
 		const slice = range.messages.slice(start - range.fromSeq);
 		const ndjson = slice.map((m) => JSON.stringify(m)).join("\n");
 		const gz = zlib.gzipSync(ndjson);
