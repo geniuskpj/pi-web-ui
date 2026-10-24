@@ -14,6 +14,7 @@ import { createApiKeyResolver, createProxyStreamFn } from "./ui/proxy-stream.js"
 import { defaultModelFromCache, fetchAndApplyConfig, loadCachedConfig, type PiConfig } from "./pi-import.js";
 import { ProxyAgent } from "./proxy-agent.js";
 import { sessionSync, type RuntimeRecord } from "./session-sync.js";
+import { getToken, installServerAuth, onServerAuth, retryServerAuth, type ServerAuthState } from "./server-auth.js";
 import { LocalStorageBackend } from "./local-storage-backend.js";
 import { fetchPiServerTools } from "./pi-tools.js";
 import { termBus } from "./ui/terminal.js";
@@ -515,6 +516,9 @@ function App() {
 	const [genStatus, setGenStatus] = useState<"" | "thinking" | "generating">("");
 	const [runtime, setRuntime] = useState<ReadonlyMap<string, RuntimeRecord>>(() => sessionSync.runtimeSnapshot());
 	const [bannerDismissed, setBannerDismissed] = useState(false);
+	// server auth/authorization state → persistent banner (2026-10-23): a 403 or a
+	// rejected token used to be invisible (empty session list, no message)
+	const [authIssue, setAuthIssue] = useState<{ state: ServerAuthState; detail: string } | null>(null);
 	const [sessionsOpen, setSessionsOpen] = useState(false);
 	const [aliveOpen, setAliveOpen] = useState(false);
 	const [settingsOpen, setSettingsOpen] = useState(false);
@@ -549,6 +553,10 @@ function App() {
 			window.removeEventListener("pi-agent-state-changed", onStateChanged);
 		};
 	}, []);
+
+	useEffect(() => onServerAuth((state, detail) => {
+		setAuthIssue(state === "ok" ? null : { state, detail });
+	}), []);
 
 	useEffect(() => {
 		const onStatus = (e: Event) => setOnline(Boolean((e as CustomEvent).detail));
@@ -671,6 +679,21 @@ function App() {
 					</div>
 				);
 			})()}
+			{authIssue && (
+				<div class="pi-auth-banner" role="alert">
+					<span class="pi-auth-ico" aria-hidden="true">{authIssue.state === "offline" ? "⚡" : "⛔"}</span>
+					<span class="pi-auth-body">
+						{authIssue.state === "no-token" && <><b>Server token required.</b> Read <code>data/auth-token.txt</code> on the server machine, then paste it in Settings → Server token.</>}
+						{authIssue.state === "bad-token" && <><b>Server token rejected.</b> The stored token no longer matches <code>data/auth-token.txt</code> — paste the current one in Settings → Server token.</>}
+						{authIssue.state === "host-blocked" && <><b>Server refused this host.</b> {authIssue.detail} — add this name on the server (<code>PI_WEB_TERM_ORIGIN</code>) or relax the gate (<code>PI_WEB_ORIGIN_GATE</code>, default <code>auto</code> already allows a valid token).</>}
+						{authIssue.state === "offline" && <><b>Server unreachable.</b> {authIssue.detail || "check the server process and the network"}.</>}
+					</span>
+					<button class="pi-auth-btn" onClick={() => { void retryServerAuth(); }}>Retry</button>
+					{authIssue.state !== "offline" && (
+						<button class="pi-auth-btn" onClick={() => setSettingsOpen(true)}>Settings</button>
+					)}
+				</div>
+			)}
 			{agent ? <ChatView agent={agent} /> : <div class="pw-chat" />}
 			{toast && <div class="pi-toast">{toast}</div>}
 			<AliveSessionsDialog
@@ -732,38 +755,25 @@ async function init() {
 		/* old browsers */
 	}
 
+	// NOTE (2026-10-23, grok review): the API token is a SETTINGS credential — stored in
+	// localStorage as `pi.webToken` and never read from the URL. A share link carrying
+	// `#token=` would hand whoever opens it full control (bash/exec + every session), so
+	// that path was deliberately removed; hand out the token only to people who should
+	// have the whole server (and see the read-only-scope open item).
+
 	// server auth: auto-generated token gates every /api/* + /ws/* call from
-	// non-loopback peers. Attach the stored token to all same-origin API calls;
-	// on 401, ask once and retry. Header (not cookie) by design — CSRF-proof.
-	const origFetch = window.fetch.bind(window);
-	window.fetch = async (input: any, init?: any) => {
-		const url = typeof input === "string" ? input : (input?.url || "");
-		const sameApi = url.includes("/api/") || url.includes("/ws/");
-		const tok = localStorage.getItem("pi.webToken");
-		if (sameApi && tok) {
-			const headers = new Headers(init?.headers || (typeof input !== "string" && input ? input.headers : undefined));
-			if (!headers.has("x-pi-web-token")) headers.set("x-pi-web-token", tok);
-			return origFetch(input, { ...init, headers });
-		}
-		let res = await origFetch(input, init);
-		if (res.status === 401 && sameApi) {
-			const t = window.prompt("Server requires the pi-web API token.\nRead it from data/auth-token.txt on the server machine:");
-			if (t) {
-				localStorage.setItem("pi.webToken", t.trim());
-				const headers = new Headers(init?.headers || (typeof input !== "string" && input ? input.headers : undefined));
-				headers.set("x-pi-web-token", t.trim());
-				res = await origFetch(input, { ...init, headers });
-			}
-		}
-		return res;
-	};
-	// WebSocket: append ?token= for /ws/* (WS can't set custom headers)
+	// non-loopback peers. installServerAuth() attaches the stored token to same-origin
+	// API calls, prompts once on a bare 401, and — new (2026-10-23) — reports 401/403
+	// to the shell so a rejected token or a blocked Host is never silent again.
+	installServerAuth();
+	// WebSocket: append ?token= for /ws/* (WS can't set custom headers; the server
+	// accepts the query form for /ws/* only — plain HTTP must use the header)
 	const RealWS = window.WebSocket;
 	window.WebSocket = class extends RealWS {
 		constructor(url: string | URL, protocols?: string | string[]) {
 			try {
 				const u = new URL(String(url));
-				const tok = localStorage.getItem("pi.webToken");
+				const tok = getToken();
 				if (u.pathname.startsWith("/ws/") && tok && !u.searchParams.has("token")) u.searchParams.set("token", tok);
 				super(u, protocols as any);
 			} catch { super(url as any, protocols as any); }

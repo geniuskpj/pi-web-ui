@@ -335,13 +335,19 @@ export function createTerminalHub({
 	agentDir,
 	dataDir,
 	killTree,
-	allowedOrigins, // Set<host:port> — browsers' Origin must match (see header)
+	allowedOrigins, // legacy Set form (host:port) — kept for other embedders
+	originAllowed, // (origin) => boolean — PREFERRED: the same rule the API gate uses
+	//                 (scheme-default port + exact allowlist entry), so the terminal
+	//                 cannot drift from the /api/* origin check
 	isLoopback, // (req) => boolean
 	debug = () => {},
 	stripWs = (s) => s,
 }) {
 	// fail closed if the caller forgets the security inputs
 	const origins = allowedOrigins instanceof Set ? allowedOrigins : new Set();
+	const originOk = typeof originAllowed === "function"
+		? originAllowed
+		: (o) => { try { return origins.has(new URL(String(o)).host.toLowerCase()); } catch { return false; } };
 	const loopbackOf = typeof isLoopback === "function" ? isLoopback : () => false;
 
 	// dedicated WSS: the shared 25MB maxPayload would let one oversized frame
@@ -958,7 +964,9 @@ export function createTerminalHub({
 			} catch {
 				/* reject below */
 			}
-			if (!host || !origins.has(host)) {
+			// ONE rule, shared with the /api/* gate: originAllowed() applies the scheme-default
+			// port and requires an exact allowlist entry (2026-10-23, grok review)
+			if (!originOk(origin)) {
 				debug("[term] rejected cross-origin WS from", origin);
 				socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
 				socket.destroy();

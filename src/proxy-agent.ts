@@ -117,6 +117,9 @@ export class ProxyAgent {
 		if (msg.type === "state") {
 			this.sessionId = msg.sessionId || this.sessionId;
 			this.attached = true;
+			// retry policy lives client-side (Settings → Retry): re-push on every attach
+			// so a hub restart/reconnect picks it up
+			this.pushAutoRetrySetting();
 			this.state.messages = [...(msg.messages || [])];
 			this.state.model = msg.model;
 			this.state.thinkingLevel = msg.thinkingLevel || "high";
@@ -317,6 +320,32 @@ export class ProxyAgent {
 	}
 
 	/** Pull a pending steering message back (edit) or drop it (cancel). */
+	/** RETRY a failed run (2026-10-23, user request). The HUB owns the semantics:
+	 *  it drops the 429/error message and continues the same transcript at the
+	 *  failure point — the user turn is NOT re-sent (the old client-side retry
+	 *  called prompt() with the last user text, which appended a SECOND user
+	 *  message) and completed tool calls are not re-run. Fire-and-forget: the reply
+	 *  is an ack, the run streams as normal agent events. */
+	async retry(): Promise<any> {
+		await this.whenReady(3000);
+		return this.sendAwait({ type: "retry" }, 15000);
+	}
+
+	/** Auto-retry preference (localStorage `pi.autoRetry`, default ON): pushes the
+	 *  hub's retry policy — 3 attempts, 3 s apart — for rate-limit/network errors.
+	 *  Re-sent on every (re)attach so a hub restart picks it up. */
+	async setAutoRetry(cfg: { enabled: boolean; attempts?: number; delayMs?: number }): Promise<any> {
+		await this.whenReady(3000);
+		return this.sendAwait({ type: "set-auto-retry", ...cfg }, 8000);
+	}
+
+	/** Push the stored auto-retry preference to the hub (called after each attach). */
+	private pushAutoRetrySetting(): void {
+		let enabled = true;
+		try { enabled = localStorage.getItem("pi.autoRetry") !== "0"; } catch { /* private mode */ }
+		this.sendMsg({ type: "set-auto-retry", enabled });
+	}
+
 	cancelSteering(): void {
 		this.sendMsg({ type: "steering-cancel" });
 	}

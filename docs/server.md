@@ -11,22 +11,52 @@ See [architecture.md](architecture.md) for the module map and trust-boundary sum
 - `AUTH_TOKEN`: env `PI_WEB_TOKEN` → else `data/auth-token.txt` → else generate
   `crypto.randomBytes(24).toString("base64url")` and persist (file mode = platform default — no chmod
   anywhere in server.mjs; the boot log prints only the file PATH, never the token).
-- `requestToken()`: header `x-pi-web-token` OR `?token=` query. The query form exists for WebSocket
-  (WS cannot set custom headers) but is accepted on plain HTTP too — query tokens leak via reverse-proxy
-  logs, Referer and history; only the WS upgrade path actually needs it.
+- `requestToken()`: header `x-pi-web-token`, OR `?token=` **only for `/ws/*`** (2026-10-23).
+  The query form exists for WebSocket (WS cannot set custom headers); on plain HTTP it is
+  REFUSED — query tokens leak via Referer, history and reverse-proxy logs, and WS has no CORS,
+  so a foreign page could otherwise dial `ws://host/ws/…?token=…` if the URL ever escaped. Use the
+  The token is a Settings credential (`localStorage pi.webToken`) — it is never read from the URL,
+  and no share-link path exists (2026-10-23, grok review: a URL token hands out full control).
 - `tokenMatches()`: length check + `crypto.timingSafeEqual` (timing-safe).
-- `authorized()`: loopback OR token. Loopback = remoteAddress `127.0.0.1` / `::1` / `::ffff:127.0.0.1`.
-- **Browser-origin gate (2026-10-21, r2 after re-review, DNS-rebinding defense)**: `ALLOWED_HOSTS`
-  (localhost, 127.0.0.1, [::1], `os.hostname()`, ALL non-internal interfaces — IPv4 AND bracketed IPv6,
-  zone ids stripped, `PI_WEB_TERM_ORIGIN` extras with scheme stripped + bare IPv6 bracket-wrapped — all
-  lowercased `host:port`) + `browserOriginAllowed(req)` require the `Host` header AND the `Origin`
-  header (when present) to be allowlisted. `headerHostAllowed` NORMALIZES: FQDN trailing dot stripped,
-  portless Host (browsers omit :80/:443) gets `:PORT` appended before the lookup. Applied by middleware
-  to **every `/api/*` route except `/api/health`** (r2: the original prefix list left
-  `/api/agent/session/:id` — which returns message BODIES — un-gated), and at upgrade to `/ws/sync` +
-  `/ws/agent` (a missing Origin = non-browser client → token gate only). `TERM_ALLOWED_ORIGINS =
-  ALLOWED_HOSTS` (shared with the terminal hub). Rationale: loopback trust is not a browser boundary —
-  a rebinding or `*.nip.io` hostname makes an attacker page same-origin over a loopback socket.
+- `authorized()`: a loopback peer is trusted ONLY when it addresses us by a LOCAL name
+  (`isLocalHost()`: localhost / `os.hostname()` / interface IPs) — a local reverse proxy makes the
+  peer loopback while serving a public Host, and that path must present the token; every other peer
+  needs the token. Loopback = remoteAddress `127.0.0.1` / `::1` / `::ffff:127.0.0.1` (socket peer
+  ONLY — `X-Forwarded-For` is never consulted). The gate MODE never changes this rule.
+- **Browser-origin gate (2026-10-21 r2; retuned 2026-10-23 after the grok PR review)**:
+  `ALLOWED_HOSTS` holds EXACT `host:port` entries: localhost, 127.0.0.1, `[::1]`, `os.hostname()`,
+  ALL non-internal interfaces (IPv4 + bracketed IPv6, zone ids stripped) at the app port, plus
+  `PI_WEB_TERM_ORIGIN` extras (scheme stripped, bare IPv6 bracket-wrapped, portless → app port).
+  `LOCAL_NAMES` (`hostName()`: lowercase, trailing FQDN dot stripped, port stripped, IPv6 bracketed)
+  is the subset that means "this machine" and is used ONLY by `isLocalHost()` for the token
+  exemption — never for matching. `browserOriginAllowed(req)` requires the `Host` header AND the
+  `Origin` header (when present) to match, and the match is EXACT: a missing Origin port means the
+  SCHEME DEFAULT (http→80, https→443), and a portless `Host` is tried as the app port plus 80/443
+  (`hostCandidates()`), so a TLS proxy works by listing its public form (`name:443`) while
+  `Origin: http://localhost:3000` from another local app stays rejected — "ignore the port" would
+  have accepted it (that was the first attempt; the review caught it). A malformed Origin (`null`)
+  fails CLOSED, and there is no suffix/`includes` matching (`localhost.evil.com` is rejected).
+  The terminal hub receives the SAME rule as a predicate (`originAllowed`), so the two cannot drift.
+  **Strictness — `PI_WEB_ORIGIN_GATE`** (`auto` default | `strict` | `off`, applied by the
+  `originGateApplies()` predicate): `auto` gates **loopback peers only**, because loopback is the one
+  trust path that skips the token — a rebinding page (served from `evil.com:PORT`, DNS flipped to
+  127.0.0.1) still arrives as loopback and is still rejected, while a remote peer that presents the
+  token may use ANY hostname (this is what makes a DDNS/domain work with zero config; before
+  2026-10-23 every custom name needed `PI_WEB_TERM_ORIGIN` and a TLS proxy could never work).
+  `strict` restores the old every-peer behaviour; `off` disables the gate entirely and logs a loud
+  WARNING at boot (plus a second warning when `HOST` is a wildcard) — a rebinding page can then read
+  `/api/sessions` with no token. Applied by middleware to **every `/api/*` route except `/api/health`**
+  (r2: the original prefix list left `/api/agent/session/:id` — which returns message BODIES —
+  un-gated) and at upgrade to `/ws/sync` + `/ws/agent` (a missing Origin = non-browser client →
+  token gate only). `headerHostAllowed` still normalizes FQDN trailing dots and portless Hosts.
+  Rationale: loopback trust is not a browser boundary.
+- **Always-token routes** (loopback is NOT enough, any gate mode): `POST /api/exec/tool`,
+  `GET /api/pi/keys` (+`POST /api/pi/key`), `/api/ws/file*` (workspace reads), token read/rotate.
+  The allowlist is not a local-attacker control — a local process just sends `Host: 127.0.0.1`.
+- **Client surfacing (`src/server-auth.ts`)**: the fetch patch attaches the token and now reports
+  `401`/`403` to the shell (banner in `main.tsx`): `no-token`, `bad-token`, `host-blocked`
+  (shows the server's own error string) or `offline` — a blocked host used to look like an empty
+  session list.
 - Middleware (first `app.use`): 401 for any `/api/*` except `/api/health` when not authorized; logs
   every `/api/*` request (errors to console.error always, successes only in debug).
 
@@ -262,6 +292,28 @@ MAX-seq idle from discard()). `enrichedSessions()` embeds NON-IDLE runtime (idle
 `/ws/sync` sessions frames and `GET /api/sessions`. Memory-only: a restart leaves everything idle.
 
 ## Server-side agent hub (`agent-hub.mjs`, non-default path)
+
+**retry / auto-retry (2026-10-23, user request)**: `hub.retry(id, {reason})` resumes a FAILED
+run at the failure point instead of re-sending the prompt. `_dropFailedTail()` pops the trailing
+assistant message(s) with `stopReason` `"error"`/`"aborted"` plus toolResults left orphaned by
+them and repairs a half-finished tool call (dangling `toolCall` without `toolResult` — the same
+repair `prompt()` does), then `agent.continue()` re-issues the failed model call against the SAME
+transcript: the user turn stays exactly once and completed tool calls are NOT re-run. Fallback
+when the tail is an assistant message: re-send the last user turn, dropping it first so it is
+never duplicated. `dropped === 0` → `{ok:false, reason:"nothing to retry…"}` (never regenerates a
+healthy turn); guarded by promptLock + idle/not-compacting. Versions are untouched, so an ✎ edit
+whose resubmit failed keeps its parked delta (`data/sessions/<id>.versions.jsonl`). WS
+`{type:"retry"}` → ack `{type:"retried"}` (the run streams as normal agent events, like prompt).
+`hub.setAutoRetry({enabled, attempts=3, delayMs=3000})` — the client pushes its setting
+(`localStorage pi.autoRetry`, default ON) on every attach. `_maybeScheduleAutoRetry()` runs from
+the `agent_end` handler when `_isRetryableError(msg)` matches transient failures only
+(429/rate-limit/quota/overloaded, 5xx, ECONNRESET/ETIMEDOUT/"fetch failed"/socket hang up/…) and
+NOT auth (401/403/invalid key) or context overflow; `entry.retryAttempts` caps the chain and is
+reset by success or any user action (prompt/steer/abort/edit/retry), so it only ever retries the
+same failing turn. Runtime preview (`entry.retryNote`) carries "retrying (n/N)…" / "auto-retry gave
+up after N attempt(s)". Timers are cleared in `abort()`, `discard()`, `shutdown()`, `prompt()`,
+`editCommit()` and on an explicit manual retry.
+
 
 Agent per session (**the DEFAULT chat path since 2026-10-21**); `getApiKey` reads `.pi/auth.json`
 server-side (keys never sent to clients); `persist()` → worker store. **The loop is fully server-side**:

@@ -114,7 +114,8 @@ Workspace file attach + image paste are BACK (plan.md §12–14) — see the exp
 | `PI_WEB_EXIT_ON_STDIN_CLOSE` | off | run the full graceful-shutdown sequence when the parent closes the server's stdin pipe (pipe-friendly Ctrl+C equivalent; used by tests — on Windows a cross-process `kill(SIGINT)` TerminateProcesses without running handlers) |
 | `PI_WEB_TERM_COLS` / `PI_WEB_TERM_LINES` | `110` / `32` | terminal grid size (stty in the pty tier, COLUMNS/LINES env in the pipe tier) |
 | `PI_WEB_TERM_BRIDGE` | auto | `0`/`pipes` forces the pipe tier; a path uses that exe as an msys-pty-bridge; unset → auto-provision msys2 `util-linux` `script.exe` into `data/bin/script/` (sha256-pinned `util-linux-2.40.2-2` package from repo.msys2.org, 8MB size cap, extracts a 63KB exe — once) |
-| `PI_WEB_TERM_ORIGIN` | auto | extra `host[:port]` entries for the /ws/terminal Origin allowlist (reverse proxies / custom DNS names) |
+| `PI_WEB_TERM_ORIGIN` | auto | extra `host[:port]` **names for the global Host/Origin allowlist** — every `/api/*` route and all three WS endpoints (`/ws/sync`, `/ws/agent`, `/ws/terminal`), not just the terminal. Comma-separated, scheme stripped. Matching is EXACT on `host:port`: a missing Origin port means the scheme default (http→80, https→443) and a portless Host is tried as the app port plus 80/443 — so a TLS reverse proxy needs its public form spelled out (`PI_WEB_TERM_ORIGIN=name:443`). Localhost, `os.hostname()` and every interface IP are always allowed |
+| `PI_WEB_ORIGIN_GATE` | `auto` | how strictly the DNS-rebinding Host/Origin allowlist applies: `auto` = **loopback peers only** (a remote peer must present the API token — that is what lets the UI work on any domain/DDNS name with no config), `strict` = every peer (pre-2026-10-23 behaviour, only allowlisted names pass), `off` = no host check at all (**foot-gun**, warns at boot: a rebinding page can read `/api/sessions` with no token) |
 | `PROXY_IDLE_MS` | `150000` | LLM proxy stall timeout |
 
 Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
@@ -123,7 +124,17 @@ Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
 
 - **Bundle**: ~1.0MB (0.20MB brotli). node_modules ~75MB. Only deps: preact,
   pi-agent-core, pi-ai, marked, dompurify, highlight.js (lib/common), diff + server-side
-  hono/ws/undici. Provider SDKs stubbed to `stubs/empty` (openai-compatible only).
+  hono/ws/undici. Provider SDKs stubbed to `stubs/empty` (openai-compatible only) — via
+  `overrides` in package.json **and** an esbuild `alias` in build.mjs: npm 9/10 silently
+  ignore `overrides` with `file:` specifiers, so the bundle must not depend on how npm
+  resolved them (otherwise the build pulls in the real SDKs and their missing transitive
+  deps, e.g. `@opentelemetry/api`, and fails — that is what broke CI on node 18/20/22).
+- **Node ≥ 22** (`engines` in package.json; 18/20 are EOL — 18 never worked, `npm run
+  build` fails there because npm 9 drops the file: overrides). CI: `.github/workflows/ci.yml`
+  runs node 22 + 24 on ubuntu + windows — `npm ci` → `typecheck` → `build` → the hermetic
+  suites (store, runtime, ssrf, retry, security-gates). The real-LLM suites
+  (`test:agent`, `test:steer`, `test:killstop`) and the Windows/pty-specific `term-smoke`
+  stay opt-in; `compact`/`fork`/`shutdown` need a bash/pty host, so they are local too.
 - **Theme variables** come from the vendored `public/assets/app.css` (pi-web-ui's compiled
   tailwind output, kept as a static asset — no runtime dependency). New-component styles live
   in `public/style.css`.
@@ -148,6 +159,10 @@ Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
   to `data/tmp/fetch/<slug>.md` (7-day prune) so `rg`/`read_file` can extract sections; `raw:true`
   returns the untouched body; body cap 3MB, timeout 20s default/60s max. Test: `npm run test:fetch`.
 - **Edit-with-versions (2026-10-23, user design — REPLACES the fork/rewrite button pair)**: hover a user message → **✎ edit** (the only action; ⑂ fork button deleted). The bubble becomes an INLINE EDITOR (llama.cpp-webui parity — textarea in the bubble, NOT composer prefill; Enter=newline, Ctrl/Cmd+Enter or **Resubmit** button submits, Esc/cancel reverts; focus returns to ✎ on cancel, to the composer on save). The click is PURELY LOCAL — no server call, no version, no refresh. Only saving a DIFFERENT text commits: the server parks the old tail (prompt + responses) as a **VERSION delta** in `data/sessions/<id>.versions.jsonl` — `{vid (monotonic), turn (cut index), firstId, count, reason, messages[]}` — truncates the active mirror to the prefix, and re-prompts through the normal path (`editCommit`; identical text = no-op, NO version — versions exist only when a different message is saved). While editing, later messages DIM + a dashed divider ("messages below will be replaced"). **🕘 versions picker** (stats bar) lists deltas meta-only with a first-text preview and a lossless **switch to** (the CURRENT tail is captured first as a `switch-away` delta). Restores are hub-side (bypass the client-put guards) + broadcastState resyncs all devices; deletes remove the sidecar too. Deepwiki research: pi's append-only tree (id/parentId + leaf) REJECTED as over-engineered per the user's simpler delta design; llama.cpp-webui's sibling-branching is the UX analogue. `forkSession` survives server-side only (no UI button; pi /clone utility). Tests: `npm run test:versions` (24) + `npm run test:fork` (23).
+- **Error retry (2026-10-23, user request)**: a failed run is retried **at the failure point**, not by re-sending the prompt. The old Retry button took the last user text and called `prompt()` — which appended a SECOND user message, and for a server-side session it mutated a transcript the server never sees. Now `hub.retry(id)` drops the trailing failure artifacts (assistant `stopReason: "error"`/`"aborted"` + toolResults orphaned by them, repairing a half-finished tool call) and calls **`agent.continue()`**: pi re-issues the failed model call against the SAME transcript, so the user turn appears exactly once and tool calls that already completed are **not** re-run. A fallback (tail is an assistant message) re-sends the user turn, dropping it first so it is never duplicated. Retry refuses when nothing failed (`{ok:false, reason:"nothing to retry…"}`) — it can never regenerate a healthy turn. WS `{type:"retry"}` → ack `{type:"retried"}` (the run streams as normal agent events); `{type:"set-auto-retry", enabled, attempts, delayMs}` → `{type:"auto-retry", …}`. Client: the Retry button on an error message calls it; the local `?local=1` loop mirrors the semantics in-browser (`agent.continue()` too).
+- **Auto-retry (2026-10-23)**: setting **Settings → Retry → "Auto-retry on rate limit / network errors — 3 attempts, 3 s apart"** (default ON, `localStorage pi.autoRetry`, pushed to the hub on every (re)attach). Only transient failures are retried: **429 / rate-limit / quota / overloaded / 5xx / network** (ECONNRESET, ETIMEDOUT, "fetch failed", "socket hang up", …). **Not** retried: 401/403/invalid key (burning quota on a bad key is pointless) or context-overflow. The attempt counter resets on success and on every user action (prompt/steer/abort/edit/retry), so it only ever chains consecutive failures of the SAME turn; when the budget is spent the runtime preview says *"auto-retry gave up after N attempt(s) — press Retry to try again"*.
+- **Versions survive a failed resubmit (2026-10-23)**: an ✎ edit parks its delta and truncates BEFORE the resubmit runs, so a 429 used to leave a parked version plus a dead turn. Now the version **stays parked** and the retry (manual or automatic) continues the edited turn as if the error had not happened — nothing is dropped from the 🕘 picker by a failure, and nothing is double-parked. Test: `npm run test:retry` (26 checks, hermetic — pi-ai's **faux provider** scripts `stopReason:"error"` responses, so no network/keys: resume-at-failure-point, no duplicated user turn, no re-run tool calls, auto-retry success + give-up, non-retryable classification, edit-version survival, refuse-when-healthy).
+
 - **Compact (2026-10-22, pi /compact parity)**: ⤓ compact button in the stats bar (server-side mode, idle, >6 messages). Algorithm mirrors pi's compaction.md: cut point by backwards token-estimate walk (chars/4) to keepRecentTokens (default 20k), cut advanced past toolResults (never splits call/result), span starts AFTER any previous compaction summary (iterative folding), serialization `[User]/[Assistant]/[Assistant tool calls]/[Tool result (name)]` with thinking OMITTED and tool results truncated at 2000 chars, structured checkpoint summary (Goal/Constraints/Progress/Key Decisions/Next Steps/Critical Context) via a throwaway Agent on the session model (thinkingLevel off). Replacement = [flagged summary message, ...kept]; the summary renders as a COLLAPSIBLE context block (⤓ collapsed by default — click to view), carries NO usage (totals drop to the kept tail). Divergence from pi: our linear mirror is REWRITTEN, so a pre-compact backup lands in `data/tmp/precompact/<id>-<ts>.jsonl.gz` (GZIP, 31-day prune). Guards: idle-only, one at a time; prompt/steer/fork/rewrite reject with "compaction in progress". WS: `{type:"compact", id, keepRecentTokens}` → `{type:"compacted", id, …}` (10-min client await; an LLM run on a huge session can take minutes — a `compacting: true` state frame shows an elapsed-time progress banner above the composer on ALL devices, surviving client timeouts). STICKY TITLE: compaction never renames the session (the old logic re-derived the title from the first user message — post-compact that IS the summary → "## Conversation summary (auto-compacted)"); once a real title exists it stays. COMPACTED-MIRROR PUT GUARD: a client push onto a compacted mirror must also start with the summary — stale pre-compact copies are rejected (`put-rejected` + toast). Auto-threshold compaction NOT implemented (manual only, like /compact). Test: `npm run test:compact`.
 - **`cdp-open.mjs` (2026-10-22)**: open a URL in the user's debugged browser — `node cdp-open.mjs
   <url>` (plus `--list` / `--close <id>`). **Chrome/Edge only** — the whole CDP tooling (cdp_eval,
@@ -203,10 +218,29 @@ Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
     allowlist inside its own size-capped WSS (WS has no CORS — a drive-by page could otherwise
     dial the socket; DNS-rebinding presents a mismatched Origin/Host pair). 2026-10-21: the same
     allowlist now gates `/ws/sync` + `/ws/agent` WS upgrades and EVERY `/api/*` route except
-    `/api/health` (Host + Origin must be real, incl. portless-Host and IPv6 normalization) — custom DNS
-    names must be added to `PI_WEB_TERM_ORIGIN` (details: docs/server.md). Session ids must be
-    unguessable (≥16 chars, not numeric) — the id is the reattach auth for loopback peers.
-    The token remains the trust boundary, exactly like `/api/exec/tool`.
+    `/api/health` (Host + Origin match **exactly** on `host:port`; a missing Origin port is the
+    scheme default — http→80, https→443 — a portless Host is tried as the app port plus 80/443,
+    IPv6/trailing-dot normalized, malformed Origin fails closed; `Origin: http://localhost:3000`
+    from another local app is NOT our origin and is rejected). Since 2026-10-23 the strictness is
+    `PI_WEB_ORIGIN_GATE` (default `auto`): the gate applies to **loopback peers only**, because
+    loopback is the one trust path that skips the token — a remote peer that presents the token is
+    already authenticated and may use ANY hostname (this is what makes a DDNS/domain work with zero
+    config; a rebinding page arriving as loopback is still rejected). The token exemption is tied to
+    the HOST: a loopback caller is trusted only when it addresses us by a LOCAL name (localhost /
+    hostname / interface IP), so a local reverse proxy serving a public name still has to send the
+    token, and the gate mode never changes that. Custom names go in `PI_WEB_TERM_ORIGIN` (spell the
+    public port for a TLS proxy). Session ids must be unguessable (≥16 chars, not numeric) — the id
+    is the reattach auth for loopback peers. The token remains the trust boundary, exactly like
+    `/api/exec/tool` (which, with `/api/pi/keys` and the workspace file reads, requires the token
+    even from loopback).
+  - **Accessing the UI on a custom domain**: open the server on that name and paste the token once
+    (Settings → Server token, stored as `pi.webToken`) — with the default `auto` gate nothing else
+    is needed. The token is a SETTINGS credential: it is never read from the URL and there are no
+    share links — a URL token would hand whoever opens it full control (bash/exec + every session);
+    a scoped read-only token is an open item. `?token=` in a query string is accepted **only on WS
+    upgrades** (WS cannot set headers), and the upgrade log prints the path without the query string.
+    If `/api/sessions` answers 401/403 the UI shows an amber banner with the reason instead of an
+    empty list.
 - **Workspace file endpoints** (picker/attachments): `GET /api/ws/files?path=` (structured
   listing, dotfiles hidden, dotfile paths 403) and `GET /api/ws/file?path=` (text w/ NUL-sniff
   or image → base64; 8MB cap; ALWAYS token-required like the exec bridge). All paths are

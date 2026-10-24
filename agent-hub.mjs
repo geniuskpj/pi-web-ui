@@ -266,7 +266,17 @@ export class AgentHub {
 					// state.isStreaming stayed true indefinitely — any device attaching in
 					// that window saw a frozen "streaming" transcript that never updates
 					// (no further events come). The terminal event is ground truth.
-					this._settleRuntime(sessionId, entry);
+					// ONE implementation (main's _settleRuntime refactor): the retry
+					// feature's note rides along so an alive-sessions row still previews
+					// WHY the run failed.
+					const { lastA, failed } = this._settleRuntime(sessionId, entry, { lastText: entry.retryNote || null });
+					// RETRY policy (2026-10-23): a run that ended in an error either gets a
+					// scheduled auto-retry (rate limit / network / transient 5xx — see
+					// _isRetryableError) or stops retrying. The counter resets on success and
+					// on every user action (prompt/steer/abort/edit/retry), so it only ever
+					// chains consecutive failures of the same turn.
+					if (failed) this._maybeScheduleAutoRetry(entry, sessionId, lastA);
+					else { entry.retryAttempts = 0; entry.retryNote = null; }
 				}
 				const payload = { type: "agent-event", sessionId, seq: entry.seq, event };
 				// liveness heartbeat for the zombie self-heal (grok Q1): multi-turn runs
@@ -403,6 +413,10 @@ export class AgentHub {
 
 	async prompt(sessionId, content, images) {
 		const entry = this.getSession(sessionId);
+		// a user-initiated send ends any auto-retry chain (the user is driving again)
+		this._cancelAutoRetry(entry);
+		entry.retryAttempts = 0;
+		entry.retryNote = null;
 		// NOTE: no fast path here — "prompt" means "start a run". A send while a run
 		// is streaming arrives as hub.steer() (the client says so); a prompt that
 		// races a run just starting takes the lock and the in-lock check below
@@ -443,6 +457,147 @@ export class AgentHub {
 		return next;
 	}
 
+	/** Error classes worth retrying automatically: the request never produced a
+	 *  usable response (rate limit, network, transient 5xx). NOT retryable: auth /
+	 *  invalid-key, context overflow, aborts — retrying those burns quota for
+	 *  nothing. Matched on the provider error string (pi encodes provider failures
+	 *  as an assistant message with stopReason "error" + errorMessage). */
+	_isRetryableError(msg) {
+		const s = String(msg?.errorMessage || "").toLowerCase();
+		if (!s) return false;
+		if (/401|403|unauthorized|invalid.?api.?key|authentication|permission/.test(s)) return false;
+		if (/context length|too many tokens|maximum context|context.?window/.test(s)) return false;
+		if (/429|too many requests|rate.?limit|quota exceeded|overloaded|capacity/.test(s)) return true;
+		if (/500|502|503|504|bad gateway|service unavailable|gateway timeout|internal server error/.test(s)) return true;
+		if (/econnreset|econnrefused|etimedout|epipe|enotfound|eai_again|socket hang up|fetch failed|network|connection (reset|closed|error)|timeout/.test(s)) return true;
+		return false;
+	}
+
+	/** Auto-retry config (per hub; the client pushes its setting at attach/change). */
+	setAutoRetry(cfg = {}) {
+		this.autoRetry = {
+			enabled: cfg.enabled !== undefined ? !!cfg.enabled : !!this.autoRetry?.enabled,
+			attempts: Math.max(0, Math.min(10, Number(cfg.attempts ?? this.autoRetry?.attempts ?? 3) || 3)),
+			delayMs: Math.max(0, Math.min(60000, Number(cfg.delayMs ?? this.autoRetry?.delayMs ?? 3000) || 3000)),
+		};
+		return { ...this.autoRetry };
+	}
+
+	_cancelAutoRetry(entry) {
+		if (entry?.retryTimer) { clearTimeout(entry.retryTimer); entry.retryTimer = null; }
+	}
+
+	/** Schedule ONE more attempt when a run died of a retryable error. Chained
+	 *  attempts are capped by cfg.attempts; any user action (prompt/steer/abort/
+	 *  edit/retry) and any success resets the counter, so it only ever retries the
+	 *  same failing turn. */
+	_maybeScheduleAutoRetry(entry, sessionId, failedMessage) {
+		const cfg = this.autoRetry || { enabled: false };
+		if (!cfg.enabled || !this._isRetryableError(failedMessage)) return;
+		if (this.discarded.has(sessionId)) return;
+		if ((entry.retryAttempts || 0) >= cfg.attempts) {
+			entry.retryNote = `auto-retry gave up after ${cfg.attempts} attempt(s) — press Retry to try again`;
+			this.emitRuntime(sessionId);
+			return;
+		}
+		entry.retryAttempts = (entry.retryAttempts || 0) + 1;
+		// Honour a provider-specified wait when the error carries one ("retry after 30",
+		// "retry-after: 30") — bounded to 30 s — and add a little jitter so N sessions that
+		// hit the same rate limit do not retry in lockstep (grok review 2026-10-23).
+		const ra = /retry[- ]?after[^0-9]{0,6}(\d{1,3})/i.exec(String(failedMessage?.errorMessage || ""));
+		const waitMs = Math.max(cfg.delayMs, ra ? Math.min(30000, Number(ra[1]) * 1000) : 0) + Math.floor(Math.random() * 250);
+		entry.retryNote = `retrying (${entry.retryAttempts}/${cfg.attempts})…`;
+		this.emitRuntime(sessionId);
+		this._cancelAutoRetry(entry);
+		entry.retryTimer = setTimeout(() => {
+			entry.retryTimer = null;
+			this.retry(sessionId, { reason: "auto" }).catch((err) => console.error(`[hub] auto-retry failed for ${sessionId}:`, err?.message || err));
+		}, waitMs);
+		if (typeof entry.retryTimer?.unref === "function") entry.retryTimer.unref();
+	}
+
+	/** Drop the artifacts of a FAILED step from the tail so the transcript can be
+	 *  continued: the trailing assistant message(s) with stopReason error/aborted,
+	 *  plus toolResults left orphaned (their assistant toolCall was dropped).
+	 *  Returns how many messages were removed. */
+	_dropFailedTail(entry) {
+		const msgs = entry.agent.state.messages;
+		let dropped = 0;
+		for (;;) {
+			const last = msgs[msgs.length - 1];
+			if (!last) break;
+			const failedAssistant = last.role === "assistant" && (last.stopReason === "error" || last.stopReason === "aborted");
+			const orphanResult = last.role === "toolResult" && !msgs.slice(0, -1).some((m) => m.role === "assistant" && Array.isArray(m.content) && m.content.some((p) => p.type === "toolCall" && p.id === last.toolCallId));
+			if (!failedAssistant && !orphanResult) break;
+			msgs.pop();
+			dropped++;
+		}
+		if (dropped) {
+			// a stream that died mid-tool-call leaves toolCalls with no toolResult —
+			// invalid for the Anthropic/OpenAI tool protocol (the same repair
+			// prompt() performs before a run)
+			for (let i = msgs.length - 1; i >= 0; i--) {
+				const m = msgs[i];
+				if (m.role !== "assistant") continue;
+				if (!Array.isArray(m.content)) break;
+				const trIds = new Set(msgs.filter((x) => x.role === "toolResult").map((x) => x.toolCallId));
+				const filtered = m.content.filter((p) => p.type !== "toolCall" || trIds.has(p.id));
+				if (filtered.length !== m.content.length) msgs[i] = { ...m, content: filtered.length > 0 ? filtered : [{ type: "text", text: "(tool call interrupted by error)" }] };
+				break;
+			}
+			entry.mutateEpoch = (entry.mutateEpoch || 0) + 1;
+		}
+		return dropped;
+	}
+
+	/** RETRY (2026-10-23, user request): resume a failed run AT THE FAILURE POINT
+	 *  instead of re-sending the user prompt. The old client-side retry appended a
+	 *  SECOND user message (and for server-side sessions mutated a mirror the server
+	 *  never saw). Here: drop the 429/error message, then agent.continue() — pi
+	 *  re-issues the failed model call against the SAME transcript, so the user turn
+	 *  stays exactly once and tool calls that already completed are NOT re-run.
+	 *  Versions are untouched: an ✎ edit whose resubmit hit a 429 keeps its parked
+	 *  delta and simply continues, as if the error had not happened. */
+	async retry(sessionId, { reason = "manual" } = {}) {
+		const entry = this.sessions.get(sessionId);
+		if (!entry) return { ok: false, reason: "no live session" };
+		if (entry.compacting) return { ok: false, reason: "compaction in progress — try again shortly" };
+		if (entry.agent.state.isStreaming) return { ok: false, reason: "a run is already streaming" };
+		if (reason !== "auto") { this._cancelAutoRetry(entry); entry.retryAttempts = 0; entry.retryNote = null; }
+		const dropped = this._dropFailedTail(entry);
+		// refuse when nothing failed — retry must never regenerate a healthy turn
+		if (dropped === 0) return { ok: false, reason: "nothing to retry (the transcript does not end in a failed turn)" };
+		const msgs = entry.agent.state.messages;
+		const tail = msgs[msgs.length - 1];
+		const canContinue = !!tail && (tail.role === "user" || tail.role === "toolResult");
+		if (!canContinue && !msgs.some((m) => m.role === "user")) return { ok: false, reason: "nothing to retry — no user turn in this session" };
+		if (dropped > 0) { await this.persistSession(sessionId, true); this.broadcastState(sessionId); }
+		const run = async () => {
+			if (entry.agent.state.isStreaming) return { ok: false, reason: "a run is already streaming" };
+			entry.runtime = { ...entry.runtime, status: "running", startedAt: Date.now(), turn: 0, currentTool: null, lastText: reason === "auto" ? "retrying…" : "retrying…", pendingPrompts: entry.pendingPrompt ? 1 : 0 };
+			this.emitRuntime(sessionId);
+			if (canContinue) {
+				await entry.agent.continue();
+				return { ok: true, mode: "continue", dropped };
+			}
+			// fallback (the tail is an assistant message): re-send the last user turn —
+			// dropping it first so the retried run does NOT duplicate it
+			let uIdx = -1;
+			for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i].role === "user") { uIdx = i; break; }
+			if (uIdx < 0) return { ok: false, reason: "nothing to retry" };
+			const u = msgs[uIdx];
+			const text = typeof u.content === "string" ? u.content : u.content.filter((b) => b?.type === "text").map((b) => b.text || "").join("\n");
+			const images = Array.isArray(u.content) ? u.content.filter((b) => b?.type === "image") : undefined;
+			entry.agent.state.messages = msgs.slice(0, uIdx);
+			await entry.agent.prompt(text, images?.length ? images : undefined);
+			return { ok: true, mode: "resend", dropped };
+		};
+		const prev = entry.promptLock || Promise.resolve();
+		const next = prev.then(run, run);
+		entry.promptLock = next.then(() => undefined, () => undefined);
+		return next;
+	}
+
 	abort(sessionId) {
 		// debounce (grok Q5): Kill-spam overlapped timeouts, redundant library
 		// flag writes and broadcast storms — one in-flight kill per session
@@ -452,6 +607,9 @@ export class AgentHub {
 		setTimeout(() => this._aborting.delete(sessionId), 7000).unref?.();
 		const entry = this.sessions.get(sessionId);
 		if (!entry) return;
+		this._cancelAutoRetry(entry); // an explicit Stop cancels any pending auto-retry
+		entry.retryAttempts = 0;
+		entry.retryNote = null;
 		// STOP = stop EVERYTHING (user report 2026-10-23: with a pending steer the
 		// chat "was not stopped" — the queued message survived the abort and injected
 		// into the next run). Clear pi's steering queue + the hub's pending payload
@@ -730,6 +888,10 @@ export class AgentHub {
 		if (!msgs[i] || msgs[i].role !== "user") throw new Error("can only edit user messages");
 		const contentText = (m) => (typeof m?.content === "string" ? m.content : (m?.content || []).filter((b) => b?.type === "text").map((b) => b.text || "").join("\n"));
 		if (String(text).trim() === contentText(msgs[i]).trim()) return { ok: true, noop: true };
+		// an edit supersedes any pending auto-retry of the turn it replaces
+		this._cancelAutoRetry(entry);
+		entry.retryAttempts = 0;
+		entry.retryNote = null;
 		let version = null;
 		if (this.versions) {
 			try {
@@ -897,11 +1059,14 @@ export class AgentHub {
 	 *  never come (wedged tool promise). Flips the runtime to idle + emits it so
 	 *  every device's alive row clears, and defensively clears pi's streaming
 	 *  flag (the phantom-streaming guard from a16f0b9, moved here per review). */
-	_settleRuntime(sessionId, entry) {
+	_settleRuntime(sessionId, entry, { lastText = null } = {}) {
 		if (entry.agent.state.isStreaming) entry.agent.state.isStreaming = false;
 		const lastA = [...entry.agent.state.messages].reverse().find((m) => m.role === "assistant");
-		entry.runtime = { status: lastA?.stopReason === "error" ? "error" : "idle", startedAt: null, turn: 0, currentTool: null, lastText: null, pendingPrompts: entry.pendingPrompt ? 1 : 0 };
+		const failed = lastA?.stopReason === "error";
+		entry.runtime = { status: failed ? "error" : "idle", startedAt: null, turn: 0, currentTool: null, lastText, pendingPrompts: entry.pendingPrompt ? 1 : 0 };
 		this.emitRuntime(sessionId);
+		// the caller (agent_end) still needs these for the retry policy — one scan, one place
+		return { lastA, failed };
 	}
 
 	/** Steering pending-state delta: broadcast to all attached /ws/agent clients
@@ -958,6 +1123,7 @@ export class AgentHub {
 		const entry = this.sessions.get(sessionId);
 		this.discarded.add(sessionId);
 		if (!entry) return;
+		this._cancelAutoRetry(entry);
 		try { if (entry.agent.state.isStreaming) entry.agent.abort(); } catch { /* already dead */ }
 		if (entry.previewTimer) { clearTimeout(entry.previewTimer); entry.previewTimer = null; }
 		this.sessions.delete(sessionId);
@@ -977,6 +1143,7 @@ export class AgentHub {
 		for (const [id, entry] of this.sessions) {
 			n++;
 			if (entry.previewTimer) { clearTimeout(entry.previewTimer); entry.previewTimer = null; }
+			this._cancelAutoRetry(entry);
 			if (entry.agent.state.isStreaming) {
 				try { entry.agent.abort(); } catch { /* already dead */ }
 			}

@@ -407,3 +407,70 @@ console.log("depth:", d); // must be 0
 | HTTP proxy for LLM (not direct) | Browser CORS blocks direct provider calls. The proxy runs on the same origin, uses undici with stall watchdog + abort propagation. |
 | JSONL sessions (not single JSON) | One message per line, crash-safe partial writes, matches pi's native format. Metadata in line 1. |
 | Custom-only model selector | The built-in catalog (~900 models) is unusable without browser-side keys. Custom providers from pi config are the actual models. |
+
+## Retry after a provider error must resume at the failure point (2026-10-23)
+
+**Symptom:** after a 429 (nvidia rate limit) or network error, pressing Retry re-sent the user
+prompt: the transcript ended up with the SAME user message twice plus the error message, and for a
+server-side session the "repair" happened in the browser against a mirror the server never sees
+(the real transcript is on the server).
+
+**Root cause:** retry was implemented client-side (`chat.tsx`): find the last user message → take
+its text → `agent.prompt(text)`. `prompt()` always APPENDS a user message, so re-sending is a
+duplicate turn, not a retry.
+
+**Fix/pattern:** retry belongs to whoever owns the transcript (the hub). The semantics that match
+user expectation:
+1. drop the trailing failure artifacts — assistant messages with `stopReason` `"error"`/`"aborted"`
+   plus toolResults orphaned by them; repair a dangling `toolCall` (no `toolResult`) the way
+   `prompt()` already does;
+2. `agent.continue()` (pi-agent-core) — it re-issues the model call against the SAME transcript, so
+   the user turn stays exactly once and tool calls that already completed are NOT re-run;
+3. fallback when the tail cannot be continued (assistant tail): re-send the last user turn, dropping
+   it FIRST so it is never duplicated;
+4. refuse when nothing failed (`dropped === 0`) — a retry must never regenerate a healthy turn;
+5. leave the versions sidecar alone: an ✎ edit whose resubmit failed keeps its parked delta.
+Auto-retry (`setAutoRetry`) hooks the same op from the `agent_end` handler: only transient failures
+(429/rate-limit/quota/overloaded, 5xx, ECONNRESET/ETIMEDOUT/fetch failed/socket hang up), capped by
+`attempts` (3 × 3 s by default), counter reset by success or any user action — never on 401/403/
+invalid-key or context overflow.
+
+**Test pattern (worth reusing):** pi-ai ships a FAUX provider —
+`registerFauxProvider({api, provider, models})` → `setResponses([fauxAssistantMessage("", {stopReason:"error", errorMessage:"429 …"}), fauxAssistantMessage([fauxText("ok")])])` — so failure/retry
+paths can be tested hermetically (no network, no keys, deterministic) against the real hub:
+`npm run test:retry` (26 checks). See `tests/retry.test.mjs` for the hub harness
+(`modelsStore` pointing at the faux model + fake `persist`/`broadcast`/`versions` deps).
+
+**Editing pattern for this repo (agent-side):** an edit tool that "re-indents to match the anchor"
+will flatten the nesting of a multi-level replacement (it turned a 5-tab block into `tab + space`
+and collapsed a 130-line method block to one tab). For anything with nested levels, write the new
+block to a file and splice it with an anchored script instead — normalise CRLF→LF for matching,
+write back with the original EOL, and assert each anchor matches exactly once. Verify with
+`git diff --stat` vs `git diff -w --stat`: their stats must be identical (no whitespace-only churn).
+
+## "Ignore the port" is not the TLS-proxy fix (2026-10-23, grok PR review)
+
+**Symptom that triggered it:** the origin allowlist stored entries as `name:PORT`, while a TLS reverse
+proxy sends `Origin: https://name` (`new URL(...).host` drops the default 443) — so the check could
+never pass and a domain behind a proxy was permanently 403.
+
+**Wrong fix (mine, first attempt):** compare bare HOSTNAMES, ignoring ports entirely. It works for the
+proxy case, but it also accepts `Origin: http://localhost:3000` against `Host: localhost:8787` — i.e.
+any other app on the same machine becomes a trusted origin, and since loopback peers skip the token,
+that is CSRF onto every non-always-token route (prompt/abort/session reads).
+
+**Right fix:** keep EXACT `host:port` entries and resolve a MISSING port to the scheme default —
+`http` → `:80`, `https` → `:443` — while a portless `Host` (what a proxy forwards) is tried as the app
+port plus `:80`/`:443`. The operator declares the public form (`PI_WEB_TERM_ORIGIN=name:443`).
+Malformed Origins fail closed; no suffix/includes matching.
+
+**Related hardening from the same review:** the loopback token exemption must be tied to the HOST, not
+just the peer — a reverse proxy on this machine makes the peer loopback while serving a PUBLIC name, so
+`authorized()` trusts a loopback caller only when it names a LOCAL host (`isLocalHost()`), in every
+`PI_WEB_ORIGIN_GATE` mode. Order matters: run the origin gate BEFORE the token gate, so a loopback
+request naming a foreign Host still reports 403 (rebinding defence) instead of 401.
+
+**Where the rules live now:** `hostName()` / `hostCandidates()` / `isLocalHost()` / `authorized()` in
+server.mjs, and the terminal hub receives the same origin rule as a PREDICATE (`originAllowed`) so the
+two checks cannot drift. Tests: `npm run test:security` (64 checks — other-port Origin, loopback +
+public Host without token, portless proxy form, `off`-mode token independence).

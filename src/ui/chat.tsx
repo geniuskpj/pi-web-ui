@@ -796,37 +796,65 @@ export function ChatView({ agent }: { agent: Agent }) {
 
 	const retry = () => {
 		if (agent.state.isStreaming) return;
-		const msgs = agent.state.messages as any[];
-		let userIdx = -1;
-		for (let i = msgs.length - 1; i >= 0; i--) {
-			if (msgs[i].role === "user") {
-				userIdx = i;
-				break;
-			}
+		// HUB-side retry (2026-10-23, user request): drop the 429/error message and
+		// CONTINUE the same transcript at the failure point. This used to run here in
+		// the browser: it took the last user text and called prompt(), which appended
+		// a SECOND user message — and since a server-side session's transcript lives
+		// on the server, the local repair only touched a mirror the server never saw.
+		// One op, one owner: the hub (see hub.retry).
+		const anyAgent = agent as any;
+		if (typeof anyAgent.retry === "function") {
+			void anyAgent.retry()
+				.then((r: any) => { if (r && r.ok === false) note(r.reason || "nothing to retry"); })
+				.catch((err: any) => note(err?.message || String(err)));
+			forceStick();
+			return;
 		}
-		if (userIdx < 0) return;
-		const text = textOf((msgs[userIdx] as UserMessage).content);
-		if (!text) return;
-		// grok P2 review: a dangling toolCall (stream/loop died before its
-		// toolResult was written) would produce tool_use without tool_result —
-		// invalid for Anthropic/OpenAI-style APIs. Strip unmatched toolCall parts
-		// from the failed assistant message before appending the retry turn.
-		for (let i = msgs.length - 1; i > userIdx; i--) {
+		// local (?local=1) in-browser loop has no hub: same semantics client-side —
+		// drop the trailing failure artifacts, repair a half-finished tool call, then
+		// continue the transcript (pi's Agent exposes continue() here too); if the
+		// tail cannot be continued, re-send the user turn (removed first, so it is
+		// never duplicated).
+		const msgs = agent.state.messages as any[];
+		for (;;) {
+			const last = msgs[msgs.length - 1];
+			if (!last) break;
+			const failedAssistant = last.role === "assistant" && (last.stopReason === "error" || last.stopReason === "aborted");
+			const orphanResult = last.role === "toolResult" && !msgs.slice(0, -1).some((m) => m.role === "assistant" && Array.isArray(m.content) && m.content.some((p: any) => p.type === "toolCall" && p.id === last.toolCallId));
+			if (!failedAssistant && !orphanResult) break;
+			msgs.pop();
+		}
+		for (let i = msgs.length - 1; i >= 0; i--) {
 			const m = msgs[i] as AssistantMessage;
 			if (m.role !== "assistant") continue;
+			if (!Array.isArray(m.content)) break;
 			const trIds = new Set(msgs.filter((x) => x.role === "toolResult").map((x) => (x as any).toolCallId));
 			const filtered = m.content.filter((p) => p.type !== "toolCall" || trIds.has((p as ToolCall).id));
 			if (filtered.length !== m.content.length) {
-				const repaired = msgs.slice();
-				repaired[i] = {
-					...m,
-					content: filtered.length > 0 ? filtered : [{ type: "text", text: "(tool call interrupted by error)" }],
-				};
-				agent.state.messages = repaired;
+				msgs[i] = { ...m, content: filtered.length > 0 ? filtered : [{ type: "text", text: "(tool call interrupted by error)" }] };
 			}
 			break; // only the last assistant message
 		}
-		void agent.prompt(text).catch((err) => console.error("[chat] retry failed:", err));
+		const tail = msgs[msgs.length - 1];
+		if (tail && (tail.role === "user" || tail.role === "toolResult")) {
+			void (agent.continue() as Promise<void>).catch((err: any) => console.error("[chat] retry failed:", err));
+			forceStick();
+			return;
+		}
+		let uIdx = -1;
+		for (let i = msgs.length - 1; i >= 0; i--) {
+			if (msgs[i].role === "user") {
+				uIdx = i;
+				break;
+			}
+		}
+		if (uIdx < 0) return;
+		const u = msgs[uIdx] as UserMessage;
+		const text = textOf(u.content);
+		if (!text) return;
+		const imgs = (Array.isArray(u.content) ? u.content.filter((b: any) => b?.type === "image") : []) as any[];
+		agent.state.messages = msgs.slice(0, uIdx);
+		void (imgs.length ? agent.prompt(text, imgs) : agent.prompt(text)).catch((err: any) => console.error("[chat] retry failed:", err));
 		forceStick();
 	};
 

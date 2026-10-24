@@ -10,6 +10,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import { useEffect, useState } from "preact/hooks";
 import { getAppStorage } from "../storage.js";
 import { getProxyUrlSync } from "./proxy-stream.js";
+import { retryServerAuth } from "../server-auth.js"; // re-probe after a token change (clears the banner)
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 
 export function SettingsDialog({
@@ -28,6 +29,10 @@ export function SettingsDialog({
 	const [proxyEnabled, setProxyEnabled] = useState(getProxyUrlSync() !== undefined);
 	const [proxyUrl, setProxyUrl] = useState("");
 	const [token, setToken] = useState("");
+	// auto-retry on 429/network errors (default ON) — mirrors localStorage `pi.autoRetry`
+	const [autoRetry, setAutoRetry] = useState(() => {
+		try { return localStorage.getItem("pi.autoRetry") !== "0"; } catch { return true; }
+	});
 	const [keys, setKeys] = useState<string[]>([]);
 	const [quota, setQuota] = useState<{ usage: number; percent: number } | null>(null);
 	const [saved, setSaved] = useState("");
@@ -238,6 +243,29 @@ export function SettingsDialog({
 					</section>
 
 					<section class="pw-set-section">
+						<h3>Retry</h3>
+						<label class="pw-set-row" title="Applies to rate-limit (429), network and transient 5xx errors. A retry removes the error message and continues the SAME turn — the user message is not re-sent.">
+							<input
+								type="checkbox"
+								checked={autoRetry}
+								onChange={(e) => {
+									const on = (e.target as HTMLInputElement).checked;
+									setAutoRetry(on);
+									try { localStorage.setItem("pi.autoRetry", on ? "1" : "0"); } catch { /* quota */ }
+									void (agent as any)?.setAutoRetry?.({ enabled: on });
+									flash(on ? "Auto-retry on (3× · 3s)" : "Auto-retry off");
+								}}
+							/>
+							<span>Auto-retry on rate limit / network errors — 3 attempts, 3 s apart</span>
+						</label>
+						<div class="pw-hint">
+							A retry drops the 429/error message and continues the same transcript at the failure point: the user
+							turn stays exactly once and tool calls that already finished are not re-run. Parked ✎-edit versions
+							survive a retry.
+						</div>
+					</section>
+
+					<section class="pw-set-section">
 						<h3>Server token</h3>
 						<input
 							class="pi-input pw-set-input"
@@ -253,6 +281,9 @@ export function SettingsDialog({
 									/* quota */
 								}
 								flash(token.trim() ? "Token saved" : "Token cleared");
+								// a new/cleared token changes authorization — re-probe so the auth banner
+								// (main.tsx) reflects reality immediately instead of on the next call
+								void retryServerAuth();
 							}}
 						/>
 					</section>
