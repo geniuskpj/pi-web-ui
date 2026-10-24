@@ -143,6 +143,9 @@ Layered design — the server decides transfer sizes, the client decides display
   anything — the new generation is a fresh key space and the old one is unreachable — a date-based
   `sweepStale()` collects it (5-minute grace once superseded, 30-day hard TTL) on attach and on tab
   focus, and a chunk that fails the on-read integrity check is dropped so the next read refetches.
+  **Live write-through:** the attached tail and every later turn are written into IDB as they arrive
+  (aligned 64-message windows; the remnant is rewritten in place on `agent_end`/idle/tab-hide), so
+  reopening an untouched session no longer re-downloads the tail — nothing about the render changes.
   Wedge-proof by design: lazy open (boot never touches IDB), 2s timeout on every op (a timeout
   is a MISS, not an error), 3-failure circuit breaker, per-session serialized writes, server
   fallback always available.

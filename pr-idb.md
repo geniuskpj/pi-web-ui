@@ -75,6 +75,17 @@ are the recorded v2 options; brotli wasm (150KB–1.8MB) rejected — wire brotl
   holes crashed UI listeners and was user-reset); the window position lives in `state.sparse
   {fromSeq, messageCount, filledFrom}`; `editCommit` indices are translated `+filledFrom` at the
   single call site (grok #2: use filledFrom, not the frozen attach fromSeq).
+- **Live write-through (C2, 2026-10-24)**: the tail the user is READING is the section every open
+  re-downloads (measured 166KB gz for the 1MB window), so it is now written into IDB as the conversation
+  grows — no request involved. The attach window seeds the buffer, every `message_end` appends to it, and
+  a chunk boundary is a pure function of the seq (`CHUNK_INTERVAL = 64`, `planLiveChunk`): a complete
+  ALIGNED window is written once (final), the trailing remnant is the open tail written under its own
+  `fromSeq` and rewritten in place as it grows. Flush triggers: boundary completed, `agent_end`, a 5s
+  idle debounce, tab hidden, `pagehide`. Compression is client-side `CompressionStream` on the SAME
+  framing `/range` serves (NDJSON, no trailing newline), and every write passes the reader's own
+  integrity check before it is stored. Cost: zero gzip/IDB work for a normal turn; one gzip (<64 messages)
+  when a window closes. Nothing here touches the render — the sparse window, `filledFrom` and the display
+  gate are unchanged.
 - Backfill vs expand split: policy=fast warms **IDB only** (never the render — user complaint
   "loading all of chat at once"); the ⤒ button grows the render one server-clamped step per click,
   IDB-first, epoch-guarded (stale generation → refuse to splice; nothing is erased in v2 — the old
@@ -263,6 +274,21 @@ the transfer PR's §2 table stay out of the tree.
   expand banner inside the chat flow; coarse-pointer/mobile patterns. Response: adopted.
 - **2026-10-24 — grok-4.6-high (implementation review, 01a16a54):** 3 critical + 4 high findings —
   ALL FIXED in `e4ac970` (see §4). Residual: IPv6-ULA netClass nit (open, low).
+- **2026-10-24 — review (C2 implemented, author):** live write-through landed (design from grok
+  `01a16c29` Q1–Q3, with one deviation: grok listed a 64KB byte threshold among the flush triggers, but a
+  byte-triggered close would move a boundary away from the aligned window and leave the stored key
+  disagreeing with what a later fetch asks for — boundaries stay purely seq-aligned, bytes only influence
+  the idle flush). The attach window itself is now seeded into the buffer (grok's table treated it as a
+  source but it was never written), which is what makes reopening an untouched session cheap: the window
+  the next attach loads is already covered, so the warm loop's hole set for it is empty. Multi-tab stays
+  last-writer-wins per key — correct because a closed window is the same NDJSON (semantically identical,
+  NOT byte-identical: two browsers' gzip may differ), and the on-read integrity check catches anything
+  malformed. `tests/idb-cache.test.mjs` grew to 46 checks (boundary math, `planLiveChunk` incl. the
+  partial head at a turn-aligned start, NDJSON framing equality with the server, source assertions that
+  message_end/agent_end/hidden/pagehide feed and flush the buffer under the attach generation).
+  Next — C3: measure the win on a real long session (cold-open bytes wifi vs cellular, gzip ms per close,
+  IDB txns/s); C4 (optional): align `/range` windows to the same boundaries server-side, which removes the
+  seam overlap entirely.
 - **2026-10-24 — review (C1 implemented, author):** the four user requirements landed in the cache only
   (`feat/idb-live-cache`): (1) generation-keyed chunks + `sweepStale()` + the `invalidateSession` wipe
   deleted — "don't erase immediately" is now structural, not a promise; (2) `verifyChunkText` on read and
