@@ -495,6 +495,67 @@ async function evictIfNeeded(db: IDBDatabase): Promise<void> {
 	});
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// LIVE WRITE-THROUGH (C2, 2026-10-24)
+//
+// The tail a user is reading is exactly the part that gets re-downloaded on the
+// next open (measured 166KB gz for the 1MB tail). C2 writes it into IDB as the
+// conversation grows — no request needed (user requirement 1) — using a chunk
+// boundary that is a PURE function of the seq, so a live-written chunk and a
+// fetched one describe the same window without negotiation (grok 01a16c29 Q1).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Messages per aligned chunk (~550KB on the measured sessions — under the 1MB
+ *  /range cap). Compiled into BOTH sides; a change invalidates nothing (keys
+ *  carry the window, coverage is seq-addressed). */
+export const CHUNK_INTERVAL = 64;
+export const chunkIndexOf = (seq: number) => Math.floor(seq / CHUNK_INTERVAL);
+export const chunkFromSeq = (index: number) => index * CHUNK_INTERVAL;
+export const chunkToSeq = (index: number) => (index + 1) * CHUNK_INTERVAL; // exclusive
+export const isChunkAligned = (seq: number) => seq >= 0 && seq % CHUNK_INTERVAL === 0;
+
+export interface LiveChunkPlan {
+	/** null = keep buffering (the run has not closed a window yet). */
+	write: { fromSeq: number; toSeq: number; final: boolean } | null;
+	consumed: number; // messages the caller may drop from the front of the buffer
+	nextFromSeq: number | null; // where the next chunk starts once `consumed` are written
+}
+
+/**
+ * What may be written after buffering `count` live messages that start at
+ * `fromSeq` — PURE, unit-tested. A run closes a chunk exactly at an ALIGNED
+ * boundary; a partial head (the first chunk after an attach, whose start is the
+ * server's turn-aligned window start) closes at the next boundary. The trailing
+ * remnant is deliberately NOT decided here: it is the open tail, flushed under
+ * its own fromSeq by idle / agent_end / tab-hide and rewritten in place as it
+ * grows (putChunk's mergeRanges replaces its own range).
+ */
+export function planLiveChunk(fromSeq: number, count: number): LiveChunkPlan {
+	if (count <= 0 || fromSeq < 0) return { write: null, consumed: 0, nextFromSeq: null };
+	if (isChunkAligned(fromSeq)) {
+		if (count < CHUNK_INTERVAL) return { write: null, consumed: 0, nextFromSeq: null };
+		return { write: { fromSeq, toSeq: fromSeq + CHUNK_INTERVAL, final: true }, consumed: CHUNK_INTERVAL, nextFromSeq: fromSeq + CHUNK_INTERVAL };
+	}
+	const boundary = chunkToSeq(chunkIndexOf(fromSeq)); // next aligned end strictly after fromSeq
+	if (fromSeq + count < boundary) return { write: null, consumed: 0, nextFromSeq: null };
+	return { write: { fromSeq, toSeq: boundary, final: true }, consumed: boundary - fromSeq, nextFromSeq: boundary };
+}
+
+/** NDJSON framing IDENTICAL to what /range serves (one JSON object per line, no
+ *  trailing newline) — that is what makes a live chunk and a fetched chunk
+ *  interchangeable on read (grok Q3). */
+export function toNdjson(messages: any[]): string {
+	return messages.map((m) => JSON.stringify(m)).join("\n");
+}
+
+/** gzip via the native CompressionStream (same codec the wire uses). */
+export async function gzipText(text: string): Promise<Blob | null> {
+	try {
+		const stream = new Blob([text]).stream().pipeThrough(new CompressionStream("gzip"));
+		return await new Response(stream).blob();
+	} catch { return null; }
+}
+
 /** Native DecompressionStream (Safari 16.4+/FF 113+/Chromium 80+). */
 export async function gunzip(blob: Blob): Promise<string | null> {
 	try {

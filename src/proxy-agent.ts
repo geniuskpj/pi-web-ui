@@ -7,7 +7,11 @@
 type Listener = (event: any) => void;
 type AnyRecord = Record<string, any>;
 import { makeId } from "./id.js";
-import { getCachedChunks, putChunk, gunzip, transferPolicy, cachedRanges, intervalDiff, sweepStale } from "./idb-cache.js";
+import { getCachedChunks, putChunk, gunzip, transferPolicy, cachedRanges, intervalDiff, sweepStale, planLiveChunk, toNdjson, gzipText, verifyChunkText } from "./idb-cache.js";
+// LIVE WRITE-THROUGH (C2): how long a quiet tail may sit in memory before it is
+// written to IDB. Every flush is one gzip of <CHUNK_INTERVAL messages.
+const LIVE_IDLE_MS = 5000;
+const LIVE_DEBUG = typeof location !== "undefined" && location.search.includes("live-cache-debug");
 // BACKFILL step in MESSAGES (filledFrom is a seq, not bytes): generous ask —
 // the server clamps the response to 1MB serialized (~140 msgs on the 7.3MB
 // session) and reports the actual window in X-Range-* headers.
@@ -53,7 +57,9 @@ export class ProxyAgent {
 		if (typeof window !== "undefined") {
 			window.addEventListener("visibilitychange", () => {
 				if (!document.hidden) void sweepStale();
+				else this.liveFlush("hidden"); // C2: best-effort tail write on the way out
 			});
+			window.addEventListener("pagehide", () => this.liveFlush("hidden"));
 		}
 	}
 
@@ -142,13 +148,19 @@ export class ProxyAgent {
 			// +fromSeq at the single call site (saveEdit). Backfill PREPENDS older wins.
 			const sparse = (msg as any).sparse as { fromSeq: number; messageCount: number; rewriteSeq: number } | undefined;
 			if (sparse && Array.isArray(msg.messages)) {
+				// C2: the buffer from the previous window belongs to the same generation,
+				// so write it before the window is replaced; then seed with THIS attach
+				// tail (the bytes every open would otherwise re-download).
+				this.liveFlush("hidden");
 				this.state.messages = [...(msg.messages || [])]; // DENSE tail window
 				(this.state as any).sparse = { ...sparse, filledFrom: sparse.fromSeq };
 				// v2 GC: attaching at generation N proves every older generation of this
 				// session is stale — collect those past the grace period (never a wipe).
 				void sweepStale({ sessionId: this.sessionId });
+				this.liveSeed(sparse.fromSeq, msg.messages || [], Number((sparse as any).rewriteSeq ?? 0));
 				void this.scheduleBackfill(sparse);
 			} else {
+				this.liveFlush("hidden");
 				this.state.messages = [...(msg.messages || [])];
 				(this.state as any).sparse = null;
 			}
@@ -208,6 +220,7 @@ export class ProxyAgent {
 			case "message_end":
 				this.state.streamingMessage = undefined;
 				this.state.messages.push(ev.message);
+				this.liveCapture(ev.message); // C2: buffer the tail for IDB (no request)
 				break;
 			case "tool_execution_start": {
 				const p = new Set(this.state.pendingToolCalls); p.add(ev.toolCallId); this.state.pendingToolCalls = p; break;
@@ -219,9 +232,98 @@ export class ProxyAgent {
 				if (ev.message?.role === "assistant" && ev.message?.errorMessage) this.state.errorMessage = ev.message.errorMessage;
 				break;
 			case "agent_start": this.state.isStreaming = true; this.state.errorMessage = undefined; break;
-			case "agent_end": this.state.isStreaming = false; this.state.streamingMessage = undefined; break;
+			case "agent_end":
+				this.state.isStreaming = false;
+				this.state.streamingMessage = undefined;
+				this.liveFlush("agent_end"); // C2: the run is over — write the open tail
+				break;
 		}
 		this.notifyListeners(ev);
+	}
+
+	// ── LIVE WRITE-THROUGH (C2, 2026-10-24) ───────────────────────────────────
+	// The tail the user is reading is exactly what every open re-downloads, so it
+	// is written into IDB as the conversation grows — no request needed (user
+	// requirement). Complete ALIGNED windows (CHUNK_INTERVAL messages, a pure
+	// function of the seq) are written once; the trailing remnant is the "open
+	// tail", written under its own fromSeq and rewritten in place as it grows.
+	// Nothing here touches the render: the sparse window, filledFrom, the display
+	// gate and the edit-index translation are unchanged.
+	private liveBuf: { fromSeq: number; messages: any[] } | null = null;
+	private liveGen = -1;
+	private liveTimer: ReturnType<typeof setTimeout> | null = null;
+
+	/** seq of the message just appended to the dense window (filledFrom + index —
+	 *  invariant under prepends, so an expand never shifts it). */
+	private liveWindowStart(): number | null {
+		const sp = (this.state as any).sparse as { fromSeq?: number; filledFrom?: number } | null | undefined;
+		if (!sp) return null; // a full-body session is not what this cache is for
+		return Number(sp.filledFrom ?? sp.fromSeq ?? 0) + this.state.messages.length - 1;
+	}
+
+	/** Seed the buffer (the attach tail, or a fresh generation). */
+	private liveSeed(fromSeq: number, messages: any[], gen: number): void {
+		this.liveBuf = { fromSeq, messages: [...messages] };
+		this.liveGen = gen;
+		this.liveDrain();
+		this.liveScheduleIdle();
+	}
+
+	/** A live message_end just landed in state.messages. */
+	private liveCapture(message: any): void {
+		const sp = (this.state as any).sparse as { rewriteSeq?: number } | null | undefined;
+		if (!sp) return;
+		const gen = Number(sp.rewriteSeq ?? 0);
+		const seq = this.liveWindowStart();
+		if (seq === null) return;
+		if (!this.liveBuf || this.liveGen !== gen) { this.liveBuf = { fromSeq: seq, messages: [] }; this.liveGen = gen; }
+		this.liveBuf.messages.push(message);
+		this.liveDrain();
+		this.liveScheduleIdle();
+	}
+
+	private liveScheduleIdle(): void {
+		if (typeof window === "undefined") return;
+		if (this.liveTimer) clearTimeout(this.liveTimer);
+		this.liveTimer = setTimeout(() => void this.liveFlush("idle"), LIVE_IDLE_MS);
+	}
+
+	/** Write every COMPLETE aligned window in the buffer; keep the remnant. */
+	private liveDrain(): void {
+		while (this.liveBuf) {
+			const plan = planLiveChunk(this.liveBuf.fromSeq, this.liveBuf.messages.length);
+			if (!plan.write || plan.consumed <= 0) return;
+			const msgs = this.liveBuf.messages.slice(0, plan.consumed);
+			this.liveWrite(this.liveGen, plan.write.fromSeq, plan.write.toSeq, msgs, "aligned");
+			this.liveBuf.messages = this.liveBuf.messages.slice(plan.consumed);
+			this.liveBuf.fromSeq = plan.nextFromSeq ?? plan.write.toSeq;
+			if (this.liveBuf.messages.length === 0) { this.liveBuf = null; return; }
+		}
+	}
+
+	/** Flush the open tail: idle debounce, run end, tab hidden / page hide. */
+	private liveFlush(reason: "idle" | "agent_end" | "hidden"): void {
+		if (this.liveTimer) { clearTimeout(this.liveTimer); this.liveTimer = null; }
+		const buf = this.liveBuf;
+		this.liveBuf = null;
+		if (!buf || buf.messages.length === 0) return;
+		this.liveWrite(this.liveGen, buf.fromSeq, buf.fromSeq + buf.messages.length, buf.messages, reason);
+	}
+
+	/** Integrity-check, gzip, store — fire and forget: the cache may never slow
+	 *  the conversation down, and a failed write is just a future refetch. */
+	private liveWrite(gen: number, fromSeq: number, toSeq: number, messages: any[], reason: string): void {
+		const sessionId = this.sessionId;
+		const text = toNdjson(messages);
+		const verdict = verifyChunkText(text, fromSeq, toSeq);
+		if (!verdict.ok) { console.warn("[live-cache] refusing to store a chunk that fails its own check:", verdict.reason); return; }
+		void gzipText(text)
+			.then((blob) => {
+				if (!blob || this.sessionId !== sessionId) return; // switched away mid-gzip
+				if (LIVE_DEBUG) console.debug(`[live-cache] ${reason} [${fromSeq},${toSeq}) ${messages.length} msgs -> ${blob.size}B`);
+				return putChunk(sessionId, fromSeq, toSeq, gen, toSeq, blob);
+			})
+			.catch(() => { /* cache is best-effort */ });
 	}
 
 	private notifyListeners(event: AnyRecord) {
