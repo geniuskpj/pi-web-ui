@@ -223,3 +223,63 @@ the predecessor artifact this PR implements):**
 | C | The report's open decisions (§9: plain-HTTP vs TLS proxy; §7.5: read-only visitor token) are still **unanswered** and now live in this PR's §6. | **open — user decision** |
 | D | Meanwhile on `main`: the CI/build defects this PR fixes (npm 9/10 silently dropping `file:` overrides → real provider SDKs → red build) were **ported to main** in `6b9ec90` (build.mjs stub aliases + assertions, ci.yml v2, webpack.yml deleted), so the eventual rebase converges instead of conflicting. Main also fixed the edit tool's line-fuzzy indent corruption (`replace("\t")` → `replace(/\t/g)`) found via `edit-vs-splice.md` — relevant here because this PR's own edits were produced with the corrupted rebase. | **noted** — reduces the rebase surface |
 | E | Rechecking my earlier finding 1 (transcripts on origin): the stale "not pushed" claim in §Status came from this predecessor report's timeline — the push happened after it was written. My disposition stands: **rebase onto stripped main + force-push** remains the merge gate. | **stands — open** |
+
+## Merge plan — `feat/auth-gate-retry` → `main` (2026-10-24)
+
+**Verdict: USABLE.** The branch is current (`main ⊂ feat/auth-gate-retry`, so a merge is a
+fast-forward), it is blob-clean, and with its OWN dependency set (`pi-ai`/`pi-agent-core` **0.75.3**,
+via `npm ci`) it passes: typecheck + build, `retry` 31, `security-gates` 64, `zombie` 11,
+`runtime-seq` 6, `store` 7, `ssrf` 5, `versions` 24, `compact` 19, `fork` 23, `shutdown` 9,
+`edit-tool` 7, `term-smoke` 12.
+Everything the branch "removes" versus main is an intentional replacement: the superseded auth gate
+(old `authorized()`, `ALLOWED_HOSTS` set, middleware order, `TERM_ALLOWED_ORIGINS`), main's old
+client-side retry (now the hub op; the `?local=1` fallback keeps its toolCall repair), and
+unreferenced scratch files (`patch-edit.mjs`, `patch-stream.mjs`, `report.md`, `doc-report.md`,
+`commit-review.md` — main's own docs note they are referenced by nothing).
+
+**Review found exactly one real loss, now repaired:** main had refactored the phantom-streaming
+guard into `_settleRuntime()` ("moved here per review"), while this branch still inlined a copy in
+`agent_end`. A fast-forward would have replaced main's single implementation with the copy, and the
+copy was the only place carrying the retry note. Fixed in `74f397d`: `agent_end` calls
+`_settleRuntime(sessionId, entry, { lastText: entry.retryNote || null })`, the method returns
+`{ lastA, failed }` for the retry policy below it (one scan, one place), and its abort()/Kill call
+sites are unchanged. `test:retry` caught the intermediate mistake (dropped `failed` binding) — the
+suite is doing its job.
+
+### Steps
+
+0. **Done** — `74f397d` (guard unification) on the branch.
+1. **Push the branch**: `git push origin feat/auth-gate-retry` (it is 2 ahead of the remote after
+   this file and `74f397d`).
+2. **Merge into main**: `git switch main && git merge --no-ff feat/auth-gate-retry`.
+   `--no-ff` is a choice, not a need: the branch contains all of main, so a plain merge would
+   fast-forward — but a merge commit preserves the PR context, and this branch *is* the PR record
+   (`pr.md` carries the reviewer passes and their dispositions).
+3. **Verify on main before pushing** (same deps as the branch, 0.75.3):
+   `npm ci && npm run typecheck && npm run build` then the suites listed above. Optionally a live
+   check on a scratch instance: remote peer 401 without the token / 200 with it on a custom Host,
+   loopback + foreign Host 403, `/ws/agent` 101, and the `PI_WEB_ORIGIN_GATE` modes.
+4. **Push main**: `git push origin main` (normal push — main and origin/main are in sync today, so
+   no force).
+5. **Then the tracks, in ONE merge**: after main has auth, `merge/tracks` (auth + retry/mobile +
+   IDB + atomic + the `1.4.0` upgrade) is a fast-forward over main and is already verified green
+   with 1.4.0 (16 suites + typecheck + build). Merging the three tracks individually would test
+   three unverified combinations instead of one verified integration.
+   Dependency order matters: main is 0.75.3, the tracks are 1.4.0 (`c461dee` upgrade). Landing the
+   tracks first would put 1.4.0 under a not-yet-merged auth branch — the auth delta itself makes no
+   pi-ai calls, but its lockfile/package.json would then conflict and the combination would have to
+   be re-verified. Landing auth first (step 2) keeps every intermediate state tested.
+6. **After a server restart** (user's call — it drops in-flight runs): the auth gate + retry behave
+   live, and the browser needs one reload to pick up the client bundle (401/403 banner, hub retry).
+
+### Environment caveat (the practical friction)
+
+`node_modules` is per-checkout, not per-branch: this branch's code needs its lockfile's
+**0.75.3**, the tracks need **1.4.0**. That is why `typecheck` failed here before `npm ci`
+(installed 1.4.0, expected 0.75.3) and why every switch between the two groups needs an install.
+`npm ci` on either side takes ~45s from the local cache.
+
+### Rollback
+
+`backup/auth-gate-pre-rebase` / `backup/auth-pre-rebase` hold the pre-rebase state (`ace26bb`); the
+merge is revertible with `git revert -m 1 <merge-sha>` or by resetting main to `6b9ec90`.
