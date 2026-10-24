@@ -340,3 +340,32 @@ the transfer PR's §2 table stay out of the tree.
     writes NOTHING to IDB, so the session-list badge ("IDB x MB (n chunks)") describes cold history, not the
     current size. If the goal ever becomes "reopen instantly on mobile without the tail download", the fix is
     the tail write-through above, not more chunking.
+- **2026-10-24 — live verification (author, isolated scratch instance on :8799):** C1 + C2 exercised
+  end-to-end on a REAL 9.6MB / 1056-message session (`60dfc94f`, rewriteSeq 1) copied into a scratch data
+  dir, opened in a separate origin so the user's live server, sessions and tabs were untouched. Peak
+  numbers first: **a warm reload transferred 0 HTTP bytes for the session body** (the cold load had been
+  6 `/range` requests ≈ 2.25MB).
+  - **Cold load** — sparse attach window `[924,1056)` (132 msgs, `messageCount 1056`, gen 1) while the warm
+    loop filled `[0,924)` in six server windows. The C2 seed then wrote **three chunks**: the partial head
+    `[924,960)` — closed at the alignment boundary, NOT after 64 messages — the aligned window
+    `[960,1024)`, and the open tail `[1024,1056)` written by the **idle flush 4s later** (storedAt ages
+    88s/88s/84s = drain-then-debounce, exactly as designed). Coverage ended disjoint:
+    `[[0,107],[107,311],[311,622],[622,766],[766,843],[843,924],[924,960],[960,1024],[1024,1056]]`.
+  - **Schema** — `pi-session-cache` **v2** on a fresh origin: meta keyed `[sessionId, rewriteSeq]` with
+    `updatedAt`, chunks keyed `[sessionId, 1, fromSeq]` (keys read back as
+    `60dfc94f-…:1:1024` etc.). Generation isolation verified by construction (only gen 1 existed).
+  - **Content equality (grok Q3, now measured not assumed)** — the live-written `[1024,1056)` chunk
+    gunzipped to EXACTLY the server's `/range?fromSeq=1024&toSeq=1056` body: 32 lines, every line JSON,
+    identical roles and content (`contentIdentical: true`). A live chunk and a fetched chunk really are
+    interchangeable.
+  - **Warm reload** — 0 HTTP session requests, 0 KB, same 9 chunks, and the seed rewrote its three windows
+    (same keys, fresh `storedAt`); the sparse expand control is still rendered, i.e. the display path is
+    unchanged.
+  - **Instrumentation caveat (worth a test, not a bug report):** two heavy `getAll()` probes I ran from the
+    debugger appeared to starve the page's own IDB ops (the module times every op out at 2s and trips a
+    3-failure circuit breaker that lasts until the next page load) — one tab stopped writing while a
+    pristine tab wrote normally. Follow-up worth considering: let `degraded` recover after a backoff, or
+    exempt live write-through from the breaker, so a slow disk / a second tab cannot silently switch the
+    cache off for the rest of the session.
+  - Note for the user's own browser: the v1 → v2 upgrade discards the existing v1 chunks (~13MB observed)
+    on the first load of the new bundle — by design (the cache is disposable); the warm loop refills it.
