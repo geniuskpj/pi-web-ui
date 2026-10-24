@@ -676,6 +676,46 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 	const scrollRef = useRef<HTMLDivElement>(null);
 	const stick = useRef(true);
 	const lastTop = useRef(0);
+	// DISPLAY BY USER TURN (user request 2026-10-24, tail-first sessions only):
+	// the view shows ONE conversational turn (from its user message down); the
+	// button reveals the previous turn — a pure VIEW change when the turn is
+	// already in memory, a /range fetch when it isn't. null = show everything
+	// (small sessions / full state frames — never gated). Only sparse (large)
+	// sessions get the gated view.
+	const [displayFrom, setDisplayFrom] = useState<number | null>(null);
+	const sparseSeen = useRef<any>(null);
+	const displayFromRef = useRef<number | null>(null);
+	displayFromRef.current = displayFrom;
+	// SYNC: a NEW sparse envelope (attach) gates the view to the LAST user turn;
+	// full state frames / small chats (no sparse) clear the gate.
+	useEffect(() => {
+		const sp = (state as any).sparse;
+		if (sp && sp !== sparseSeen.current) {
+			sparseSeen.current = sp;
+			let idx = 0;
+			for (let i = state.messages.length - 1; i >= 0; i--) if (state.messages[i]?.role === "user") { idx = i; break; }
+			setDisplayFrom(idx);
+		} else if (!sp && sparseSeen.current) { sparseSeen.current = null; setDisplayFrom(null); }
+	});
+	/** ⤒ reveal the PREVIOUS user turn: pure view change when it is already in
+	 *  memory (instant); a /range fetch (user-turn aligned server-side) when it
+	 *  isn't. Anchor by message IDENTITY — array indices shift on prepend. */
+	const expandTurns = async () => {
+		const msgs = state.messages;
+		const df = displayFromRef.current ?? 0;
+		for (let i = df - 1; i >= 0; i--) {
+			if (msgs[i]?.role === "user") { setDisplayFrom(i); return; }
+		}
+		const anchor = msgs[df] || msgs[msgs.length - 1];
+		const ok = await (agent as any).expandEarlier?.();
+		if (!ok) { note("could not load earlier turns — check the server log"); return; }
+		const arr = state.messages;
+		const anchorIdx = anchor ? arr.indexOf(anchor) : -1;
+		for (let i = (anchorIdx >= 0 ? anchorIdx : arr.length) - 1; i >= 0; i--) {
+			if (arr[i]?.role === "user") { setDisplayFrom(i); return; }
+		}
+		setDisplayFrom(0);
+	};
 	// UI-ONLY streaming partials for running tools (never enters messages)
 	const partials = useRef(new Map<string, string>());
 	// attachment state lives here so composer chips AND sent-message file chips
@@ -1074,19 +1114,21 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 				   <button type="button" class="pw-continuation-open" onClick={() => { setContinuation(null); window.dispatchEvent(new CustomEvent("pi-open-session", { detail: continuation.id })); }}>open it</button>
 				  </div>
 				 )}
-					{(state as any).sparse && (state as any).sparse.filledFrom > 0 && (
+					{(displayFrom != null && (displayFrom > 0 || ((state as any).sparse?.filledFrom ?? 0) > 0)) && (
 					<div class="pw-expand">
 						<button
 							type="button"
 							class="pw-expand-btn"
-							onClick={() => { const a: any = agent; void a?.expandEarlier?.()?.then?.((ok: boolean) => { if (!ok) note("could not load earlier messages — check the server log"); }); }}
+							onClick={() => { void expandTurns(); }}
 						>
-							⤒ Load earlier turns ({(state as any).sparse.filledFrom} msgs left)
+							⤒ Load earlier turns{displayFrom ? ` (${displayFrom} msgs hidden)` : ""}
 						</button>
 					</div>
 					)}
 					{state.messages.map((m: any, i: number) => (
 					<Fragment key={keyOf(m)}>
+					{displayFrom != null && i < displayFrom ? null /* hidden by the user-turn display gate */ : (
+					<>
 					{editingIdx !== null && i === editingIdx + 1 && (
 						<div class="pw-edit-divider">messages below will be replaced — the old turn is saved as a restorable version on Resubmit</div>
 					)}
@@ -1110,7 +1152,9 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 						retryState={retryState}
 						onOpenFile={openFileViewer}
 						/>
-						</Fragment>
+					</>
+					)}
+					</Fragment>
 				))}
 					{state.streamingMessage ? (
 						<MessageView
