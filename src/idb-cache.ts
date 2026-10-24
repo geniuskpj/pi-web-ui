@@ -14,13 +14,26 @@
 //   - versioned schema (v1), single db, no multi-store migrations
 //   - server fallback always available: a cache miss is just a range GET
 //
-// SHAPE: per-session COVERAGE (sorted disjoint [fromSeq,toSeq) windows) in a
-// tiny meta record + per-chunk gzip blobs keyed `${sessionId}:${fromSeq}`.
+// SHAPE (v2, 2026-10-24): per-session COVERAGE (sorted disjoint [fromSeq,toSeq)
+// windows) in a tiny meta record PER GENERATION + per-chunk gzip blobs keyed
+// `[sessionId, rewriteSeq, fromSeq]`.
 // The miss-set is computed from meta alone (one small get) — a fully-cached
 // session never pulls blobs to answer "do I have the tail?".
+//
+// V2 = GENERATIONS INSTEAD OF ERASURE (design update, grok 01a16c29; user asks:
+// "chunk should be updated automatically without request", "local cache don't
+// need to be erased immediately — it could be deleted by some logic after
+// checking integrity (date, reload)", "only for cache"): a rewrite bumps
+// rewriteSeq; the new generation has its own meta and its own chunk keys, so the
+// old one is simply UNREACHABLE — there is no invalidate-and-wipe step any more.
+// sweepStale() then collects superseded generations after an idle window and
+// anything older than a hard TTL (date-based GC), and a chunk that fails the
+// integrity check on read is dropped (coverage punched) instead of rendered.
 
 const DB_NAME = "pi-session-cache";
-const DB_VERSION = 1;
+const DB_VERSION = 2; // v2: compound keys carry rewriteSeq (old DB is abandoned, not migrated)
+const SWEEP_MAX_AGE_MS = 5 * 60 * 1000; // superseded generation: grace period before GC
+const SWEEP_HARD_TTL_MS = 30 * 24 * 60 * 60 * 1000; // anything idle this long goes, current gen included
 const META_STORE = "meta";
 const CHUNK_STORE = "chunks";
 const OP_TIMEOUT_MS = 2000;
@@ -41,6 +54,7 @@ export interface IdbMeta {
 	sessionId: string;
 	rewriteSeq: number;
 	messageCount: number;
+	updatedAt?: number; // last write (age-based GC; metas without it fall back to chunk storedAt)
 	ranges: Array<{ fromSeq: number; toSeq: number; bytes?: number }>; // sorted, disjoint; bytes per chunk (LRU)
 	totalBytes: number;
 }
@@ -48,6 +62,11 @@ export interface IdbMeta {
 let dbPromise: Promise<IDBDatabase> | null = null;
 let degraded = false;
 let failureStreak = 0;
+// Highest generation seen per session (in memory): a write for an OLDER
+// generation is pointless (unreachable by design) and is dropped, so a stale
+// in-flight fetch can't resurrect a swept generation.
+const currentGen = new Map<string, number>();
+const sweepRunning = new Set<string>(); // one sweep per session at a time
 const writeQueues = new Map<string, Promise<unknown>>();
 // CLEAR-vs-INFLIGHT GUARD (user request: "click clear while chat is in progress"):
 // clearSession bumps the generation; queued writes capture it at call time and
@@ -73,11 +92,21 @@ function withTimeout<T>(op: (db: IDBDatabase) => Promise<T>): Promise<T | null> 
 	const MISS = Symbol("miss"); // sentinel: op itself failed/threw — distinct from a null RESULT
 	dbPromise ??= new Promise<IDBDatabase>((resolve, reject) => {
 		const req = indexedDB.open(DB_NAME, DB_VERSION);
-		req.onupgradeneeded = () => {
+		req.onupgradeneeded = (ev) => {
 			const db = req.result;
-			if (!db.objectStoreNames.contains(META_STORE)) db.createObjectStore(META_STORE, { keyPath: "sessionId" });
+			// v1 → v2: a keyPath CANNOT be changed in place, so the v1 stores are
+			// dropped and recreated (the cache is disposable — a user's existing v1
+			// cache is simply discarded on the first load of v2).
+			const from = (ev as IDBVersionChangeEvent).oldVersion || 0;
+			if (from > 0 && from < 2) {
+				for (const name of [META_STORE, CHUNK_STORE]) {
+					if (db.objectStoreNames.contains(name)) db.deleteObjectStore(name);
+				}
+			}
+			// v2: one meta PER GENERATION, chunks keyed by [session, generation, fromSeq]
+			if (!db.objectStoreNames.contains(META_STORE)) db.createObjectStore(META_STORE, { keyPath: ["sessionId", "rewriteSeq"] });
 			if (!db.objectStoreNames.contains(CHUNK_STORE)) {
-				const store = db.createObjectStore(CHUNK_STORE, { keyPath: ["sessionId", "fromSeq"] });
+				const store = db.createObjectStore(CHUNK_STORE, { keyPath: ["sessionId", "rewriteSeq", "fromSeq"] });
 				store.createIndex("byStoredAt", "storedAt");
 			}
 		};
@@ -114,9 +143,84 @@ function txReq<T>(db: IDBDatabase, stores: string[], mode: IDBTransactionMode, f
 	});
 }
 
-/** Sorted disjoint windows covered by the session's chunk records. */
-async function coverage(sessionId: string): Promise<IdbMeta | null> {
-	return withTimeout((db) => txReq(db, [META_STORE], "readonly", (tx) => tx.objectStore(META_STORE).get(sessionId) as IDBRequest<IdbMeta>));
+function rememberGen(sessionId: string, gen: number) {
+	if (gen > (currentGen.get(sessionId) ?? -1)) currentGen.set(sessionId, gen);
+}
+
+/** Coverage of ONE generation (v2): exact hit by [sessionId, rewriteSeq].
+ *  With no generation given, the NEWEST generation for that session wins.
+ *  A missing generation is a MISS — never a reason to delete anything. */
+async function coverageFor(sessionId: string, rewriteSeq?: number): Promise<IdbMeta | null> {
+	if (rewriteSeq !== undefined) {
+		const meta = await withTimeout((db) => txReq(db, [META_STORE], "readonly", (tx) => tx.objectStore(META_STORE).get([sessionId, rewriteSeq]) as IDBRequest<IdbMeta>));
+		if (meta) rememberGen(sessionId, meta.rewriteSeq || 0);
+		return meta;
+	}
+	const metas = (await withTimeout((db) => txReq(db, [META_STORE], "readonly", (tx) => tx.objectStore(META_STORE).getAll() as IDBRequest<IdbMeta[]>))) || [];
+	const mine = metas.filter((m) => m.sessionId === sessionId);
+	if (mine.length === 0) return null;
+	const newest = mine.reduce((a, b) => ((b.rewriteSeq || 0) > (a.rewriteSeq || 0) ? b : a));
+	rememberGen(sessionId, newest.rewriteSeq || 0);
+	return newest;
+}
+
+/** Schema v2 chunk key — PURE, so every writer (warm loop, expand, live
+ *  write-through) lands on the same key for the same window. */
+export function chunkKey(sessionId: string, rewriteSeq: number, fromSeq: number): [string, number, number] {
+	return [sessionId, rewriteSeq, fromSeq];
+}
+
+/** Coverage update for one window: ranges stay DISJOINT and 1:1 with chunk keys
+ *  (`range.fromSeq` IS the chunk's fromSeq — a merged range would read only its
+ *  first blob, grok 01a16a54 #5). A window overlapping older ranges REPLACES
+ *  them and the caller deletes those chunk records in the same txn. Overlap is a
+ *  seam case (turn-aligned fetched windows meeting aligned live chunks); losing
+ *  the older chunk costs at most one refetch and keeps the invariant intact. */
+export function mergeRanges(
+	ranges: Array<{ fromSeq: number; toSeq: number; bytes?: number }>,
+	add: { fromSeq: number; toSeq: number; bytes?: number },
+): { ranges: Array<{ fromSeq: number; toSeq: number; bytes?: number }>; replaced: Array<{ fromSeq: number; toSeq: number }> } {
+	const replaced: Array<{ fromSeq: number; toSeq: number }> = [];
+	const out: Array<{ fromSeq: number; toSeq: number; bytes?: number }> = [];
+	for (const r of ranges) {
+		if (r.toSeq <= add.fromSeq || r.fromSeq >= add.toSeq) { out.push(r); continue; } // disjoint
+		replaced.push(r); // exact re-put / fully covered / partial — the new window wins
+	}
+	out.push({ fromSeq: add.fromSeq, toSeq: add.toSeq, bytes: add.bytes });
+	out.sort((a, b) => a.fromSeq - b.fromSeq);
+	return { ranges: out, replaced };
+}
+
+/** Which generations may be deleted now (PURE, unit-tested). Superseded = a
+ *  newer generation exists AND the idle grace period has passed; expired = older
+ *  than the hard TTL whatever the generations say. The current generation is
+ *  never selected unless it is beyond the hard TTL. */
+export function pickSweepCandidates(
+	metas: Array<{ sessionId: string; rewriteSeq: number; updatedAt?: number }>,
+	opts: { now: number; maxAgeMs: number; hardTtlMs: number; sessionId?: string },
+): Array<{ sessionId: string; rewriteSeq: number; reason: "superseded" | "expired" }> {
+	const newest = new Map<string, number>();
+	for (const m of metas) newest.set(m.sessionId, Math.max(newest.get(m.sessionId) ?? -1, m.rewriteSeq || 0));
+	const out: Array<{ sessionId: string; rewriteSeq: number; reason: "superseded" | "expired" }> = [];
+	for (const m of metas) {
+		if (opts.sessionId && m.sessionId !== opts.sessionId) continue;
+		const age = opts.now - (m.updatedAt ?? 0);
+		if (age > opts.hardTtlMs) { out.push({ sessionId: m.sessionId, rewriteSeq: m.rewriteSeq || 0, reason: "expired" }); continue; }
+		if ((m.rewriteSeq || 0) < (newest.get(m.sessionId) ?? 0) && age > opts.maxAgeMs) out.push({ sessionId: m.sessionId, rewriteSeq: m.rewriteSeq || 0, reason: "superseded" });
+	}
+	return out;
+}
+
+/** Integrity check for a decompressed chunk body (PURE). The wire carries no
+ *  per-message seq, so the checkable facts are: every line is JSON and the line
+ *  count matches the claimed window exactly. */
+export function verifyChunkText(text: string, fromSeq: number, toSeq: number): { ok: boolean; lines: number; reason?: string } {
+	const lines = text.split("\n").filter(Boolean);
+	if (lines.length !== toSeq - fromSeq) return { ok: false, lines: lines.length, reason: `line count ${lines.length} != window ${toSeq - fromSeq}` };
+	for (let i = 0; i < lines.length; i++) {
+		try { JSON.parse(lines[i]); } catch { return { ok: false, lines: lines.length, reason: `line ${i} is not JSON` }; }
+	}
+	return { ok: true, lines: lines.length };
 }
 
 /** Interval difference: subranges of [from,to) NOT covered by the sorted ranges. */
@@ -138,12 +242,8 @@ export function intervalDiff(from: number, to: number, ranges: Array<{ fromSeq: 
  *  renumbered the transcript) invalidates the session and reports NO coverage —
  *  stale pre-rewrite chunks must never satisfy a read (COMPACT CHECK). */
 export async function cachedRanges(sessionId: string, expectRewriteSeq?: number): Promise<Array<{ fromSeq: number; toSeq: number }>> {
-	const meta = await coverage(sessionId);
-	if (!meta) return [];
-	if (expectRewriteSeq !== undefined && (meta.rewriteSeq || 0) !== expectRewriteSeq) {
-		await invalidateSession(sessionId);
-		return [];
-	}
+	const meta = await coverageFor(sessionId, expectRewriteSeq);
+	if (!meta) return []; // unknown generation ⇒ miss (the old generation stays for the GC)
 	return meta.ranges ?? [];
 }
 
@@ -154,12 +254,9 @@ export async function cachedRanges(sessionId: string, expectRewriteSeq?: number)
  *  expectRewriteSeq: generation mismatch (compaction/edits) → invalidate + []. */
 export async function getCachedChunks(sessionId: string, from: number, to: number, expectRewriteSeq?: number): Promise<Array<{ fromSeq: number; toSeq: number; messages: any[] }>> {
 	const result = await withTimeout(async (db) => {
-		const meta = await coverage(sessionId);
-		if (!meta) return [];
-		if (expectRewriteSeq !== undefined && (meta.rewriteSeq || 0) !== expectRewriteSeq) {
-			await invalidateSession(sessionId); // COMPACT CHECK: stale content must never render
-			return [];
-		}
+		const meta = await coverageFor(sessionId, expectRewriteSeq);
+		if (!meta) return []; // unknown generation ⇒ miss; stale content can never satisfy a read
+		const gen = meta.rewriteSeq || 0;
 		const holes = intervalDiff(from, to, meta.ranges);
 		if (holes.length > 0) return []; // partial coverage → caller fetches the whole window
 		const out: Array<{ fromSeq: number; toSeq: number; messages: any[] }> = [];
@@ -168,10 +265,12 @@ export async function getCachedChunks(sessionId: string, from: number, to: numbe
 			// MEMORY TIER first (shader-cache): skip gunzip entirely on re-reads
 			const hit = memTier.get(memKey(sessionId, r.fromSeq));
 			if (hit) { hit.at = Date.now(); out.push({ fromSeq: r.fromSeq, toSeq: r.toSeq, messages: hit.messages }); continue; }
-			const rec = await txReq(db, [CHUNK_STORE], "readonly", (tx) => tx.objectStore(CHUNK_STORE).get([sessionId, r.fromSeq]) as IDBRequest<IdbChunk>);
+			const rec = await txReq(db, [CHUNK_STORE], "readonly", (tx) => tx.objectStore(CHUNK_STORE).get(chunkKey(sessionId, gen, r.fromSeq)) as IDBRequest<IdbChunk>);
 			if (!rec || rec.toSeq !== r.toSeq) return []; // ghost range (blob gone) → fetch instead
 			const text = await gunzip(rec.blob);
-			if (text == null) return [];
+			if (text == null) { void dropChunk(sessionId, gen, r.fromSeq); return []; } // corrupt blob: never render, refetch
+			const verdict = verifyChunkText(text, r.fromSeq, r.toSeq);
+			if (!verdict.ok) { console.warn("[idb] dropping chunk", r.fromSeq, "—", verdict.reason); void dropChunk(sessionId, gen, r.fromSeq); return []; }
 			const msgs = text.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
 			memPut(sessionId, rec.fromSeq, msgs);
 			out.push({ fromSeq: rec.fromSeq, toSeq: rec.toSeq, messages: msgs });
@@ -188,31 +287,32 @@ export async function getCachedChunks(sessionId: string, from: number, to: numbe
  *  EPOCH GUARD: meta from an older rewriteSeq is dropped; ranges below
  *  rewrittenFrom survive (same identity rule as the server). Serialized per
  *  session; overwrites of the same key adjust totalBytes (no LRU inflation). */
-export async function putChunk(sessionId: string, fromSeq: number, toSeq: number, rewriteSeq: number, messageCount: number, gzipBlob: Blob, rewrittenFrom = Number.MAX_SAFE_INTEGER): Promise<void> {
+export async function putChunk(sessionId: string, fromSeq: number, toSeq: number, rewriteSeq: number, messageCount: number, gzipBlob: Blob, _rewrittenFrom = Number.MAX_SAFE_INTEGER): Promise<void> {
+	// STALE-WRITE GUARD (v2): a window fetched for an older generation can no
+	// longer be reached by any read — don't resurrect it (the _rewrittenFrom
+	// prefix-survival hint is intentionally unused here; a rewrite starts a fresh
+	// generation and the warm loop refills it).
+	const known = currentGen.get(sessionId);
+	if (known !== undefined && rewriteSeq < known) return;
+	rememberGen(sessionId, rewriteSeq);
 	const genAtCall = clearGen.get(sessionId) || 0; // clear-vs-inflight guard
 	const run = () => withTimeout(async (db) => {
 		if ((clearGen.get(sessionId) || 0) !== genAtCall) return true; // cleared mid-flight — drop silently
-		const chunk: IdbChunk = { sessionId, fromSeq, toSeq, rewriteSeq, blob: gzipBlob, bytes: gzipBlob.size, storedAt: Date.now() };
+		const now = Date.now();
+		const chunk: IdbChunk = { sessionId, fromSeq, toSeq, rewriteSeq, blob: gzipBlob, bytes: gzipBlob.size, storedAt: now };
 		await new Promise<null>((resolve) => {
 			try {
 				const tx = db.transaction([META_STORE, CHUNK_STORE], "readwrite");
-				const metaReq = tx.objectStore(META_STORE).get(sessionId);
+				const metaReq = tx.objectStore(META_STORE).get([sessionId, rewriteSeq]);
 				metaReq.onsuccess = () => {
-					let meta = metaReq.result as IdbMeta | undefined;
-					if (!meta) meta = { sessionId, rewriteSeq, messageCount, ranges: [], totalBytes: 0 };
-					if ((meta.rewriteSeq || 0) !== rewriteSeq) {
-						// EPOCH CHANGE: keep only ranges strictly below rewrittenFrom
-						const keep = rewrittenFrom >= Number.MAX_SAFE_INTEGER ? [] : meta.ranges.filter((r) => r.toSeq <= rewrittenFrom);
-						const keptBytes = keep.reduce((a, r) => a + (r.bytes || 0), 0);
-						meta = { sessionId, rewriteSeq, messageCount, ranges: keep, totalBytes: meta.totalBytes - keptBytes + gzipBlob.size };
-					} else {
-						// same epoch: replace an existing overlapping record's byte count
-						const old = meta.ranges.find((r) => r.fromSeq === fromSeq);
-						meta.totalBytes = Math.max(0, meta.totalBytes - (old?.bytes || 0) + gzipBlob.size);
-					}
-					const ranges = [...meta.ranges.filter((r) => r.fromSeq !== fromSeq && r.toSeq <= fromSeq || r.fromSeq >= toSeq), { fromSeq, toSeq, bytes: gzipBlob.size }].sort((a, b) => a.fromSeq - b.fromSeq);
+					const prev = (metaReq.result as IdbMeta | undefined) ?? { sessionId, rewriteSeq, messageCount, ranges: [], totalBytes: 0, updatedAt: now };
+					const { ranges, replaced } = mergeRanges(prev.ranges || [], { fromSeq, toSeq, bytes: gzipBlob.size });
+					let totalBytes = gzipBlob.size;
+					for (const r of ranges) totalBytes += r.bytes || 0;
+					// replaced ranges lose their chunk records in THIS txn (never a half-state)
+					for (const r of replaced) tx.objectStore(CHUNK_STORE).delete(chunkKey(sessionId, rewriteSeq, r.fromSeq));
 					tx.objectStore(CHUNK_STORE).put(chunk);
-					tx.objectStore(META_STORE).put({ ...meta, ranges });
+					tx.objectStore(META_STORE).put({ sessionId, rewriteSeq, messageCount: Math.max(prev.messageCount || 0, messageCount || 0), ranges, totalBytes, updatedAt: now });
 				};
 				tx.oncomplete = () => resolve(null);
 				tx.onerror = () => resolve(null);
@@ -229,12 +329,75 @@ export async function putChunk(sessionId: string, fromSeq: number, toSeq: number
 	await next;
 }
 
-/** Drop ALL chunks of a session (rewrite invalidation when the client can't
- *  trust any cached range — e.g. epoch changed and no rewrittenFrom survived).
- *  Resolves on tx COMPLETE (the old version never resolved on the done path
- *  and always rode the 2s timeout — grok review 01a16a54 #6). */
-export async function invalidateSession(sessionId: string): Promise<void> {
-	await clearSession(sessionId);
+/** Drop ONE chunk + punch its coverage (integrity failure on read, ghost blob).
+ *  Reads then refetch that window; nothing else is touched. */
+async function dropChunk(sessionId: string, rewriteSeq: number, fromSeq: number): Promise<void> {
+	await withTimeout(async (db) => {
+		await new Promise<null>((resolve) => {
+			try {
+				const tx = db.transaction([META_STORE, CHUNK_STORE], "readwrite");
+				tx.objectStore(CHUNK_STORE).delete(chunkKey(sessionId, rewriteSeq, fromSeq));
+				const metaReq = tx.objectStore(META_STORE).get([sessionId, rewriteSeq]);
+				metaReq.onsuccess = () => {
+					const meta = metaReq.result as IdbMeta | undefined;
+					if (!meta) return;
+					const gone = (meta.ranges || []).find((r) => r.fromSeq === fromSeq);
+					const ranges = (meta.ranges || []).filter((r) => r.fromSeq !== fromSeq);
+					tx.objectStore(META_STORE).put({ ...meta, ranges, totalBytes: Math.max(0, (meta.totalBytes || 0) - (gone?.bytes || 0)), updatedAt: Date.now() });
+				};
+				tx.oncomplete = () => resolve(null);
+				tx.onerror = () => resolve(null);
+				tx.onabort = () => resolve(null);
+			} catch { resolve(null); }
+		});
+		return null;
+	});
+}
+
+/** Date/integrity GC (user request: the cache "don't need to be erased
+ *  immediately — it could be deleted by some logic after checking integrity
+ *  (date, reload)"). Superseded generations go after SWEEP_MAX_AGE_MS, anything
+ *  goes after SWEEP_HARD_TTL_MS. Never called for the current generation's
+ *  fresh data. Triggers: attach (a newer generation proves the old is stale) and
+ *  tab focus. Returns a small summary for tests/telemetry. */
+export async function sweepStale(opts: { sessionId?: string; maxAgeMs?: number; hardTtlMs?: number; now?: number } = {}): Promise<{ scanned: number; dropped: number }> {
+	const now = opts.now ?? Date.now();
+	const key = opts.sessionId || "*";
+	if (sweepRunning.has(key)) return { scanned: 0, dropped: 0 };
+	sweepRunning.add(key);
+	try {
+		const metas = (await withTimeout((db) => txReq(db, [META_STORE], "readonly", (tx) => tx.objectStore(META_STORE).getAll() as IDBRequest<IdbMeta[]>))) || [];
+		const targets = pickSweepCandidates(metas as Array<{ sessionId: string; rewriteSeq: number; updatedAt?: number }>, {
+			now,
+			maxAgeMs: opts.maxAgeMs ?? SWEEP_MAX_AGE_MS,
+			hardTtlMs: opts.hardTtlMs ?? SWEEP_HARD_TTL_MS,
+			sessionId: opts.sessionId,
+		});
+		if (targets.length === 0) return { scanned: metas.length, dropped: 0 };
+		await withTimeout(async (db) => {
+			await new Promise<null>((resolve) => {
+				try {
+					const tx = db.transaction([META_STORE, CHUNK_STORE], "readwrite");
+					const metaStore = tx.objectStore(META_STORE);
+					const chunkStore = tx.objectStore(CHUNK_STORE);
+					for (const t of targets) {
+						metaStore.delete([t.sessionId, t.rewriteSeq]);
+						const range = IDBKeyRange.bound([t.sessionId, t.rewriteSeq, -Infinity], [t.sessionId, t.rewriteSeq, Number.MAX_SAFE_INTEGER]);
+						const cur = chunkStore.openCursor(range);
+						cur.onsuccess = () => { const c = cur.result; if (!c) return; c.delete(); c.continue(); };
+					}
+					tx.oncomplete = () => resolve(null);
+					tx.onerror = () => resolve(null);
+					tx.onabort = () => resolve(null);
+				} catch { resolve(null); }
+			});
+			return null;
+		});
+		for (const t of targets) currentGen.delete(t.sessionId);
+		return { scanned: metas.length, dropped: targets.length };
+	} finally {
+		sweepRunning.delete(key);
+	}
 }
 
 /** USER-FACING CLEAR (session-list UI, "🧹 beside Kill"): wipes one session's
@@ -248,8 +411,12 @@ export async function clearSession(sessionId: string): Promise<void> {
 		await new Promise<null>((resolve) => {
 			try {
 				const tx = db.transaction([META_STORE, CHUNK_STORE], "readwrite");
-				tx.objectStore(META_STORE).delete(sessionId);
-				const range = IDBKeyRange.bound([sessionId, -Infinity], [sessionId, Number.MAX_SAFE_INTEGER]);
+				const metaStore = tx.objectStore(META_STORE);
+				// v2: wipe EVERY generation of this session (the explicit 🧹 button)
+				const metaRange = IDBKeyRange.bound([sessionId, -Infinity], [sessionId, Number.MAX_SAFE_INTEGER]);
+				const metaCur = metaStore.openCursor(metaRange);
+				metaCur.onsuccess = () => { const c = metaCur.result; if (!c) return; c.delete(); c.continue(); };
+				const range = IDBKeyRange.bound([sessionId, -Infinity, -Infinity], [sessionId, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER]);
 				const cursorReq = tx.objectStore(CHUNK_STORE).openCursor(range);
 				cursorReq.onsuccess = () => {
 					const cur = cursorReq.result;
@@ -270,7 +437,12 @@ export async function clearSession(sessionId: string): Promise<void> {
 export async function idbStats(): Promise<Map<string, { bytes: number; chunks: number }>> {
 	const out = new Map<string, { bytes: number; chunks: number }>();
 	const metas = await withTimeout(async (db) => txReq(db, [META_STORE], "readonly", (tx) => tx.objectStore(META_STORE).getAll() as IDBRequest<IdbMeta[]>));
-	for (const m of metas || []) out.set(m.sessionId, { bytes: m.totalBytes || 0, chunks: m.ranges?.length || 0 });
+	// v2: a session may hold several generations until the sweep — the badge is
+	// the session's TOTAL footprint (that is what the user can reclaim).
+	for (const m of metas || []) {
+		const cur = out.get(m.sessionId) || { bytes: 0, chunks: 0 };
+		out.set(m.sessionId, { bytes: cur.bytes + (m.totalBytes || 0), chunks: cur.chunks + (m.ranges?.length || 0) });
+	}
 	return out;
 }
 
@@ -289,11 +461,19 @@ async function evictIfNeeded(db: IDBDatabase): Promise<void> {
 				const chunksReq = tx.objectStore(CHUNK_STORE).index("byStoredAt").getAll();
 				chunksReq.onsuccess = () => {
 					const chunks = (chunksReq.result || []) as IdbChunk[];
-					for (const rec of chunks.sort((a, b) => a.storedAt - b.storedAt)) {
+					const newestGen = new Map<string, number>();
+					for (const m of metas) newestGen.set(m.sessionId, Math.max(newestGen.get(m.sessionId) ?? -1, m.rewriteSeq || 0));
+					// superseded generations are dead weight — evict them first, then LRU
+					const ordered = chunks.sort((a, b) => {
+						const sa = (a.rewriteSeq || 0) < (newestGen.get(a.sessionId) ?? 0) ? 0 : 1;
+						const sb = (b.rewriteSeq || 0) < (newestGen.get(b.sessionId) ?? 0) ? 0 : 1;
+						return sa !== sb ? sa - sb : a.storedAt - b.storedAt;
+					});
+					for (const rec of ordered) {
 						if (total <= MAX_CACHE_BYTES) break;
-						tx.objectStore(CHUNK_STORE).delete([rec.sessionId, rec.fromSeq]);
+						tx.objectStore(CHUNK_STORE).delete(chunkKey(rec.sessionId, rec.rewriteSeq || 0, rec.fromSeq));
 						total = Math.max(0, total - rec.bytes);
-						const m = metas.find((x) => x.sessionId === rec.sessionId);
+						const m = metas.find((x) => x.sessionId === rec.sessionId && (x.rewriteSeq || 0) === (rec.rewriteSeq || 0));
 						if (!m) continue;
 						// punch [fromSeq,toSeq) out of coverage (split if middle)
 						const out: IdbMeta["ranges"] = [];

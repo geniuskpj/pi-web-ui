@@ -7,7 +7,7 @@
 type Listener = (event: any) => void;
 type AnyRecord = Record<string, any>;
 import { makeId } from "./id.js";
-import { getCachedChunks, putChunk, gunzip, transferPolicy, cachedRanges, intervalDiff, invalidateSession } from "./idb-cache.js";
+import { getCachedChunks, putChunk, gunzip, transferPolicy, cachedRanges, intervalDiff, sweepStale } from "./idb-cache.js";
 // BACKFILL step in MESSAGES (filledFrom is a seq, not bytes): generous ask —
 // the server clamps the response to 1MB serialized (~140 msgs on the 7.3MB
 // session) and reports the actual window in X-Range-* headers.
@@ -47,6 +47,14 @@ export class ProxyAgent {
 	constructor(sessionId: string, initialModel?: any) {
 		this.sessionId = sessionId || makeId(); // randomUUID is secure-context-only
 		if (initialModel) this.state.model = initialModel;
+		// IDB GC (v2): generations are never erased on rewrite — they are collected
+		// here, by date: a tab coming back to the foreground is the natural moment
+		// (page reload is the other one, via the attach sweep below).
+		if (typeof window !== "undefined") {
+			window.addEventListener("visibilitychange", () => {
+				if (!document.hidden) void sweepStale();
+			});
+		}
 	}
 
 	connect() {
@@ -136,6 +144,9 @@ export class ProxyAgent {
 			if (sparse && Array.isArray(msg.messages)) {
 				this.state.messages = [...(msg.messages || [])]; // DENSE tail window
 				(this.state as any).sparse = { ...sparse, filledFrom: sparse.fromSeq };
+				// v2 GC: attaching at generation N proves every older generation of this
+				// session is stale — collect those past the grace period (never a wipe).
+				void sweepStale({ sessionId: this.sessionId });
 				void this.scheduleBackfill(sparse);
 			} else {
 				this.state.messages = [...(msg.messages || [])];
@@ -468,10 +479,11 @@ export class ProxyAgent {
 				const sparse = (this.state as any).sparse as { rewriteSeq: number } | undefined;
 				if (sparse && rsq !== sparse.rewriteSeq) {
 					// STALE GENERATION (grok #6): the transcript was rewritten since our
-					// attach — drop cached chunks (the server's rewrittenFrom says which
-					// ranges survive) and refuse to splice stale messages
-					console.warn("[backfill] stale epoch (saw", sparse.rewriteSeq, "server", rsq, ") — invalidating cache");
-					try { await invalidateSession(this.sessionId); } catch { /* best-effort */ }
+					// attach. v2: nothing to erase — chunks are keyed by rewriteSeq, so the
+					// old generation is already unreachable; the GC collects it by date.
+					// The splice is still refused: stale messages must never render.
+					console.warn("[backfill] stale epoch (saw", sparse.rewriteSeq, "server", rsq, ") — old generation left to the GC");
+					void sweepStale({ sessionId: this.sessionId });
 					return false;
 				}
 				// cache write-through: the SAME raw gzip bytes into IDB (decompress on read)
