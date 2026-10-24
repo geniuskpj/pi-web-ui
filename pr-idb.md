@@ -251,3 +251,37 @@ the transfer PR's §2 table stay out of the tree.
   "display by user turn" → view gate + turn-aligned ranges; "how it works with compaction" →
   COMPACT CHECK + prefix survival. All addressed in `4e079e4`..`03becb7`.
 - **2026-10-24 — author re-verification (PR 2):** at `6dfee3e` — retry 50, security 64, versions 30, zombie 11, range 13, compact 19, fork 23, store 7, runtime 6, ssrf 5, shutdown 9, edit-tool 7, typecheck + build green. The A1/A2 auto-retry regressions were caught by the internal cap test while writing this record (not by review) and folded into `b8f1aca`.
+- **2026-10-24 — review (IDB cache vs a GROWING session; user question):** *"idb+compression works with a long
+  session. It fetched a chunk at first. Assume the user chats until there is another chunk — is the new chunk
+  appended automatically?"* — **No, and that is the design.** Only two code paths ever write chunks
+  (`src/proxy-agent.ts:417` = the warm loop started by the sparse attach frame, `:478` = the expand/cache-miss
+  fill) and both are fed by `GET …/range`; the attach snapshot itself and the live `agent-event` stream never
+  touch IDB. Growth is also invisible to the cache *by construction*: chunks are seq-addressed and the seq space
+  is APPEND-ONLY, so a warmed `[a,b)` stays valid indefinitely — only a rewrite bumps `rewriteSeq` /
+  `rewrittenFrom` (✎ edit · 🕘 restore · retry tail-drop · compact) and invalidates. The cached `messageCount`
+  does go stale as the session grows and is deliberately **not** a validity key (badge/telemetry only).
+  Expected sequence across a chunk boundary: session ≈3MB → open renders the last ~1MB (seqs ~700–900) and the
+  warm loop caches `[0,700)` in ~1MB chunks → the user chats; messages 901+ arrive live and only the RENDER
+  grows (IDB untouched, `filledFrom` unchanged) → on the next open the server picks a NEW tail window
+  (turn-aligned, keep-high clamp), the warm loop finds `[0,700)` already covered (no re-download) and fetches
+  only the new hole `(700,780)` once, storing it as its own chunk under the server's returned
+  `X-Range-From/To-Seq`. Net effect: **the cache grows lazily, one chunk per open/expand, never from live
+  traffic.**
+  - **Note — accepted trade-off with a real cost: the LIVE TAIL is never cached**, so every reload re-downloads
+    ~1MB (≈170–270KB gzip; the measured 909–977 tail was 166KB gz). That is the most frequent network event on
+    mobile. Cheap follow-up *if it ever matters*: write the attach tail through to IDB (server sends the tail as
+    gzip, or the client re-serializes + gzips ≈30ms/1MB) validated by `rewriteSeq`. Not done on purpose —
+    freshness won.
+  - **Open — overlapping coverage needs a test before it needs a fix.** A warmed hole is `[700,780)`, while the
+    next attach tail may begin INSIDE an already-cached chunk (the start is server-chosen alignment). `putChunk`'s
+    coverage update (`keep` + sorted disjoint ranges, `idb-cache.ts` ~202–207) has no explicit overlap case:
+    verify it splits rather than persisting two overlapping/adjacent ranges, and that `getCachedChunks` can never
+    yield the same message twice after a prepend. Suggested: a case in `tests/range.test.mjs` (or a new
+    `tests/idb-coverage.test.mjs`) — "overlapping put → coverage stays disjoint, messages deduplicated".
+  - **Confirmed correct by reading it:** `intervalDiff(0, filledFrom, covered)` with oldest-hole-first warming
+    means warm history is never re-fetched; a metered link skips warming entirely (policy gate at :395–397);
+    a stale epoch drops the cache and refuses to splice (`fillWindow`, grok #6).
+  - **Consequence for expectations (not a bug, worth stating in the PR):** a session the user chats in for hours
+    writes NOTHING to IDB, so the session-list badge ("IDB x MB (n chunks)") describes cold history, not the
+    current size. If the goal ever becomes "reopen instantly on mobile without the tail download", the fix is
+    the tail write-through above, not more chunking.
