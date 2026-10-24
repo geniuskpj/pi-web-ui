@@ -76,6 +76,28 @@ try {
 		check("T7 well-formed call unchanged (no repair notes)",
 			/Successfully replaced/.test(text) && !/Repaired malformed call/.test(text) && file().includes("GAMMA"));
 	}
+
+	// T8 — built-in write/read tools use workspace paths and preserve exact input bytes
+	{
+		const target = path.join(srv.wsDir, "nested", "platform.txt");
+		const content = "first line\r\nsecond line\r\n";
+		const write = await execTool(srv, { path: path.relative(srv.wsDir, target), content }, "write_file");
+		const read = await execTool(srv, { path: target }, "read_file");
+		const text = read.content?.[0]?.text || "";
+		check("T8 write_file creates parent dirs and preserves CRLF",
+			/wrote \d+ bytes/.test(write.content?.[0]?.text || "") && fs.readFileSync(target, "utf8") === content);
+		check("T8 read_file accepts an absolute Linux workspace path",
+			text.includes("1| first line\r\n2| second line\r"));
+	}
+
+	// T9 — editing a CRLF file must not convert it to the server OS line endings
+	{
+		const target = path.join(srv.wsDir, "nested", "platform.txt");
+		const r = await execTool(srv, { path: target, edits: [{ oldText: "second line\n", newText: "updated line\n" }] });
+		check("T9 edit preserves Windows CRLF on Linux",
+			/Successfully replaced/.test(r.content?.[0]?.text || "") &&
+			fs.readFileSync(target, "utf8") === "first line\r\nupdated line\r\n");
+	}
 } finally {
 	await srv.stop();
 }

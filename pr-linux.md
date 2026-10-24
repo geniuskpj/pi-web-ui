@@ -15,6 +15,8 @@ Make the server's terminal and Bash execution usable on Linux while preserving t
 - Upgrade `@earendil-works/pi-ai` and `@earendil-works/pi-agent-core` to 1.4.0, set the app's Node minimum to `22.19.0`, and migrate to the new compat exports and required agent `streamFn`.
 - Use the pi-ai builtin model catalog when there is no usable models store, so listed catalog models can also be resolved by the server agent.
 - Save keys entered in Settings to browser storage and a private `data/provider-keys.json` server-side store. Preserve `.pi/auth.json` and allow the server agent to read both sources.
+- Make `write_file` create missing parent directories by default, matching its documented behavior, and allow callers to opt out with `createDirs: false`.
+- Add built-in file-tool regression coverage for Linux workspace paths and preserving CRLF when editing Windows-style files on Linux.
 
 ## Validation
 
@@ -24,6 +26,8 @@ Make the server's terminal and Bash execution usable on Linux while preserving t
 - `npm run test:provider-keys`
 - `npm run test:provider-models`
 - `npm run test:term-platform`
+- `npm run test:edit` — 10 checks passed, including Linux workspace paths and CRLF preservation.
+- `npm run test:fetch` — 9 checks passed.
 - `npm test` — 14 checks passed with Linux `script` installed; confirmed Bash sees a TTY.
 - `env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin "$(node -p 'process.execPath')" tests/term-smoke.mjs` — 13 checks passed with `script` unavailable; confirmed pipes fallback.
 - `npm run test:retry` — 31 checks passed.

@@ -819,7 +819,7 @@ const builtinTools = [
 			const content = String(params.content ?? "");
 			if (Buffer.byteLength(content) > 2 * 1024 * 1024) throw new Error("content too large (>2MB)");
 			return await withFileMutationQueue(p, async () => {
-				if (params.createDirs === true && !fs.existsSync(path.dirname(p))) fs.mkdirSync(path.dirname(p), { recursive: true });
+				if (params.createDirs !== false && !fs.existsSync(path.dirname(p))) fs.mkdirSync(path.dirname(p), { recursive: true });
 				try {
 					fs.writeFileSync(p, content, "utf8");
 				} catch (err) {
