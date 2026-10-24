@@ -118,6 +118,121 @@ security 64, store 7, runtime 6, typecheck + build. Live: range tail 909–977 (
   gzip-at-rest in IDB (adds 118ms decompress to the open path), zstd/fflate (v2 if quota binds).
 - The mobile-decode numbers are desktop-derived; real-device check rides with PL-12.
 
+---
+
+# PR 2 — retry + mobile: the branch base (`c461dee`, `b8f1aca`, `916c0ef`, `7bdcd03`)
+
+**Branch:** `feat/retry-mobile-transfer` · **Base:** `ea2dc63` (*retry: keep the toolcall + thinking when retrying a mid-round 429*)
+**Covers:** `c461dee` pi-ai/pi-agent-core 1.4.0 + builtin model-catalog fallback · `b8f1aca` auto-retry UI (server-driven countdown + Cancel/Retry now) · `916c0ef` mobile long-press edit + Enter=newline · `7bdcd03` gitignore bench harness
+**Diff:** 20 files, +707 / −131 (4 commits) · **Pushed:** only `c461dee`; the rest is local
+**Design consult:** sonnet-5-high `01a169a9` (auto-retry pending UI + mobile input patterns)
+**Review log:** shared footer (entries tagged **PR 2**)
+
+> The transfer PR above takes `916c0ef` as its base — i.e. these four commits are the base it assumed
+> without documenting. Same branch, same reviewers, so the record lives here rather than in a second file.
+
+## 1. Problem — three user asks
+
+1. "try to update pi related package to 1.4.0" — and, once upgraded, the model picker had to work for a
+   user whose `models-store.json` is missing/empty.
+2. The pending auto-retry was **invisible** (a `retryNote` that only flashed through `runtime.lastText`)
+   and **uncancellable**; Settings could only toggle on/off with "3x / 3s" hardcoded in the label; and a
+   `Retry-After` timer kept firing *after* the toggle was switched off.
+3. "add multi line support for mobile if user uses long touch/click. It's inconvenient that i can't use
+   return key" + "hide model name before `/` in mobile. change text `+files` into clip emoji" + a
+   follow-up that the emoji was fixed-size and dark in BOTH themes.
+
+## 2. Design (what shipped)
+
+### 2.1 pi-ai + pi-agent-core 0.75.3 → 1.4.0, plus a builtin model catalog (`c461dee`)
+
+- **npm could not reify at all** (`Cannot read properties of null (reading 'name')`): the lockfile still
+  carried provider-stub LINK nodes (`link -> pi-ai/stubs/empty` for `@anthropic-ai/sdk`, `@aws-sdk/*`,
+  `@google/genai`, `@mistralai/*`) from the 0.75.3-overrides era, and 1.4.0 no longer ships `stubs/`, so
+  arborist resolved a null target. Fixed by regenerating `package-lock.json`; the six provider SDKs stay
+  stubbed through **`build.mjs` aliases** (the `pr.md` CI work), not through npm overrides.
+- **API migrations** (all mechanical): `AgentOptions.streamFn` is now REQUIRED → the hub, the `/compact`
+  summary agent and the browser bootstrap pass the generic dispatcher from `@earendil-works/pi-ai/compat`
+  (`streamSimple` routes on `model.api`; importing the compat subpath also auto-registers the builtin api
+  providers); `getModel`/`streamSimple` moved to `compat` (`proxy-stream.ts`); `TextContent` stays a root
+  type export; `tests/retry.test.mjs` imports the faux provider from `compat` (same registry).
+  The mirror format is untouched — 1.4.0 kept the message shapes our toolResult repairs encode.
+- **Model-catalog fallback**: 1.4.0 ships `providers/all` — 42 providers in exactly the `models-store.json`
+  record shape (nvidia: 21 models with `baseUrl`/`api`/reasoning metadata), upstream-maintained, offline,
+  key-free. Seeded in **two** places when the store is missing/empty: `/api/pi/config` — which now reports
+  `modelSource: "models-store" | "builtin-catalog" | "none"` — and the hub's `modelsStore` (otherwise the
+  picker would list models `_getModel` refuses to run). **Store entries always win** (custom ids/baseUrls
+  the catalog lacks). Rejected: REST `GET {baseUrl}/v1/models` (needs a key + network, bare ids without
+  metadata) and a checked-in `backup-model-store.json` (static, goes stale, duplicates upstream).
+  Verified live: `PI_DIR` at an empty dir → `builtin-catalog`, 41 providers; real `.pi` → `models-store`,
+  3 providers, nvidia 21.
+
+### 2.2 Auto-retry: server-driven countdown + Cancel / Retry now (`b8f1aca`)
+
+- `runtime.retry` on the runtime frame: `{state:"scheduled", attempt, attempts, retryAt, delayMs, epoch}`
+  while pending, `{state:"given-up", note}` after the cap. **Presence is the signal** — every attached
+  device renders the same server-driven state and ticks the countdown locally from `retryAt` (no extra
+  pushes, no client-side drift between devices).
+- New WS op `cancel-retry` → `cancelPendingRetry(sessionId)`: cancels THIS pending retry only — auto-retry
+  stays enabled and the failed turn stays a plain error.
+- **A1** — `setAutoRetry({enabled:false})` now cancels every session's already-scheduled timer and clears
+  the notes (previously a 30s `Retry-After` timer still fired after disabling). **A2** — the timer callback
+  re-checks `enabled`/`discarded`/`compacting`/epoch **at fire time**, so a superseded or guarded timer
+  burns no attempt; the attempt counter commits **synchronously at dispatch** (committing in `.then()`
+  lagged the next failure's `agent_end` and the cap over-ran — caught by the cap test).
+- Client: `RetryCountdown` inside the error chrome ("Retrying in Ns — attempt n/N" + progress bar + Cancel
+  + Retry now; give-up shows the note + a plain Retry), 44px targets, stacked full-width below `48rem`.
+  Settings gains **Attempts (0–10)** and **Delay (1–60s)** inputs (disabled while off), persisted as
+  `pi.autoRetryAttempts` / `pi.autoRetryDelayMs`; `set-auto-retry` pushes the full config.
+
+### 2.3 Mobile: long-press edit + Enter=newline (`916c0ef`)
+
+- **Long-press edit** is gated on `pointerType` (touch/pen only — a desktop mouse long-click never edits,
+  so it cannot fight drag-select): 480ms hold, 10px move-slop cancels on scroll (no `preventDefault` on
+  down/move — native scrolling stays intact), a **fire-time selection check** (a hold that ended in a
+  selection never yanks the bubble into edit), `navigator.vibrate(12)` haptic (guarded, no-op on iOS),
+  `contextmenu` suppressed on mutable bubbles, `-webkit-touch-callout` off so iOS does not show its own
+  menu, pressed visual state (scale .98 + dim). ✎ remains the explicit control and is now always visible
+  with 44px targets on coarse pointers (it used to be hover-hidden). Timer cleanup is unmount-safe.
+- **Composer Enter** became a tri-state, per-device pref `pi.enterSends`: `auto` (default) | `always` |
+  `never`. In `auto`: fine pointer → Enter sends **bit-for-bit as before**; coarse pointer → Enter inserts a
+  newline and the always-visible Send button submits. Ctrl/Cmd+Enter always sends; desktop Shift/Alt+Enter
+  still newline; `enterkeyhint` relabels the soft key to match actual behaviour; recomputed per render, so a
+  settings change applies on the next keystroke. The desktop Enter-**steer** path is unchanged (mobile
+  steers with one tap on Send).
+- Tweaks: **ModelPill** hides the `provider/` prefix below 48rem (tooltip + picker keep the full id); the
+  `+ files` text becomes an **SVG paperclip** (feather path, `stroke=currentColor`) after the emoji turned
+  out fixed-size and dark in both themes.
+
+### 2.4 gitignore (`7bdcd03`)
+
+`public/tmp-bench/` + the decompression-bench harness HTML are ignored — the measurement artifacts behind
+the transfer PR's §2 table stay out of the tree.
+
+## 3. Tests (re-verified at `6dfee3e`, this branch)
+
+| suite | result |
+|---|---|
+| `test:retry` | **50** (was 40 — runtime exposure, `cancelPendingRetry`, cancel-keeps-auto-retry, disable-cancels-pending A1, compacting fire-time guard + intact budget A2) |
+| `test:security` | 64 |
+| `test:versions` | 30 |
+| `test:zombie` | 11 |
+| `test:range` | 13 |
+| `test:compact` | 19 |
+| `test:fork` | 23 |
+| store 7 · runtime 6 · ssrf 5 · shutdown 9 · edit-tool 7 | green |
+
+`typecheck` + `build` clean.
+
+## 4. Known limitations / deferred
+
+- The builtin catalog is a **snapshot** of upstream's `providers/all`: correct at upgrade time, stale by
+  design. Store entries win, and `modelSource` is reported so the UI can say where the list came from.
+- REST model discovery stays deferred until a key+network path is genuinely needed.
+- Input and retry prefs are per-device localStorage, deliberately not synced (a phone and a desktop want
+  different Enter behaviour).
+- Long-press edit is touch/pen only; pen-drag selection is not a second gesture (pen long-press is edit).
+
 ## Review log
 
 - **2026-10-24 — grok-4.6-high (design, 01a169e1):** approved the layered structure; key course
@@ -135,3 +250,4 @@ security 64, store 7, runtime 6, typecheck + build. Live: range tail 909–977 (
   warming is IDB-only; "512KB too short" → 1MB tail; "button not responding" → unit-mismatch fixed;
   "display by user turn" → view gate + turn-aligned ranges; "how it works with compaction" →
   COMPACT CHECK + prefix survival. All addressed in `4e079e4`..`03becb7`.
+- **2026-10-24 — author re-verification (PR 2):** at `6dfee3e` — retry 50, security 64, versions 30, zombie 11, range 13, compact 19, fork 23, store 7, runtime 6, ssrf 5, shutdown 9, edit-tool 7, typecheck + build green. The A1/A2 auto-retry regressions were caught by the internal cap test while writing this record (not by review) and folded into `b8f1aca`.
