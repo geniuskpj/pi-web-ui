@@ -146,6 +146,52 @@ security 64, store 7, runtime 6, typecheck + build. Live: range tail 909–977 (
   gzip-at-rest in IDB (adds 118ms decompress to the open path), zstd/fflate (v2 if quota binds).
 - The mobile-decode numbers are desktop-derived; real-device check rides with PL-12.
 
+
+## 7. C3 measurements (live, 2026-10-24)
+
+All numbers from a **real 9.6MB / 1056-message session** (`60dfc94f`, gen 1) on isolated scratch
+instances (fresh origins, scratch data dirs), measured from the page (`performance` resource entries +
+IndexedDB reads) rather than estimated. Grok's accept/reject thresholds (design update `01a16c29` Q7)
+are quoted where they apply.
+
+| metric | measured | threshold | verdict |
+|---|---|---|---|
+| cold open, session body over HTTP (empty IDB) | **6 `/range` requests ≈ 2193 KB** (305/396/507/533/335/117 KB) — reproduced at 2250 KB on a second instance | — | baseline |
+| **warm reopen (cache present)** | **0 requests, 0 KB** | wire bytes ↓ >80% | **pass (100%)** |
+| IDB bytes written vs session body | 2.62 MB vs 9.59 MB raw = **27%** (vs ~1.92 MB gzipped full body = 1.36×) | reject at >1.5× raw | **pass (both framings)** |
+| IDB transactions | 9 readwrite txns for a cold load (1 per chunk), ≈0.3/s during the load, **0/s idle** | <1/s | **pass** |
+| framing cost per closed window (main thread: `toNdjson` over the window's objects) | **4.9–7.9 ms** for 242–523 KB windows | — | at a boundary/idle, never mid-stream |
+| gzip cost per closed window (native `CompressionStream`) | **4.1–15.1 ms** wall for 242–523 KB, ratio 16–31% | "<3 ms per close" | **threshold unrealistic** — see note |
+
+Notes:
+
+- **The gzip threshold needs restating.** 64 messages is ~240–520 KB on these sessions; no compressor
+  gzips half a megabyte in 3 ms (that would be ~170 MB/s). The real costs are ~5–8 ms of main-thread
+  framing and 4–15 ms of off-thread `CompressionStream` work per *closed* window — i.e. once per 64
+  messages or at idle/run-end/tab-hide, never during streaming. Suggest replacing grok's threshold with
+  "main-thread framing <10 ms and gzip off the critical path", which is what is measured here.
+- **What the warm 0 KB does and does not cover.** The attach snapshot still carries the tail (~1 MB → ~276 KB
+  deflated for this session) over the WebSocket, because `/range` history is what the cache serves; the
+  measured *HTTP* session traffic is what drops to zero. Removing the tail re-transfer is exactly what C4
+  (server-side alignment / a "tail already cached" hint in the attach) would buy.
+- **Transfer policy** (the gate that decides whether a cold open warms the whole history): unit-tested in
+  `tests/idb-cache.test.mjs` T1–T7 — `saveData` ⇒ metered, 2g/3g ⇒ metered, `type: cellular` ⇒ metered,
+  wifi/4g ⇒ fast, and with no Network Information API the server's `netClass` decides (`lan` ⇒ fast, else
+  metered). A metered link therefore skips warming entirely and pays only the tail.
+- **Two defects found while measuring (out of scope for this cache work, worth their own fix):**
+  1. **A fresh origin cannot open an existing session.** Opening `?session=<existing big id>` in a
+     browser profile with no local state for that session rendered an EMPTY chat and made **zero**
+     network requests for the body (observed twice, on two fresh origins, with the bundle that otherwise
+     works). The stored transcript is not touched (the mirror stayed byte-identical), so this is a
+     load-path gap on new devices/incognito — precisely the case the IDB cache exists for.
+  2. **A hub entry created before hydration is never re-hydrated.** `agent-hub.mjs` `_ensureEntry()` opens
+     with `if (entry && entry.agent.state.messages.length > 0) return entry;` — and a freshly created
+     entry already holds one message (the materialized system prompt). So an attach that lands before the
+     body load leaves that session EMPTY for the life of the process (reproduced: attach reported
+     `messages: 1, sparse: null`; after a hub restart the same instance reported `messages: 132,
+     sparse: [924,1056]`). Candidate fix: track `entry.hydrated` explicitly (or compare against the
+     expected system-message count) instead of using `length > 0` as the proxy.
+
 ---
 
 # PR 2 — retry + mobile: the branch base (`c461dee`, `b8f1aca`, `916c0ef`, `7bdcd03`)
@@ -369,3 +415,4 @@ the transfer PR's §2 table stay out of the tree.
     cache off for the rest of the session.
   - Note for the user's own browser: the v1 → v2 upgrade discards the existing v1 chunks (~13MB observed)
     on the first load of the new bundle — by design (the cache is disposable); the warm loop refills it.
+- **2026-10-24 — measurements (C3, author):** cold/warm pair on the real 9.6MB session from a fresh origin: **cold = 6 /range requests ≈ 2193 KB, warm = 0 requests / 0 KB**, IDB written 2.62MB (27% of the raw body, 1.36x the gzipped body), 9 readwrite txns per load and 0/s idle, framing 4.9-7.9ms and gzip 4.1-15.1ms per closed 242-523KB window. Full table + threshold verdicts in §7. Two threshold corrections in the write-up: grok’s “<3ms gzip per close” is unreachable for a 64-message window (restated as main-thread framing <10ms, gzip off the critical path), and the warm 0 KB covers HTTP session traffic only — the tail still rides the WS attach (~276KB deflated), which is what C4 would address. §7 also records two defects found while measuring (fresh-origin ?session= never fetches the body; _ensureEntry’s length>0 guard leaves a pre-hydration entry empty for the process’s life) — both pre-existing, neither caused by this work, both recommended for a separate fix.

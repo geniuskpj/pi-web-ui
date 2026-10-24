@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 import {
 	intervalDiff, chunkKey, mergeRanges, pickSweepCandidates, verifyChunkText,
 	CHUNK_INTERVAL, chunkIndexOf, chunkFromSeq, chunkToSeq, isChunkAligned, planLiveChunk, toNdjson,
+	transferPolicy,
 } from "../src/idb-cache.ts";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -181,6 +182,35 @@ const disjoint = (rs) => rs.every((r, i) => i === 0 || rs[i - 1].toSeq <= r.from
 	check("L5 writes are integrity-checked, gzipped and stored under the generation",
 		/verifyChunkText\(text, fromSeq, toSeq\)/.test(proxySrc) && /gzipText\(text\)/.test(proxySrc) && /putChunk\(sessionId, fromSeq, toSeq, gen, toSeq, blob\)/.test(proxySrc));
 	check("L6 an idle debounce exists so a quiet tail still lands", /LIVE_IDLE_MS = 5000/.test(proxySrc) && /liveScheduleIdle/.test(proxySrc));
+}
+
+// ────────────────────────── transfer policy: does the cache warm at all? (T)
+// The gate that decides whether a cold open warms the whole history (fast link) or
+// only the tail (metered). navigator.connection outranks the server's netClass.
+{
+	const realNav = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+	const setNav = (conn) => {
+		try {
+			Object.defineProperty(globalThis, "navigator", { value: conn === null ? undefined : { connection: conn }, configurable: true, writable: true });
+			return true;
+		} catch { return false; }
+	};
+	const stubbed = setNav({ saveData: true });
+	if (!stubbed) {
+		console.log("  - T* skipped (cannot stub navigator in this runtime)");
+	} else {
+		const p = async (conn, netClass) => { setNav(conn); return transferPolicy(netClass); };
+		check("T1 saveData → metered", (await p({ saveData: true })) === "metered");
+		check("T2 3g/slow-2g → metered", (await p({ effectiveType: "3g" })) === "metered" && (await p({ effectiveType: "slow-2g" })) === "metered");
+		check("T3 type:cellular → metered", (await p({ type: "cellular" })) === "metered");
+		check("T4 type:wifi → fast", (await p({ type: "wifi" })) === "fast");
+		check("T5 effectiveType 4g → fast", (await p({ effectiveType: "4g" })) === "fast");
+		check("T6 no NIA: the server's netClass decides (lan=fast, else metered)",
+			(await p(null, "lan")) === "fast" && (await p(null, "wan")) === "metered" && (await p(null)) === "metered");
+		check("T7 an unknown connection object falls through to netClass", (await p({}, "lan")) === "fast" && (await p({}, "wan")) === "metered");
+		// restore
+		if (realNav) Object.defineProperty(globalThis, "navigator", realNav); else delete globalThis.navigator;
+	}
 }
 
 console.log(`\n[idb-cache] ${passed} passed, ${failed} failed`);
