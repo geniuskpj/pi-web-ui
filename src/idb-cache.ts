@@ -517,14 +517,12 @@ async function evictIfNeeded(db: IDBDatabase): Promise<void> {
 // fetched one describe the same window without negotiation (grok 01a16c29 Q1).
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Messages per aligned chunk (~550KB on the measured sessions — under the 1MB
- *  /range cap). Compiled into BOTH sides; a change invalidates nothing (keys
- *  carry the window, coverage is seq-addressed). */
-export const CHUNK_INTERVAL = 64;
-export const chunkIndexOf = (seq: number) => Math.floor(seq / CHUNK_INTERVAL);
-export const chunkFromSeq = (index: number) => index * CHUNK_INTERVAL;
-export const chunkToSeq = (index: number) => (index + 1) * CHUNK_INTERVAL; // exclusive
-export const isChunkAligned = (seq: number) => seq >= 0 && seq % CHUNK_INTERVAL === 0;
+/** The chunk boundary is defined ONCE, in lib/chunk-window.mjs, and imported by the
+ *  server too (C4): a fetched /range window and a live-written chunk must describe
+ *  the same key, or the coverage carries a seam and nothing can be reused. The
+ *  client's API is unchanged (pure re-export). */
+export { CHUNK_INTERVAL, chunkIndexOf, chunkFromSeq, chunkToSeq, isChunkAligned, alignDown, alignUp } from "../lib/chunk-window.mjs";
+import { CHUNK_INTERVAL, isChunkAligned, chunkIndexOf, chunkFromSeq, chunkToSeq } from "../lib/chunk-window.mjs";
 
 export interface LiveChunkPlan {
 	/** null = keep buffering (the run has not closed a window yet). */

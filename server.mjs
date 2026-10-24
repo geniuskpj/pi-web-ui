@@ -48,6 +48,7 @@ import { AgentHub } from "./agent-hub.mjs";
 import { createTerminalHub } from "./terminal-hub.mjs";
 import { stripBoilerplate } from "./lib/hp2.mjs";
 import { netClassOf } from "./lib/net-class.mjs";
+import { alignDown, isChunkAligned, chunkIndexOf, chunkFromSeq, chunkToSeq } from "./lib/chunk-window.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, "public");
@@ -2199,7 +2200,7 @@ function agentConn(ws) {
 					// the prefix via /range into IDB — instead of every attach shipping 2-7MB.
 					// attach() now hydrates the entry itself before snapshotting (2026-10-24) —
 					// await it so the first frame can never be an empty pre-hydration state
-					await agentHub.attach(currentSession, (msg) => safeSend(ws, msg), { tailFirst: !!m.tailFirst });
+					await agentHub.attach(currentSession, (msg) => safeSend(ws, msg), { tailFirst: !!m.tailFirst, haveTo: Number(m.haveTo) || 0 });
 					break;
 				}
 				case "prompt": {
@@ -2501,7 +2502,15 @@ app.get("/api/agent/session/:id/range", async (c) => {
 			if (range.messages[aligned - range.fromSeq]?.role === "user") break;
 		}
 		start = aligned;
-		const slice = range.messages.slice(start - range.fromSeq);
+		// C4 ALIGNMENT (2026-10-24): return WHOLE CHUNK_INTERVAL windows. The low end snaps
+		// DOWN (after the user-turn pass, so a turn is never cut) and the high end snaps UP
+		// (capped at the session end) so a stored window ENDS on a boundary and the next one
+		// starts exactly there. A fetched window and a live-written chunk then share a key —
+		// no seam, and the client's cache can serve the prefix of a later attach (see
+		// haveTo in agent-hub attach).
+		start = chunkFromSeq(chunkIndexOf(start));
+		const end = Math.min(isChunkAligned(range.toSeq) ? range.toSeq : chunkToSeq(chunkIndexOf(range.toSeq)), range.messageCount);
+		const slice = range.messages.slice(start - range.fromSeq, end - range.fromSeq);
 		const ndjson = slice.map((m) => JSON.stringify(m)).join("\n");
 		const gz = zlib.gzipSync(ndjson);
 		return c.body(gz, slice.length === 0 ? 204 : 200, {
@@ -2510,7 +2519,7 @@ app.get("/api/agent/session/:id/range", async (c) => {
 			"X-Session-Mutate-Epoch": String(range.rewriteSeq),
 			"X-Session-Message-Count": String(range.messageCount),
 			"X-Range-From-Seq": String(start),
-			"X-Range-To-Seq": String(range.toSeq),
+			"X-Range-To-Seq": String(end),
 			"X-Rewritten-From": String(range.rewrittenFrom),
 			Vary: "Accept-Encoding",
 		});

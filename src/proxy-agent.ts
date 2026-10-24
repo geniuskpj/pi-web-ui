@@ -95,9 +95,16 @@ export class ProxyAgent {
 				if (gen !== this.generation || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 				// attach carries the client's chosen model/effort so a FRESH server
 				// session runs what the UI shows (grok r3: model desync)
-				this.sendMsg({ type: "attach", sessionId: this.sessionId, modelId: this.state.model?.id, thinkingLevel: this.state.thinkingLevel, tailFirst: true });
-				const cbs = this.readyCallbacks.splice(0);
-				cbs.forEach((cb) => cb(this.attached));
+				// C4: tell the server how far our IDB cache reaches so it does not re-send
+				// those messages (the prefix is filled from the cache right after the snapshot).
+				void (async () => {
+					const sid = this.sessionId;
+					const haveTo = await this.cachedCoverTo();
+					if (gen !== this.generation || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+					this.sendMsg({ type: "attach", sessionId: sid, modelId: this.state.model?.id, thinkingLevel: this.state.thinkingLevel, tailFirst: true, haveTo });
+					const cbs = this.readyCallbacks.splice(0);
+					cbs.forEach((cb) => cb(this.attached));
+				})();
 			}, 50);
 		};
 		sock.onmessage = (e) => {
@@ -152,12 +159,19 @@ export class ProxyAgent {
 				// so write it before the window is replaced; then seed with THIS attach
 				// tail (the bytes every open would otherwise re-download).
 				this.liveFlush("hidden");
-				this.state.messages = [...(msg.messages || [])]; // DENSE tail window
-				(this.state as any).sparse = { ...sparse, filledFrom: sparse.fromSeq };
+				// C4: the server may have skipped [fromSeq, sentFrom) because we reported it
+				// cached — so the DENSE window we actually hold starts at sentFrom, and the
+				// envelope's fromSeq is where the full window would have started.
+				const sentFrom = Number((sparse as any).sentFrom ?? sparse.fromSeq);
+				this.state.messages = [...(msg.messages || [])];
+				(this.state as any).sparse = { ...sparse, filledFrom: sentFrom };
 				// v2 GC: attaching at generation N proves every older generation of this
 				// session is stale — collect those past the grace period (never a wipe).
 				void sweepStale({ sessionId: this.sessionId });
-				this.liveSeed(sparse.fromSeq, msg.messages || [], Number((sparse as any).rewriteSeq ?? 0));
+				this.liveSeed(sentFrom, msg.messages || [], Number((sparse as any).rewriteSeq ?? 0));
+				// Fill the skipped prefix: IDB first (it is why we skipped), /range on a miss
+				// (fillWindow does both, and refuses to splice across a rewrite/switch).
+				if (sentFrom > sparse.fromSeq) void this.fillWindow(sparse.fromSeq, sentFrom);
 				void this.scheduleBackfill(sparse);
 			} else {
 				this.liveFlush("hidden");
@@ -502,6 +516,16 @@ export class ProxyAgent {
 	 *  metered → manual expand only). CRITICAL (user report: "loading all of chat
 	 *  at once"): warming touches IDB ONLY — it must NEVER prepend into
 	 *  state.messages. The render stays tail-only; the expand button grows it. */
+	/** C4: how far this device's IDB cache reaches for the session (0 = nothing cached).
+	 *  Sent with the attach so the server skips re-sending it; a stale/evicted claim only
+	 *  costs one /range fetch in fillWindow, never a wrong window. */
+	private async cachedCoverTo(): Promise<number> {
+		try {
+			const ranges = await cachedRanges(this.sessionId);
+			return ranges.reduce((max, r) => Math.max(max, r.toSeq || 0), 0);
+		} catch { return 0; }
+	}
+
 	private async scheduleBackfill(sparse: { fromSeq: number; messageCount: number; rewriteSeq: number }): Promise<void> {
 		if (this.backfillRunning) return;
 		this.backfillRunning = true;

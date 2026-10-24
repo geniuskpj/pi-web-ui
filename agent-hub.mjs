@@ -7,6 +7,7 @@
 //   - every connected device (laptop/phone) is a viewer/controller via /ws/agent
 // Clients can disconnect at any time — long jobs keep running server-side.
 import { Agent } from "@earendil-works/pi-agent-core";
+import { alignDown } from "./lib/chunk-window.mjs";
 // pi-ai 1.4.0: AgentOptions.streamFn is REQUIRED — the compat subpath exports the
 // generic streamSimple dispatcher (routes on model.api) and auto-registers the
 // builtin api providers on import
@@ -333,7 +334,7 @@ export class AgentHub {
 	 *  2026-10-21: per-session entry.buffer hook — the old implementation swapped
 	 *  the GLOBAL this.broadcast, which was not reentrant when two attaches
 	 *  interleaved (one restore clobbered the other's interception). */
-	async attach(sessionId, deliver, { tailFirst = false } = {}) {
+	async attach(sessionId, deliver, { tailFirst = false, haveTo = 0 } = {}) {
 		// HYDRATE FIRST (2026-10-24): the attach used to build its snapshot from
 		// whatever entry existed — so a session whose entry was created before the
 		// transcript loaded (a raced store read, a prompt, an earlier attach) shipped
@@ -363,9 +364,24 @@ export class AgentHub {
 				from--;
 				try { bytes += JSON.stringify(msgs[from]).length; } catch { bytes += 256; }
 			}
+			// C4: snap the window start to a chunk boundary (the same helper /range uses) so a
+			// live-written chunk and this window share a key — but never snap all the way to 0,
+			// which would turn a huge-message tail into a full attach (the byte-derived start
+			// stays in that edge case, leaving at most one partial chunk at the seam).
+			const snapped = alignDown(from);
+			if (snapped > 0) from = snapped;
 			if (from > 0 && bytes > 768 * 1024) { // only worth it when the tail is meaningfully smaller
-				state.messages = msgs.slice(from);
-				state.sparse = { fromSeq: from, messageCount: count, rewriteSeq: entry.rewriteSeq || 0, rewrittenFrom: entry.rewrittenFrom || 0 };
+				// C4 "don't re-send what the client has": haveTo is the end of the client's cached
+				// coverage. The claim snaps DOWN, so the wire may carry up to 63 messages the
+				// client already has (harmless — mergeRanges replaces them) rather than forcing
+				// it to fetch a partial chunk. A claim below the window start sends everything.
+				const claim = Math.max(0, Math.min(Number(haveTo) || 0, count));
+				// A claim that REACHES the session end means the client holds the whole window,
+				// including the trailing partial chunk — send nothing at all (the ideal return
+				// visit: zero bytes). Anything less snaps down (see above).
+				const sentFrom = claim >= count ? count : Math.max(from, alignDown(claim));
+				state.messages = msgs.slice(sentFrom);
+				state.sparse = { fromSeq: from, messageCount: count, sentFrom, rewriteSeq: entry.rewriteSeq || 0, rewrittenFrom: entry.rewrittenFrom || 0 };
 			}
 		}
 		entry.buffer = null; // stop buffering BEFORE delivering (synchronous — no interleave)

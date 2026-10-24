@@ -28,9 +28,9 @@ const check = (name, cond, detail = "") => {
 const roleMsgs = (n, prefix) => Array.from({ length: n }, (_, i) => ({ role: i % 2 === 0 ? "user" : "assistant", content: `${prefix}${i}`, timestamp: 1700000000000 + i }));
 const nonSystem = (hub, id) => (hub.sessions.get(id)?.agent.state.messages || []).filter((m) => m.role !== "system");
 
-function makeHub({ stored = null, heavy = 0 } = {}) {
+function makeHub({ stored = null, heavy = 0, msgBytes = 60000 } = {}) {
 	const faux = registerFauxProvider({ api: "faux", provider: "faux", models: [{ id: "faux-1", reasoning: false, input: ["text"] }] });
-	const messages = heavy ? Array.from({ length: heavy }, (_, i) => ({ role: "user", content: "x".repeat(60000) + i })) : null;
+	const messages = heavy ? Array.from({ length: heavy }, (_, i) => ({ role: "user", content: "x".repeat(msgBytes) + i })) : null;
 	const calls = { load: 0 };
 	const hub = new AgentHub({
 		modelsStore: { faux: { name: "faux", models: [faux.getModel("faux-1")] } },
@@ -120,6 +120,49 @@ const frames = () => { const out = []; return { out, deliver: (m) => out.push(m)
 		!!state?.sparse && state.sparse.messageCount === 30 && msgs.length > 0 && msgs.length < 30 && msgs.length === state.sparse.messageCount - state.sparse.fromSeq,
 		`window=${state?.sparse ? state.sparse.fromSeq + "…" + state.sparse.messageCount : "none"} msgs=${msgs.length}`);
 	check("H5b the tail really is the LAST messages", msgs.length > 0 && String(msgs[msgs.length - 1].content).endsWith("29"));
+}
+
+// ── 6) C4: align the window + skip what the client already has (haveTo) ──────
+{
+	// 400 × ~6KB ≈ 2.4MB ⇒ a 1MB tail starts well past the first chunk, so the window
+	// start really is aligned (a tiny session would snap to 0 and stay unaligned).
+	const { hub } = makeHub({ heavy: 400, msgBytes: 6000 }); // ~2.4MB ⇒ a 1MB tail starts ~170 msgs in
+	const id = "sess-c4";
+	const frame = async (haveTo) => {
+		const { out, deliver } = frames();
+		await hub.attach(id, deliver, { tailFirst: true, haveTo });
+		return out.find((m) => m.type === "state");
+	};
+	const full = await frame(0);
+	const sp = full.sparse;
+	check("H6a the attach window starts on a chunk boundary",
+		!!sp && sp.fromSeq % 64 === 0 && sp.fromSeq > 0 && sp.sentFrom === sp.fromSeq,
+		`fromSeq=${sp?.fromSeq} sentFrom=${sp?.sentFrom} msgs=${full.messages.length}`);
+	check("H6b without a claim the whole window is sent",
+		full.messages.length === sp.messageCount - sp.fromSeq);
+
+	const claimed = sp.fromSeq + 128; // a claim below the window start + 64 snaps back to it
+	const trimmed = await frame(claimed);
+	check("H6c a claim 128 above the window start trims exactly that much (no wasted bytes)",
+		trimmed.sparse.sentFrom === claimed && trimmed.messages.length === sp.messageCount - claimed && trimmed.sparse.fromSeq === sp.fromSeq,
+		`sentFrom=${trimmed.sparse.sentFrom} msgs=${trimmed.messages.length}`);
+
+	const tiny = await frame(sp.fromSeq + 5);
+	check("H6d a sub-chunk claim snaps DOWN — the server sends it rather than forcing a fetch",
+		tiny.sparse.sentFrom === sp.fromSeq && tiny.messages.length === full.messages.length);
+
+	const all = await frame(999999);
+	check("H6e a claim that reaches the session end sends NOTHING (the zero-byte return visit)",
+		all.messages.length === 0 && all.sparse.sentFrom === sp.messageCount,
+		`sentFrom=${all.sparse.sentFrom} msgs=${all.messages.length}`);
+
+	const partial = await frame(Math.floor(sp.messageCount / 64) * 64);
+	check("H6g a claim mid-way snaps DOWN and still ships the trailing partial chunk",
+		partial.sparse.sentFrom === Math.floor(sp.messageCount / 64) * 64 && partial.messages.length === sp.messageCount - Math.floor(sp.messageCount / 64) * 64,
+		`sentFrom=${partial.sparse.sentFrom} msgs=${partial.messages.length}`);
+
+	const none = await frame(1);
+	check("H6f a claim below the window start changes nothing", none.messages.length === full.messages.length);
 }
 
 console.log(`\n[hub-hydration] ${pass} passed, ${fail} failed`);

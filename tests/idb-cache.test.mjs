@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 import {
 	intervalDiff, chunkKey, mergeRanges, pickSweepCandidates, verifyChunkText,
 	CHUNK_INTERVAL, chunkIndexOf, chunkFromSeq, chunkToSeq, isChunkAligned, planLiveChunk, toNdjson,
-	transferPolicy, breakerOpenAt,
+	transferPolicy, breakerOpenAt, alignDown, alignUp,
 } from "../src/idb-cache.ts";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -176,7 +176,7 @@ const disjoint = (rs) => rs.every((r, i) => i === 0 || rs[i - 1].toSeq <= r.from
 	check("L2 the run end, tab hide and page hide flush the open tail",
 		/this\.liveFlush\("agent_end"\)/.test(proxySrc) && /this\.liveFlush\("hidden"\)/.test(proxySrc) && /addEventListener\("pagehide"/.test(proxySrc));
 	check("L3 the attach window is seeded (that is the 1MB every open used to re-download)",
-		/this\.liveSeed\(sparse\.fromSeq, msg\.messages \|\| \[\], Number\(\(sparse as any\)\.rewriteSeq/.test(proxySrc));
+		/this\.liveSeed\(sentFrom, msg\.messages \|\| \[\], Number\(\(sparse as any\)\.rewriteSeq/.test(proxySrc));
 	check("L4 the buffer is keyed by the attach generation and a new one starts a new buffer",
 		/this\.liveGen !== gen\) \{ this\.liveBuf = \{ fromSeq: seq, messages: \[\] \}; this\.liveGen = gen; \}/.test(proxySrc));
 	check("L5 writes are integrity-checked, gzipped and stored under the generation",
@@ -261,6 +261,32 @@ const disjoint = (rs) => rs.every((r, i) => i === 0 || rs[i - 1].toSeq <= r.from
 		if (holes.some((h) => ranges.some((r) => h.fromSeq < r.toSeq && r.fromSeq < h.toSeq))) failure = `seed ${seed}: a hole overlaps a claimed range`;
 	}
 	check("P8 random overlapping puts stay disjoint, blob-backed and duplicate-free", !failure, failure || "40 seeds × 12 puts");
+}
+
+// ─────────────── C4: the shared boundary + the attach hint wiring (A, C)
+{
+	check("A1 alignDown never cuts what was requested", alignDown(0) === 0 && alignDown(63) === 0 && alignDown(64) === 64 && alignDown(700) === 640);
+	check("A2 alignUp always reaches the next boundary", alignUp(0) === 0 && alignUp(63) === 64 && alignUp(64) === 64 && alignUp(700) === 704);
+	check("A3 both ends round-trip on a boundary", isChunkAligned(alignDown(1234)) && isChunkAligned(alignUp(1234)));
+
+	const cacheSrc = fs.readFileSync(path.join(ROOT, "src/idb-cache.ts"), "utf8");
+	const serverSrc = fs.readFileSync(path.join(ROOT, "server.mjs"), "utf8");
+	const hubSrc = fs.readFileSync(path.join(ROOT, "agent-hub.mjs"), "utf8");
+	const proxySrc = fs.readFileSync(path.join(ROOT, "src/proxy-agent.ts"), "utf8");
+	check("A4 the boundary is defined ONCE (client re-exports lib/chunk-window.mjs)",
+		/export \{ CHUNK_INTERVAL,[^}]*\} from "\.\.\/lib\/chunk-window\.mjs"/.test(cacheSrc) && !/^export const CHUNK_INTERVAL = 64;/m.test(cacheSrc));
+	check("A5 the server and hub import the same helper (no drift possible)",
+		/from "\.\/lib\/chunk-window\.mjs"/.test(serverSrc) && /from "\.\/lib\/chunk-window\.mjs"/.test(hubSrc) &&
+		/start = chunkFromSeq\(chunkIndexOf\(start\)\)/.test(serverSrc) && /const snapped = alignDown\(from\)/.test(hubSrc));
+	check("C1 the client reports its cached reach with the attach",
+		/private async cachedCoverTo\(\)/.test(proxySrc) && /tailFirst: true, haveTo \}/.test(proxySrc) && /cachedRanges\(this\.sessionId\)/.test(proxySrc));
+	check("C2 the client treats the sent window start as its dense-window start and fills the prefix",
+		/const sentFrom = Number\(\(sparse as any\)\.sentFrom \?\? sparse\.fromSeq\)/.test(proxySrc) &&
+		/filledFrom: sentFrom/.test(proxySrc) &&
+		/if \(sentFrom > sparse\.fromSeq\) void this\.fillWindow\(sparse\.fromSeq, sentFrom\)/.test(proxySrc));
+	check("C3 the server passes the hint and the hub trims the low end",
+		/haveTo: Number\(m\.haveTo\) \|\| 0/.test(serverSrc) && /const sentFrom = claim >= count \? count : Math\.max\(from, alignDown\(claim\)\)/.test(hubSrc) &&
+		/state\.sparse = \{ fromSeq: from, messageCount: count, sentFrom/.test(hubSrc));
 }
 
 console.log(`\n[idb-cache] ${passed} passed, ${failed} failed`);
