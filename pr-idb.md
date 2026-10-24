@@ -122,7 +122,8 @@ are the recorded v2 options; brotli wasm (150KB–1.8MB) rejected — wire brotl
    verified the generation → pre-compaction content could render. Fixed: epoch check on all three
    paths (read/warm/network). Compaction preserves the prefix below its span start.
 9. **LOW** — 204 handling (no splice, no filledFrom advance), expand button failure toast,
-   single-txn LRU eviction, per-chunk bytes in meta (no LRU inflation), IPv6-ULA nit left open.
+   single-txn LRU eviction, per-chunk bytes in meta (no LRU inflation) — all verified in code;
+   the IPv6-ULA `netClass` nit was **FIXED 2026-10-24** (`lib/net-class.mjs`, see the audit entry).
 
 ## 5. Tests
 
@@ -139,7 +140,9 @@ security 64, store 7, runtime 6, typecheck + build. Live: range tail 909–977 (
   backfill loop instead of being carried over. Prefix survival (the server's `X-Rewritten-From` hint) is
   deliberately deferred — it needs the surviving chunks copied into the new generation, and a rewrite is
   rare next to the cost of getting identity wrong.
-- IDB unavailable (private mode / disabled) → circuit opens → today's fetch-every-time behavior.
+- IDB unavailable (private mode / disabled) → circuit opens → fetch-every-time behavior. The
+  breaker now EXPIRES after 30s (and a success closes it early) instead of lasting the page load —
+  a transient stall (slow disk, heavy work in another tab) costs one 30s window, not the session.
 - No list virtualization: a fully-expanded 7.3MB session renders all nodes (the sparse display
   gate mitigates; full virtualization is a separate UI project).
 - Deferred by measurement: brotli on ranges (chunking penalty), CBOR/MessagePack (<5-10% post-gzip),
@@ -309,6 +312,39 @@ the transfer PR's §2 table stay out of the tree.
 
 ## Review log
 
+### 2026-10-24 — audit: EVERY review item checked against the code (author)
+
+Asked to check every item in this file, not the handful I had grepped. Dispositions, with the invariant
+each one rests on today:
+
+| # | item (source) | status |
+|---|---|---|
+| 1 | /range clamp keeps the HIGH end (grok #1) | **in code** — `server.mjs` range handler + `range` suite (13) |
+| 2 | `withTimeout` counts only timeouts/MISS as failures (grok #2) | **in code** — `MISS` sentinel + `timedOut` flag in `idb-cache.ts` |
+| 3 | `editCommit` translates by `filledFrom` (grok #3) | **in code** — `chat.tsx` reads `sparse.filledFrom` |
+| 4 | `getCachedChunks` hole-check + ghost-range guard (grok #4) | **in code** — `intervalDiff` + `rec.toSeq !== r.toSeq` bail |
+| 5 | 1:1 ranges, single-txn put, byte accounting (grok #5) | **in code** — `mergeRanges` + one readwrite txn |
+| 6 | rewrite identity honoured on read/warm/network (grok #6, COMPACT CHECK #8) | **in code** — `expectRewriteSeq` on read, epoch guard in `fillWindow`, generation-keyed writes (C1) |
+| 7 | expand/warm races: single-flight, session pinned (grok #7) | **in code** — `backfillRunning`/`expandRunning` + `sessionIdAtStart` |
+| 8 | 204 handling, expand toast, single-txn LRU, per-chunk bytes (grok #9) | **in code** — 204 returns without splicing, eviction is one txn, `bytes` per range |
+| 9 | **IPv6-ULA `netClass` nit** (grok #9 residual) | **FIXED today** — was `host.split(":")[0]` with no IPv6 ranges (every IPv6 host, loopback included, reported "remote"); now `lib/net-class.mjs`, pure and unit-tested |
+| 10 | **overlapping coverage untested** (growing-session review) | **FIXED today** — `mergeRanges` semantics + idb-cache **P8** (40 random overlap bursts) |
+| 11 | **breaker never recovers** (live-verification caveat) | **FIXED today** — 30s expiry, success closes it, `breakerOpenAt` unit-tested |
+| 12 | live tail never cached (growing-session review) | **FIXED earlier in C2** — attach tail seeded + live write-through; measured live: warm reopen 0 HTTP bytes |
+| 13 | v1→v2 upgrade discards a browser's v1 cache | **by design** (disposable cache; the warm loop refills) |
+| 14 | two tabs: last-writer-wins per key, metas self-heal | **by design** (closed windows are the same NDJSON; the on-read integrity check catches anything malformed) |
+| 15 | a rewrite starts an EMPTY generation (prefix survival via `X-Rewritten-From`) | **deferred** (needs surviving chunks copied into the new generation; rewrites are rare) |
+| 16 | no list virtualization for a fully expanded 7.3MB session | **deferred** (separate UI project; the sparse gate mitigates) |
+| 17 | brotli on ranges / CBOR / gzip-at-rest / zstd | **deferred by measurement** (§2/§6) |
+| 18 | mobile-decode numbers are desktop-derived | **open — needs a real device** (rides with PL-12; not closable from here) |
+| 19 | C4: server-side `/range` alignment + "don't re-send a cached tail" | **deferred/optional** — buys ~276KB/open and removes the seam; nothing needs it for correctness |
+| 20 | PR 2: auto-retry A1 (disable cancels timers) / A2 (fire-time re-check, synchronous attempt commit) | **fixed in `b8f1aca`**; PR 2's suites cover it |
+
+Rebased onto the new main (auth merged) before this audit and re-verified there with the branch's own
+deps (`npm ci`, pi-ai 1.4.0): `idb-cache` 58, `security-gates` 69, `retry` 50, `range` 13,
+`hub-hydration` 12, `atomic-write` 26, `zombie` 11, `store` 7, `runtime` 6, `ssrf` 5, `versions` 30,
+`compact` 19, `fork` 23, `shutdown` 9, `edit-tool` 7, `fetch` 9, `term-smoke` 12 + typecheck + build.
+
 - **2026-10-24 — grok-4.6-high (design, 01a169e1):** approved the layered structure; key course
   corrections: IDB as a disposable cache (not "localStorage but bigger"), tail as a seq-addressed
   dense window (not a sliced view), wire gzip first / gzip-at-rest deferred, CBOR rejected.
@@ -373,12 +409,16 @@ the transfer PR's §2 table stay out of the tree.
     mobile. Cheap follow-up *if it ever matters*: write the attach tail through to IDB (server sends the tail as
     gzip, or the client re-serializes + gzips ≈30ms/1MB) validated by `rewriteSeq`. Not done on purpose —
     freshness won.
-  - **Open — overlapping coverage needs a test before it needs a fix.** A warmed hole is `[700,780)`, while the
+  - **FIXED (test added, audit entry) — overlapping coverage.** A warmed hole is `[700,780)`, while the
     next attach tail may begin INSIDE an already-cached chunk (the start is server-chosen alignment). `putChunk`'s
     coverage update (`keep` + sorted disjoint ranges, `idb-cache.ts` ~202–207) has no explicit overlap case:
     verify it splits rather than persisting two overlapping/adjacent ranges, and that `getCachedChunks` can never
     yield the same message twice after a prepend. Suggested: a case in `tests/range.test.mjs` (or a new
     `tests/idb-coverage.test.mjs`) — "overlapping put → coverage stays disjoint, messages deduplicated".
+    **DONE:** `mergeRanges()` gives overlap explicit semantics (the new window replaces the older range and
+    the replaced chunk is deleted in the same txn) and `tests/idb-cache.test.mjs` **P8** runs 40 random
+    overlap bursts asserting the coverage stays pairwise disjoint, every range still has a blob behind it,
+    and a read over the final coverage can never hand out the same message twice.
   - **Confirmed correct by reading it:** `intervalDiff(0, filledFrom, covered)` with oldest-hole-first warming
     means warm history is never re-fetched; a metered link skips warming entirely (policy gate at :395–397);
     a stale epoch drops the cache and refuses to splice (`fillWindow`, grok #6).
@@ -410,9 +450,9 @@ the transfer PR's §2 table stay out of the tree.
   - **Instrumentation caveat (worth a test, not a bug report):** two heavy `getAll()` probes I ran from the
     debugger appeared to starve the page's own IDB ops (the module times every op out at 2s and trips a
     3-failure circuit breaker that lasts until the next page load) — one tab stopped writing while a
-    pristine tab wrote normally. Follow-up worth considering: let `degraded` recover after a backoff, or
-    exempt live write-through from the breaker, so a slow disk / a second tab cannot silently switch the
-    cache off for the rest of the session.
+    pristine tab wrote normally. **FIXED (audit entry):** the breaker now carries an expiry —
+    `degradedUntil = now + 30s` on the third failure and `0` again on any success — so a slow disk / a
+    second tab cannot silently switch the cache off for the rest of the session.
   - Note for the user's own browser: the v1 → v2 upgrade discards the existing v1 chunks (~13MB observed)
     on the first load of the new bundle — by design (the cache is disposable); the warm loop refills it.
 - **2026-10-24 — fix (hydration; the defect that faked a measurement, author):** `agent-hub.mjs` no
