@@ -408,9 +408,8 @@ function isProjectTrusted(projectDir, agentDir) {
 }
 // Effective system prompt for the SERVER-SIDE agent. Precedence lives in ONE place
 // (lib/system-prompt.mjs) so the hub and /api/pi/system cannot drift:
-//   WEB_SYSTEM.md > trusted project .pi/SYSTEM.md > global SYSTEM.md, then
-//   .pi/APPEND_SYSTEM.md (the operator's standing instructions — pi's filename, honored
-//   here too) is appended.
+//   WEB_SYSTEM.md > trusted project .pi/SYSTEM.md > global SYSTEM.md.
+//   APPEND_SYSTEM.md is NOT read (pi's file; the web prompt is self-contained).
 // When NO prompt file exists the resolver returns a BUILT-IN prompt composed in code
 // (pi-style sections: preamble/tools/rules/cwd) instead of undefined: pi-agent-core has
 // no built-in preamble and the hub only passes a systemPrompt when it is truthy, so the
@@ -463,8 +462,8 @@ app.get("/api/pi/system", (c) => {
 		systemFileMeta(path.join(agentDir, "WEB_SYSTEM.md"), "web", "WEB_SYSTEM.md"),
 		systemFileMeta(path.join(projectDir, ".pi", "SYSTEM.md"), "project", "SYSTEM.md"),
 		systemFileMeta(path.join(agentDir, "SYSTEM.md"), "global", "SYSTEM.md"),
-		systemFileMeta(path.join(projectDir, ".pi", "APPEND_SYSTEM.md"), "project", "APPEND_SYSTEM.md"),
-		systemFileMeta(path.join(agentDir, "APPEND_SYSTEM.md"), "global", "APPEND_SYSTEM.md"),
+		// NOTE: APPEND_SYSTEM.md is pi's file and is NOT read by the web path (2026-10-25)
+		// — the web prompt is WEB_SYSTEM.md alone, so it is not listed here either.
 	];
 	const pick = (name) => files.find((f) => f.name === name && f.scope === "project" && f.exists && trusted) || files.find((f) => f.name === name && f.scope === "global" && f.exists) || null;
 	// base precedence: WEB_SYSTEM.md (web-UI-only filename — the TUI never reads
@@ -473,7 +472,6 @@ app.get("/api/pi/system", (c) => {
 	// web file: it is the web UI's own config, not a repo-supplied resource.
 	const webBase = files.find((f) => f.name === "WEB_SYSTEM.md" && f.exists) || null;
 	const base = webBase || pick("SYSTEM.md");
-	const append = pick("APPEND_SYSTEM.md");
 	// the ACTUAL text the server-side agent gets — resolved through the same module the
 	// hub uses, so "effective" here is not a re-implementation that can drift. When no
 	// file exists this is a code-composed prompt, reported as source "builtin" (the old
@@ -482,8 +480,12 @@ app.get("/api/pi/system", (c) => {
 		agentDir,
 		workspaceDir: projectDir,
 		trusted,
+		// separator-tolerant: the lib joins with "/" (it is runtime-agnostic), path.join
+		// produced "\" — an exact string compare silently missed and reported the BUILT-IN
+		// prompt while naming the file as the winner (caught by the live check 2026-10-25).
 		read: (p) => {
-			const m = files.find((f) => f.path === p && f.exists);
+			const norm = (x) => String(x).replace(/[\\/]+/g, "/");
+			const m = files.find((f) => norm(f.path) === norm(p) && f.exists);
 			return m ? m.content : undefined;
 		},
 		docsPath: (() => {
@@ -494,7 +496,7 @@ app.get("/api/pi/system", (c) => {
 		})(),
 	});
 	// server computes precedence so the client can't drift from pick() (sonnet review)
-	for (const f of files) f.wins = f === base || f === append;
+	for (const f of files) f.wins = f === base;
 	// NOTE: projectDir = PI_WS env || parent of agentDir — assumes .pi is a direct
 	// child of the workspace root. Git worktrees with a non-standard .pi location
 	// would need PI_WS set explicitly (same caveat @agegr's UI handles via its
@@ -505,9 +507,12 @@ app.get("/api/pi/system", (c) => {
 		agentDir, projectDir, needsTrust, trusted,
 		effective: {
 			base: base ? base.path : "built-in web default (composed in code)",
-			append: append ? append.path : null,
 			source: resolved.source,
 			chars: resolved.text.length,
+			// the ACTUAL prompt text (any size: these are prompt files, capped at 1MB) so
+			// the client uses the server's resolution verbatim instead of re-implementing
+			// the precedence — the in-browser agent and the dialog both read this.
+			text: resolved.text,
 		},
 		files,
 	}, 200, { "Cache-Control": "no-cache" });

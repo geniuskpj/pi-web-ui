@@ -151,8 +151,9 @@ refresh, `?session=` restore.
   real gate).
 - **Filesystem**: all fs paths (tools + picker) go through `assertInsideRoots()` (realpath walk, roots =
   workspace + agent dir). Dotfiles hidden/403 in the picker, with an allowlist for the three system
-  prompt files (`.pi/WEB_SYSTEM.md`, `.pi/SYSTEM.md`, `.pi/APPEND_SYSTEM.md` — resolved by
-`lib/system-prompt.mjs`, which COMPOSES a built-in prompt when none exist); `.pi/auth.json` etc. stay
+  prompt files (`.pi/WEB_SYSTEM.md` — the self-contained WEB prompt — and `.pi/SYSTEM.md`; resolved by
+`lib/system-prompt.mjs`, which COMPOSES a built-in prompt when none exist; `.pi/APPEND_SYSTEM.md` is
+pi's file and is not read here); `.pi/auth.json` etc. stay
   blocked. Tool execution is audited via `/api/debug/state` (keep last 50, EXPOSE last 20; that route
   has the same Host-derived Origin check as the proxy).
 

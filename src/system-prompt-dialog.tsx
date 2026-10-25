@@ -1,7 +1,8 @@
 // SystemPromptDialog — shows the effective pi system prompt resolved by the server
-// (/api/pi/system) exactly like pi's resource-loader does it: trusted project
-// .pi/SYSTEM.md wins over agentDir SYSTEM.md (per-name, not combined);
-// SYSTEM.md replaces pi's default prompt, APPEND_SYSTEM.md appends to it.
+// (/api/pi/system): trusted project .pi/SYSTEM.md wins over agentDir SYSTEM.md
+// (per-name, not combined), and .pi/WEB_SYSTEM.md wins over both for the WEB agent.
+// APPEND_SYSTEM.md is pi's file and is NOT read by the web path (2026-10-25); when no
+// prompt file exists the server composes a built-in prompt (effective.source=builtin).
 // Render <SystemPromptDialog /> once; open via showSystemPrompt() (window event,
 // same pattern as pi-toast).
 import { useState, useEffect } from "preact/hooks";
@@ -42,28 +43,28 @@ export function SystemPromptDialog() {
 					{info.needsTrust ? (info.trusted ? "trusted ✓" : "UNTRUSTED — project .pi files ignored") : "no trust-gated .pi resources"}
 					<br />
 					Effective: <code>{info.effective.base}</code>
-					{info.effective.append ? <> + <code>{info.effective.append}</code></> : null}
-					{info.effective.base === "pi default" && !info.effective.append ? " (pi built-in prompt, no overrides)" : null}
+					{info.effective.source === "builtin" ? " (built-in web prompt composed in code — no prompt file found)" : null}
+					{typeof info.effective.chars === "number" ? ` ${info.effective.chars} chars` : null}
 				</div>
 				{info.files.filter((f: any) => f.exists).map((f: any) => (
 					<div key={f.path} style={{ marginBottom: 14 }}>
 						<div style={{ fontSize: 12, marginBottom: 4, wordBreak: "break-all" }}>
 							{badge(f.name, "#2a4a2a", "#8f8")}
 							{badge(f.scope, "#333", "#ccc")}
-							{(f.wins || info.effective.base === f.path || info.effective.append === f.path) && badge("active", "#2a4a6a", "#8cf")}
+							{(f.wins || info.effective.base === f.path) && badge("active", "#2a4a6a", "#8cf")}
 							<span style={{ color: "#888" }}>{new Date(f.mtimeMs).toLocaleString()} · {f.size} B · {f.path}</span>
 						</div>
 						<pre style={{ background: "rgba(127,127,127,.08)", border: "1px solid rgba(127,127,127,.25)", borderRadius: 8, padding: 10, fontSize: 12, whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 320, overflow: "auto", margin: 0 }}>{f.content}</pre>
 					</div>
 				))}
 				{info.files.every((f: any) => !f.exists) && (
-					<div style={{ color: "#888", fontSize: 13 }}>No SYSTEM.md / APPEND_SYSTEM.md found — pi is using its built-in default prompt.</div>
+					<div style={{ color: "#888", fontSize: 13 }}>No prompt file found — the server composes a built-in web prompt (preamble/tools/rules/cwd).</div>
 				)}
 				<div style={{ fontSize: 11, color: "#777", marginTop: 8 }}>
-					Trusted project files override global ones (same name only). SYSTEM.md replaces pi's default prompt; APPEND_SYSTEM.md appends to it.
+					Trusted project files override global ones (same name only). For the WEB agent, .pi/WEB_SYSTEM.md wins and is the WHOLE prompt — APPEND_SYSTEM.md is pi's file and is not read here.
 				</div>
 				<div style={{ fontSize: 11, color: "#888", marginTop: 6, borderTop: "1px solid rgba(127,127,127,.2)", paddingTop: 6 }}>
-					This web chat's agent runs with {info.effective.base === "pi default" ? "its built-in chat default" : "SYSTEM.md as its base prompt"}{info.effective.append ? " + APPEND_SYSTEM.md" : ""} — the same files as the pi TUI. Its tools are browser-only (JS REPL); coding tools (bash/read/edit) exist only in the pi TUI or a server-side agent.
+					This web chat's agent runs with {info.effective.source === "builtin" ? "a built-in prompt composed by the server" : "the prompt file above"} (server-side agents use the same resolution). Its tools are browser-only (JS REPL); coding tools (bash/read/edit) exist only in the pi TUI or a server-side agent.
 				</div>
 			</div>
 		</div>

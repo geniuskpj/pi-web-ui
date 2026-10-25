@@ -189,7 +189,9 @@ Requirements & limits:
 - **System prompt**: resolved by `lib/system-prompt.mjs` (one definition for the hub and
   `/api/pi/system`): a prompt FILE when one exists, otherwise a built-in prompt composed in code
   (pi-style `<preamble>/<tools>/<rules>/<cwd>` sections) — see `docs/server.md`.
-- **System prompt files**: `.pi/WEB_SYSTEM.md` is the ACTIVE system prompt for the WEB agent — a
+- **System prompt files**: `.pi/WEB_SYSTEM.md` is the ACTIVE system prompt for the WEB agent — ONE
+  self-contained file (the operator's standing instructions were merged into it; `.pi/APPEND_SYSTEM.md`
+  is pi's file and is not read by the web path) — a
   filename pi's TUI/CLI never reads (prompt discovery matches exactly `SYSTEM.md` /
   `APPEND_SYSTEM.md`; research-confirmed via sonnet-5-search), so the web prompt cannot leak
   into the TUI. It is pi-default revised for the web UI (tool set incl. the explicit `edit`

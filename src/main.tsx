@@ -218,9 +218,10 @@ const createServerAgent = async (sessionId: string, initialModel?: any) => {
 // ============================================================================
 // AGENT CREATION
 // ============================================================================
-// effective system prompt for the WEB agent only: .pi/WEB_SYSTEM.md (a filename
-// pi's TUI never reads) replaces the chat default, APPEND_SYSTEM.md appends —
-// resolved by /api/pi/system, cached at boot
+// Effective system prompt for the WEB agent: .pi/WEB_SYSTEM.md (a filename pi's TUI
+// never reads), or a built-in composed prompt when no file exists. The SERVER resolves
+// it (/api/pi/system → effective.text) so the in-browser agent cannot drift from the
+// server-side one; APPEND_SYSTEM.md is not part of the web prompt (2026-10-25).
 let piSystemPrompt: string | undefined;
 let piServerTools: any[] = [];
 const resolvePiSystemPrompt = async (): Promise<string | undefined> => {
@@ -228,12 +229,10 @@ const resolvePiSystemPrompt = async (): Promise<string | undefined> => {
 		const r = await fetch("/api/pi/system", { signal: AbortSignal.timeout(8000) });
 		if (!r.ok) return undefined;
 		const j: any = await r.json();
-		// base precedence (server-computed wins flags): WEB_SYSTEM.md (web-UI-only,
-		// TUI-invisible filename) > SYSTEM.md. APPEND_SYSTEM.md appends after.
-		const base = j.files?.find((f: any) => f.wins && f.name === "WEB_SYSTEM.md") || j.files?.find((f: any) => f.wins && f.name === "SYSTEM.md");
-		const append = j.files?.find((f: any) => f.wins && f.name === "APPEND_SYSTEM.md");
-		const parts = [base?.content ?? "You are a helpful AI assistant.", append?.content].filter(Boolean);
-		return parts.length > 0 ? parts.join("\n\n") : undefined; // neither file → chat default stays
+		// the SERVER's resolution, verbatim (file or built-in) — no client-side precedence
+		// logic to drift from the hub's (the old code re-derived base+append here).
+		const text = j.effective?.text;
+		return typeof text === "string" && text.length > 0 ? text : undefined; // nothing → pi's chat default
 	} catch { return undefined; } // offline → default prompt
 };
 
@@ -797,9 +796,10 @@ async function init() {
 		const bootModel = lastModelFromLocal() || defaultModelFromCache();
 		await createServerAgent(params.get("session") || makeId(), bootModel);
 	} else {
-		// resolve local pi's SYSTEM.md / APPEND_SYSTEM.md (bugs: the web agent must
-		// SHARE the local pi's system prompt, not just display it) — resolved once
-		// before any createAgent() call (boot, ?session= restore, dialog click)
+		// resolve the web system prompt from the server (WEB_SYSTEM.md, or the built-in
+		// the server composes when no file exists — bugs: the web agent must SHARE the
+		// resolved prompt, not just display it) — resolved once before any createAgent()
+		// call (boot, ?session= restore, dialog click)
 		piSystemPrompt = await resolvePiSystemPrompt();
 		(window as any).__piSystemPrompt = piSystemPrompt; // debuggable from the console
 		piServerTools = await fetchPiServerTools(); // pi extensions + workspace tools (sync for toolsFactory)

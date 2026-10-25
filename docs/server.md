@@ -91,9 +91,11 @@ extensions/skills/prompts/themes/SYSTEM.md/APPEND_SYSTEM.md present) gates proje
 `isProjectTrusted()` walks UP from the project dir through `.pi/trust.json` entries (fail-closed on
 unreadable). Precedence lives in ONE place — `lib/system-prompt.mjs`, used by both the hub and
 `/api/pi/system` — so the two cannot drift: `WEB_SYSTEM.md` (agent dir; web-UI-only filename, no trust
-gate) > project `.pi/SYSTEM.md` (trusted) > global `agentDir/SYSTEM.md`. `APPEND_SYSTEM.md` is PI'S
-filename, not a web-UI concept, but the web path appends it too: it is where the operator's standing
-instructions live (tool notes, permission rules, path conventions) and the web agent needs them.
+gate) > project `.pi/SYSTEM.md` (trusted) > global `agentDir/SYSTEM.md`. **`APPEND_SYSTEM.md` is NOT
+read by the web path** (2026-10-25): it is pi's file, the two paths should not overlap, and the
+operator's standing instructions were merged into `.pi/WEB_SYSTEM.md` so the web prompt is one
+self-contained file. `/api/pi/system` therefore lists only the prompt-file candidates above, and
+`effective.text` carries the resolved prompt verbatim (the client uses it instead of re-deriving).
 **When no prompt file exists at all** the resolver returns a prompt COMPOSED IN CODE (pi-style tagged
 sections: `preamble`/`tools`/`rules`/`docs`/`cwd`) instead of `undefined` — before 2026-10-25 a
 deployment with a missing `pi_dir` ran the agent with no system prompt at all (pi-agent-core has no
