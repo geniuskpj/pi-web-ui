@@ -526,3 +526,12 @@ NOTHING in the UI said why.
 **Lesson:** an integrity check ("this is a plausible binary") is not a capability check ("this binary
 can do the job I am about to give it"). Prove the capability by RUNNING it with the real collaborator,
 and surface the reason when it fails — a silent downgrade reads as "the feature is gone".
+
+**Resolution (2026-10-25):** the msys route stayed broken on that machine, and the fix came from a
+SECOND bridge kind rather than a repair: **Windows ConPTY** (`conhost.exe --headless`) gives the shell a
+real console with no download and no native module, and the hub now probes it after `script.exe` (it
+prefers whichever PROVES it can give the shell a tty). Verified end to end: nano renders through the
+dock. The environment itself turned out to be a resource leak, not a descriptor limit: 16.8M kernel
+event objects, 293 days of uptime, and 130 leaked `bash`+`conhost` pairs from servers that were killed
+hard (which skips the hub's reap). Corollary worth remembering: **killing a server leaves its terminal
+shells and consoles alive** — reap them (or shut down gracefully), or the next pty allocation may fail.

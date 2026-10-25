@@ -114,7 +114,7 @@ Workspace file attach + image paste are BACK (plan.md §12–14) — see the exp
 | `PI_WEB_EXIT_ON_STDIN_CLOSE` | off | run the full graceful-shutdown sequence when the parent closes the server's stdin pipe (pipe-friendly Ctrl+C equivalent; used by tests — on Windows a cross-process `kill(SIGINT)` TerminateProcesses without running handlers) |
 | `PI_WEB_WS_DEFLATE` | on | `off` disables permessage-deflate on the agent/sync WebSockets (state frames are the multi-MB path — leave on unless profiling) |
 | `PI_WEB_TERM_COLS` / `PI_WEB_TERM_LINES` | `110` / `32` | terminal grid size (stty in the pty tier, COLUMNS/LINES env in the pipe tier) |
-| `PI_WEB_TERM_BRIDGE` | auto | `0`/`pipes` forces the pipe tier; a path uses that exe as an msys-pty-bridge; unset → auto-provision msys2 `util-linux` `script.exe` into `data/bin/script/` (sha256-pinned `util-linux-2.40.2-2` package from repo.msys2.org, 8MB size cap, extracts a 63KB exe — once). The bridge is then **proven by running it** with the shell it will drive (that shell must get `isatty(stdin)==true`); a bridge that cannot allocate a pty is refused, and the reason appears in the dock instead of a silent downgrade |
+| `PI_WEB_TERM_BRIDGE` | auto | `conhost` forces Windows ConPTY; `0`/`pipes` forces the pipe tier; a path uses that exe as an msys-pty-bridge; unset → auto-provision msys2 `util-linux` `script.exe` into `data/bin/script/` (sha256-pinned `util-linux-2.40.2-2` package from repo.msys2.org, 8MB size cap, extracts a 63KB exe — once). The bridge is then **proven by running it** with the shell it will drive (that shell must get `isatty(stdin)==true`); a bridge that cannot allocate a pty is refused, and the reason appears in the dock instead of a silent downgrade |
 | `PI_WEB_TERM_ORIGIN` | auto | extra `host[:port]` **names for the global Host/Origin allowlist** — every `/api/*` route and all three WS endpoints (`/ws/sync`, `/ws/agent`, `/ws/terminal`), not just the terminal. Comma-separated, scheme stripped. Matching is EXACT on `host:port`: a missing Origin port means the scheme default (http→80, https→443) and a portless Host is tried as the app port plus 80/443 — so a TLS reverse proxy needs its public form spelled out (`PI_WEB_TERM_ORIGIN=name:443`). Localhost, `os.hostname()` and every interface IP are always allowed |
 | `PI_WEB_ORIGIN_GATE` | `auto` | how strictly the DNS-rebinding Host/Origin allowlist applies: `auto` = **loopback peers only** (a remote peer must present the API token — that is what lets the UI work on any domain/DDNS name with no config), `strict` = every peer (pre-2026-10-23 behaviour, only allowlisted names pass), `off` = no host check at all (**foot-gun**, warns at boot: a rebinding page can read `/api/sessions` with no token) |
 | `PROXY_IDLE_MS` | `150000` | LLM proxy stall timeout |
@@ -240,7 +240,11 @@ network. Full analysis: `pr-idb.md`.
     bridge's own error — and runs the pipe tier. `node tests/term-pty.test.mjs` reports the same
     diagnosis headlessly (`PI_REQUIRE_PTY=1` makes a working pty a hard requirement); the fix is a
     repaired/reinstalled Git for Windows, or `PI_WEB_TERM_BRIDGE` pointing at a `script.exe` built
-    for that runtime.
+    for that runtime. **When the msys pty route is unavailable the hub falls back to Windows' own
+    ConPTY server** (`conhost.exe --headless`: a real console for the shell, forwarded as VT over the
+    hub's pipes — no download, no native module). Verified end to end: `isatty(stdin)=true`,
+    `stty size` answers, OSC 133/7 still arrive, and **nano renders**. The dock names the bridge in
+    use (`bash — pty (conhost)` / `bash — pty (msys)`).
   - tier `pty` (default, auto-provisioned): **msys2 `script.exe`** allocates a REAL msys pty
     and bridges our stdio — bash gets `/dev/ptyN`, so interactive TUIs work: `nano`/`vim` pass
     the isatty check (the old "standard input is not a terminal" is fixed — verified with a

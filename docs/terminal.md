@@ -23,12 +23,29 @@ Covers `terminal-hub.mjs` (server), `src/ui/terminal.tsx` (client dock), `src/ui
 - Auto-fallback: the pty bridge dying non-zero within 4s of spawn (`PTY_FALLBACK_MS`) downgrades that
   session to pipes once (`fallbackTried`); a pipes-started session may upgrade to pty on later respawns.
 
-## Bridge CAPABILITY (`bridgeProbe` / `pickBridge`)
+## Bridge kinds: `script` (msys pty) and `conhost` (Windows ConPTY)
+
+`pickBridge` proves candidates in order and returns the FIRST that works, with its kind:
+
+1. **`script`** — msys2 util-linux `script.exe`, which allocates a real msys pty. Preferred when
+   the msys runtime can allocate one, because it is a true msys tty (job control, WINCH resize).
+2. **`conhost`** — `conhost.exe --headless <bash> --noprofile [--rcfile rc] -i`: Windows' ConPTY
+   server gives the shell a real CONSOLE (so `isatty(stdin)` is true, `stty size` answers, nano/vim
+   render, OSC 133/7 pass through) while the hub keeps plain pipes for stdio. No download, no native
+   module, no console needed in the server process. Added 2026-10-25 after a machine whose msys
+   runtime could not allocate a pty *at all* (`/dev/ptmx: Too many open files` even with a console,
+   `script.exe` failing identically under one) — ConPTY was unaffected, and `nano` worked through
+   the dock again. Its grid is fixed at spawn (`--width/--height`), the same limitation `script.exe`
+   has (see the resize note); it re-uses the same session/protocol plumbing.
+
+## Bridge CAPABILITY (`bridgeProbe` / `conhostProbe` / `pickBridge`)
 
 A bridge is only adopted if it can allocate a pty FOR THE SHELL IT WILL DRIVE:
 `bridgeProbe(exe, bashPath)` runs `exe -q -f -e -c "<bash> -c 'test -t 0'" /dev/null` and requires
 exit 0 (`-e`/--return makes `script` propagate the child's status, so this asserts
-`isatty(stdin)` — exactly what nano/vim need). The verdict and the bridge's own stderr are cached
+`isatty(stdin)` — exactly what nano/vim need). `conhostProbe` does the same through ConPTY with a
+MARKER in the output, because conhost does NOT propagate the child's exit status (verified: `bash -c
+"exit 7"` comes back 0). The verdict and the bridge's own stderr are cached
 per process; `pickBridge` walks the candidates and keeps the last failure reason, which becomes
 `state.bridgeNote` (the dock renders it) and blocks adoption.
 
@@ -72,7 +89,7 @@ Downloads a PINNED package (`util-linux-2.40.2-2` from repo.msys2.org, sha256-pi
 | s→c | `{t:"replay", d}` | ring history on (re)attach |
 | s→c | `{t:"d", d}` | live output (stdout+stderr merged) |
 | s→c | `{t:"clear"}` | other sockets drop the dead screen on reset |
-| s→c | `{t:"state", s}` | `{phase: starting|ready|dead|error, tier, exit, error, pid, bridgeNote}` — `bridgeNote` explains why the pipe tier is in use when that is a BRIDGE problem |
+| s→c | `{t:"state", s}` | `{phase: starting|ready|dead|error, tier, exit, error, pid, bridge, bridgeNote}` — `bridge` names the working bridge ("conhost --headless (ConPTY)", "script.exe (msys pty)"), `bridgeNote` explains why the pipe tier is in use when that is a BRIDGE problem |
 
 ## Session lifecycle (all proc handlers generation-guarded via `sess.gen`)
 

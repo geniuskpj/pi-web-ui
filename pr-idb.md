@@ -278,7 +278,35 @@ Fixed on the test side (assert losslessness + the dedupe, not a vid) **and** in 
 summary (`32 passed, 0 failed`). The dedupe commit (`c3d166b`) exists only on this
 branch, so this red test was this branch's to fix.
 
-### 12 — the terminal: environment, not branch
+### 12 — the terminal: environment, not branch — RESOLVED by a second bridge kind
+
+**Outcome (2026-10-25):** `script.exe` stays unusable on this machine, but the dock has nano back —
+through **Windows ConPTY** (`conhost.exe --headless`), which the hub now probes and prefers as a
+second bridge kind. Verified end to end through the real hub + WS protocol: `tier=pty`,
+`bridge="conhost --headless (ConPTY)"`, `IS_TTY=yes TERM=xterm-256color`, nano renders its UI, Ctrl-X
+returns to the prompt. No download, no native module, no node-pty.
+
+The environment root cause is now evidence-backed and is NOT a descriptor limit (a suggested
+`ulimit -n` fix was tested and ruled out: the soft limit is already the hard max, 3200, and raising
+it changes nothing — `/dev/ptmx` fails from a fresh process with three open fds):
+
+| Signal | Value |
+|---|---|
+| Kernel `Events` objects | **16,813,072** |
+| `conhost.exe` processes | **144** (130 created 2026-10-20…23) |
+| `bash.exe` processes | **133** (same days, one per console) |
+| Uptime | **293 days** |
+
+Those 130 pairs are shells whose owning server was killed hard (`taskkill /F` — which skips the
+hub's shutdown reap): killing a server leaves its shells and consoles alive, and after ~130 of them
+the kernel-object counters are in the tens of millions, which is the plausible reason new pty
+allocations fail while long-lived ones keep working (the user's own terminal). Two consequences:
+(1) a **restart** should restore the msys route (the fallback makes it unnecessary for nano);
+(2) **the hub should reap orphaned shells at boot** — proposed, not yet implemented — so a leaked
+console cannot accumulate again. Reaping the stale pairs *may* fix `/dev/ptmx` without a reboot;
+that is the operator's call (they are not attached to any live server).
+
+### 12a — the original report
 
 `terminal-hub.mjs`, `src/ui/terminal.tsx` and the vendored bridge are **byte-identical
 to main** on this branch, and `data/bin/script/script.exe` is byte-identical to a freshly
