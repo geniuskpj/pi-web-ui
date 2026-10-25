@@ -275,9 +275,13 @@ const disjoint = (rs) => rs.every((r, i) => i === 0 || rs[i - 1].toSeq <= r.from
 	const proxySrc = fs.readFileSync(path.join(ROOT, "src/proxy-agent.ts"), "utf8");
 	check("A4 the boundary is defined ONCE (client re-exports lib/chunk-window.mjs)",
 		/export \{ CHUNK_INTERVAL,[^}]*\} from "\.\.\/lib\/chunk-window\.mjs"/.test(cacheSrc) && !/^export const CHUNK_INTERVAL = 64;/m.test(cacheSrc));
-	check("A5 the server and hub import the same helper (no drift possible)",
-		/from "\.\/lib\/chunk-window\.mjs"/.test(serverSrc) && /from "\.\/lib\/chunk-window\.mjs"/.test(hubSrc) &&
-		/start = chunkFromSeq\(chunkIndexOf\(start\)\)/.test(serverSrc) && /const snapped = alignDown\(from\)/.test(hubSrc));
+	// A5 got STRICTER with the 2026-10-25 review fixes: the server no longer inlines the
+	// boundary math at all — it imports lib/range-window.mjs, which imports the ONE
+	// boundary definition (lib/chunk-window.mjs), the same module the hub imports.
+	check("A5 the server and hub reach the same boundary definition (no drift possible)",
+		/from "\.\/lib\/range-window\.mjs"/.test(serverSrc) && !/chunkFromSeq\(chunkIndexOf\(/.test(serverSrc) &&
+		/from "\.\/chunk-window\.mjs"/.test(fs.readFileSync(path.join(ROOT, "lib/range-window.mjs"), "utf8")) &&
+		/from "\.\/lib\/chunk-window\.mjs"/.test(hubSrc) && /const snapped = alignDown\(from\)/.test(hubSrc));
 	check("C1 the client reports its cached reach with the attach",
 		/private async cachedCoverTo\(\)/.test(proxySrc) && /tailFirst: true, haveTo \}/.test(proxySrc) && /cachedRanges\(this\.sessionId\)/.test(proxySrc));
 	check("C2 the client treats the sent window start as its dense-window start and fills the prefix",
@@ -287,6 +291,66 @@ const disjoint = (rs) => rs.every((r, i) => i === 0 || rs[i - 1].toSeq <= r.from
 	check("C3 the server passes the hint and the hub trims the low end",
 		/haveTo: Number\(m\.haveTo\) \|\| 0/.test(serverSrc) && /const sentFrom = claim >= count \? count : Math\.max\(from, alignDown\(claim\)\)/.test(hubSrc) &&
 		/state\.sparse = \{ fromSeq: from, messageCount: count, sentFrom/.test(hubSrc));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S. CACHED SPLICE + MEM TIER (review 2026-10-25, reviewer2 P1 + #2/#3)
+{
+	const { planCachedSplice } = await import("../lib/chunk-splice.mjs");
+	const m = (from, n) => Array.from({ length: n }, (_, i) => ({ role: "user", content: [{ type: "text", text: "s" + (from + i) }] }));
+	// S1 — the reported bug: a chunk reaching BELOW the request is kept and its start
+	//      is ADOPTED (the old code recorded the requested from → every index shifted).
+	{
+		const p = planCachedSplice([{ fromSeq: 576, toSeq: 640, messages: m(576, 64) }], 624, 640);
+		check("S1 the splice adopts the lowest chunk start (not the requested from)", p.fromSeq === 576, `fromSeq=${p.fromSeq}`);
+		check("S1 the whole chunk is spliced (contiguous upward)", p.messages.length === 64, `n=${p.messages.length}`);
+	}
+	// S2 — a chunk spilling ABOVE `to` is trimmed: those messages are already the top
+	//      of the dense window (the duplicate the reviewer described).
+	{
+		const p = planCachedSplice([{ fromSeq: 576, toSeq: 704, messages: m(576, 128) }], 576, 640);
+		check("S2 nothing at/above the dense window's start is re-spliced", p.messages.length === 64 && p.fromSeq === 576, `n=${p.messages.length}`);
+	}
+	// S3 — multi-chunk tile: contiguous output, no duplicates, message 0 = lowest seq.
+	{
+		const cached = [{ fromSeq: 448, toSeq: 512, messages: m(448, 64) }, { fromSeq: 512, toSeq: 576, messages: m(512, 64) }];
+		const p = planCachedSplice(cached, 500, 576);
+		const seqs = p.messages.map((x) => Number(String(x.content[0].text).slice(1)));
+		const monotone = seqs.every((sq, i) => i === 0 || sq === seqs[i - 1] + 1);
+		check("S3 multi-chunk splice is contiguous and duplicate-free", p.fromSeq === 448 && monotone && p.messages.length === 128, `n=${p.messages.length} first=${seqs[0]}`);
+	}
+	// S4 — no cache → caller must fetch (empty splice, start unchanged).
+	{
+		const p = planCachedSplice([], 100, 200);
+		check("S4 an empty cache yields an empty splice at the requested from", p.messages.length === 0 && p.fromSeq === 100, `fromSeq=${p.fromSeq}`);
+	}
+	// S5 — SOURCE: the memory tier must be generation-keyed (the one cache layer that
+	//      was not, so a post-rewrite read rendered pre-rewrite content).
+	{
+		const idbSrc = fs.readFileSync(path.join(ROOT, "src/idb-cache.ts"), "utf8");
+		check("S5 the memory tier key carries the rewrite generation",
+			/const memKey = \(sessionId: string, rewriteSeq: number, fromSeq: number\)/.test(idbSrc) &&
+			/memTier\.get\(memKey\(sessionId, gen, r\.fromSeq\)\)/.test(idbSrc) &&
+			/memPut\(sessionId, gen, rec\.fromSeq, msgs\)/.test(idbSrc));
+		check("S5 dropChunk punches the matching memory entry",
+			/memTier\.delete\(memKey\(sessionId, rewriteSeq, fromSeq\)\)/.test(idbSrc));
+	}
+	// S6 — SOURCE: the sweep only forgets a session's generation when its NEWEST was
+	//      collected (otherwise a stale in-flight write can resurrect it).
+	{
+		const idbSrc = fs.readFileSync(path.join(ROOT, "src/idb-cache.ts"), "utf8");
+		check("S6 sweepStale forgets currentGen only for the newest collected generation",
+			/newestDropped/.test(idbSrc) && !/for \(const t of targets\) currentGen\.delete\(t\.sessionId\);/.test(idbSrc));
+	}
+	// S7 — SOURCE: the client verifies a fetched window BEFORE storing/splicing it,
+	//      refuses an empty window, and sets filledFrom to what it actually spliced.
+	{
+		const proxySrc = fs.readFileSync(path.join(ROOT, "src/proxy-agent.ts"), "utf8");
+		check("S7 the client rejects an empty window before touching filledFrom",
+			/if \(re <= rs\) return false;/.test(proxySrc));
+		check("S7 the client verifies the fetched body before caching it",
+			/const verdict = verifyChunkText\(text, rs, re\)/.test(proxySrc) && /if \(!verdict\.ok\) \{ console\.warn\("\[backfill\] range body rejected/.test(proxySrc));
+	}
 }
 
 console.log(`\n[idb-cache] ${passed} passed, ${failed} failed`);

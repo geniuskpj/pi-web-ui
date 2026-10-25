@@ -8,6 +8,7 @@ type Listener = (event: any) => void;
 type AnyRecord = Record<string, any>;
 import { makeId } from "./id.js";
 import { getCachedChunks, putChunk, gunzip, transferPolicy, cachedRanges, intervalDiff, sweepStale, planLiveChunk, toNdjson, gzipText, verifyChunkText } from "./idb-cache.js";
+import { planCachedSplice } from "../lib/chunk-splice.mjs";
 // LIVE WRITE-THROUGH (C2): how long a quiet tail may sit in memory before it is
 // written to IDB. Every flush is one gzip of <CHUNK_INTERVAL messages.
 const LIVE_IDLE_MS = 5000;
@@ -587,11 +588,25 @@ export class ProxyAgent {
 		try {
 			let msgs: any[] = [];
 			const sparseAtStart = (this.state as any).sparse as { rewriteSeq: number } | undefined;
-			const cached = await getCachedChunks(this.sessionId, from, to, sparseAtStart?.rewriteSeq);
+			const genExpected = sparseAtStart?.rewriteSeq;
+			// no known generation ⇒ no cache read: a chunk from another generation must
+			// never be spliced into this transcript (worst case: one /range fetch).
+			const cached = genExpected === undefined ? [] : await getCachedChunks(this.sessionId, from, to, genExpected);
 			let fullyCached = false;
 			if (cached.length > 0) {
 				fullyCached = true;
-				for (const c of cached) msgs.push(...c.messages);
+				// SPLICE HONESTY (review 2026-10-25, reviewer2 P1): getCachedChunks returns
+				// chunks WHOLE (they must tile [from,to) or it returns [] — no holes), and a
+				// chunk may start BELOW the requested `from` and — for chunks written before
+				// the server-side bound fix — end ABOVE `to`. Prepending those as-is while
+				// recording the REQUESTED from as filledFrom shifted every index under the
+				// splice (edits land on the wrong turn; the top duplicates what the dense
+				// window already holds). So: trim at `to` and adopt the LOWEST chunk start
+				// as the window's real start — "more than asked for" is fine (it is real,
+				// contiguous content and the display gate is seq-based), "less" never is.
+				const plan = planCachedSplice(cached, from, to);
+				from = plan.fromSeq;
+				msgs = plan.messages;
 			}
 			if (!fullyCached) {
 				const res = await fetch(`/api/agent/session/${encodeURIComponent(this.sessionId)}/range?fromSeq=${from}&toSeq=${to}`, { signal: AbortSignal.timeout(15000) });
@@ -612,11 +627,23 @@ export class ProxyAgent {
 					void sweepStale({ sessionId: this.sessionId });
 					return false;
 				}
-				// cache write-through: the SAME raw gzip bytes into IDB (decompress on read)
-				try { await putChunk(this.sessionId, rs, re, rsq, count, new Blob([buf], { type: "application/gzip" }), rwr); } catch { /* cache is best-effort */ }
+				// EMPTY WINDOW (review 2026-10-25 #1): re <= rs means "nothing more to load"
+				// — the old code carried on and set filledFrom = rs (ABOVE the dense window),
+				// which desynced the array from its seq and made expandEarlier() report
+				// success forever while doing nothing (the dead ⤒ button, again).
+				if (re <= rs) return false;
 				const text = await gunzip(new Blob([buf], { type: "application/gzip" }));
 				if (text == null) { console.warn("[backfill] gunzip failed"); return false; }
+				// VERIFY BEFORE STORE (review #5): live writes already pass verifyChunkText
+				// first; a fetched window did not, so a short/mislabeled body (exactly what
+				// the server-side bound bug produced) got cached and re-dropped on every read.
+				// A bad body is now a logged miss that also fails the expand, not a silent
+				// half-window in the transcript.
+				const verdict = verifyChunkText(text, rs, re);
+				if (!verdict.ok) { console.warn("[backfill] range body rejected —", verdict.reason); return false; }
 				msgs = text.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+				// cache write-through: the SAME raw gzip bytes into IDB (decompress on read)
+				try { await putChunk(this.sessionId, rs, re, rsq, count, new Blob([buf], { type: "application/gzip" }), rwr); } catch { /* cache is best-effort */ }
 				from = rs; // SERVER-AUTHORITATIVE window (may be smaller than requested)
 				to = re;
 			}
@@ -626,6 +653,8 @@ export class ProxyAgent {
 			const sp = (this.state as any).sparse;
 			if (!sp || sp.filledFrom !== requestedTo || this.sessionId !== sessionIdAtStart) { console.warn("[backfill] raced a rewrite/switch — window dropped"); return false; }
 			this.state.messages = [...msgs, ...this.state.messages];
+			// `from` is the seq of msgs[0] — the requested from only when the cache was
+			// not wider than the request (see SPLICE HONESTY above).
 			sp.filledFrom = from;
 			sp.fromSeq = from; // LOCKSTEP (grok #2): the edit translation uses fromSeq —
 			// a frozen value would point edits at the wrong turn after any expand

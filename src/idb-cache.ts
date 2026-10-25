@@ -83,9 +83,16 @@ const clearGen = new Map<string, number>();
 // quota this whole design exists to escape).
 const memTier = new Map<string, { messages: any[]; at: number }>();
 const MEM_TIER_MAX = 24;
-const memKey = (sessionId: string, fromSeq: number) => `${sessionId}:${fromSeq}`;
-function memPut(sessionId: string, fromSeq: number, messages: any[]) {
-	memTier.set(memKey(sessionId, fromSeq), { messages, at: Date.now() });
+// GENERATION-SCOPED KEY (review 2026-10-25 #2): the IDB stores are keyed by
+// [sessionId, rewriteSeq, fromSeq] but this tier was keyed by (session, fromSeq)
+// only — so after a ✎ edit / 🕘 restore / compact bumped the generation, a re-read
+// of the same window (the meta DOES have a range there, so the read is legitimate)
+// got the PRE-REWRITE decompressed messages: exactly the failure class the compact
+// check was written to close, through the one layer that was not generation-keyed.
+// The rewriteSeq is free at every call site and the LRU bounding is unchanged.
+const memKey = (sessionId: string, rewriteSeq: number, fromSeq: number) => `${sessionId}:${rewriteSeq}:${fromSeq}`;
+function memPut(sessionId: string, rewriteSeq: number, fromSeq: number, messages: any[]) {
+	memTier.set(memKey(sessionId, rewriteSeq, fromSeq), { messages, at: Date.now() });
 	if (memTier.size > MEM_TIER_MAX) {
 		const oldest = [...memTier.entries()].sort((a, b) => a[1].at - b[1].at)[0];
 		if (oldest) memTier.delete(oldest[0]);
@@ -275,7 +282,7 @@ export async function getCachedChunks(sessionId: string, from: number, to: numbe
 		for (const r of meta.ranges) {
 			if (r.toSeq <= from || r.fromSeq >= to) continue;
 			// MEMORY TIER first (shader-cache): skip gunzip entirely on re-reads
-			const hit = memTier.get(memKey(sessionId, r.fromSeq));
+			const hit = memTier.get(memKey(sessionId, gen, r.fromSeq));
 			if (hit) { hit.at = Date.now(); out.push({ fromSeq: r.fromSeq, toSeq: r.toSeq, messages: hit.messages }); continue; }
 			const rec = await txReq(db, [CHUNK_STORE], "readonly", (tx) => tx.objectStore(CHUNK_STORE).get(chunkKey(sessionId, gen, r.fromSeq)) as IDBRequest<IdbChunk>);
 			if (!rec || rec.toSeq !== r.toSeq) return []; // ghost range (blob gone) → fetch instead
@@ -284,7 +291,7 @@ export async function getCachedChunks(sessionId: string, from: number, to: numbe
 			const verdict = verifyChunkText(text, r.fromSeq, r.toSeq);
 			if (!verdict.ok) { console.warn("[idb] dropping chunk", r.fromSeq, "—", verdict.reason); void dropChunk(sessionId, gen, r.fromSeq); return []; }
 			const msgs = text.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-			memPut(sessionId, rec.fromSeq, msgs);
+			memPut(sessionId, gen, rec.fromSeq, msgs);
 			out.push({ fromSeq: rec.fromSeq, toSeq: rec.toSeq, messages: msgs });
 		}
 		return out;
@@ -344,6 +351,9 @@ export async function putChunk(sessionId: string, fromSeq: number, toSeq: number
 /** Drop ONE chunk + punch its coverage (integrity failure on read, ghost blob).
  *  Reads then refetch that window; nothing else is touched. */
 async function dropChunk(sessionId: string, rewriteSeq: number, fromSeq: number): Promise<void> {
+	// the decompressed mirror of this window must go with the blob — otherwise the
+	// next read hits the mem tier with content the cache just decided was corrupt
+	memTier.delete(memKey(sessionId, rewriteSeq, fromSeq));
 	await withTimeout(async (db) => {
 		await new Promise<null>((resolve) => {
 			try {
@@ -405,7 +415,14 @@ export async function sweepStale(opts: { sessionId?: string; maxAgeMs?: number; 
 			});
 			return null;
 		});
-		for (const t of targets) currentGen.delete(t.sessionId);
+		// (review #6) Forget a session's remembered generation ONLY when the newest
+		// generation among the collected targets is the one we remember. Deleting it
+		// after collecting just an OLD generation of a live session would re-open the
+		// door for a stale in-flight write (putChunk accepts when known === undefined)
+		// and resurrect the generation the sweep had just collected.
+		const newestDropped = new Map<string, number>();
+		for (const t of targets) newestDropped.set(t.sessionId, Math.max(newestDropped.get(t.sessionId) ?? -1, t.rewriteSeq));
+		for (const [sid, gen] of newestDropped) if ((currentGen.get(sid) ?? -1) <= gen) currentGen.delete(sid);
 		return { scanned: metas.length, dropped: targets.length };
 	} finally {
 		sweepRunning.delete(key);
