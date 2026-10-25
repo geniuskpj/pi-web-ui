@@ -77,3 +77,14 @@ jobs:
           npm run test:sysprompt
       - name: "Tests (security gates — token + origin/Host allowlist)"
         run: npm run test:security
+      # data transfer (plan-mobile-data.md §6): pure policy/planning (images, egress redaction,
+      # turn coalescing, thinking flush thresholds) + the WS deflate handshake. All hermetic —
+      # the deflate suite starts a scratch server and never provisions a pty/shell.
+      - name: "Tests (data reduction, thinking flush, WS deflate)"
+        run: |
+          npm run test:data
+          npm run test:thinking
+          npm run test:deflate
+          npm run test:imgcompress
+          npm run test:reduce
+          npm run test:reduce-e2e
