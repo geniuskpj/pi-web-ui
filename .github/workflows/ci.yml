@@ -17,10 +17,16 @@ on:
     branches: ["main", "master"]
   pull_request:
     branches: ["main", "master"]
+  release:
+    types: [published]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build-and-test:
+    if: github.event_name != 'release'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -66,3 +72,39 @@ jobs:
         run: |
           npm run test:term-platform
           npm test
+
+  publish-release:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        run: npm run build
+
+      - name: Package runnable app
+        run: |
+          mkdir -p release-package/lib release-package/public release-package/stubs
+          cp package.json package-lock.json README.md \
+            server.mjs agent-hub.mjs terminal-hub.mjs terminal-backends.mjs \
+            process-tree.mjs session-id.mjs session-worker.mjs release-package/
+          cp -R lib/. release-package/lib/
+          cp -R public/. release-package/public/
+          cp -R stubs/. release-package/stubs/
+          tar -czf pi-web-ui.tar.gz -C release-package .
+
+      - name: Upload archive to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" pi-web-ui.tar.gz --clobber

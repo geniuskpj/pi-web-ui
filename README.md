@@ -143,6 +143,9 @@ Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
   suites (store, runtime, ssrf, retry, security-gates). The real-LLM suites
   (`test:agent`, `test:steer`, `test:killstop`) and the Windows/pty-specific `term-smoke`
   stay opt-in; `compact`/`fork`/`shutdown` need a bash/pty host, so they are local too.
+  Publishing a GitHub Release builds the app and attaches `pi-web-ui.tar.gz` with the built
+  public assets and server runtime; extract it, run `npm ci`, then `npm start`. Runtime data
+  and credentials are not included.
 - **Theme variables** come from the vendored `public/assets/app.css` (pi-web-ui's compiled
   tailwind output, kept as a static asset — no runtime dependency). New-component styles live
   in `public/style.css`.
