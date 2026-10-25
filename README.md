@@ -112,13 +112,67 @@ Workspace file attach + image paste are BACK (plan.md §12–14) — see the exp
 | `PI_WEB_DEBUG` | off | verbose server logging |
 | `PI_WEB_LOG_DIR` | `<PI_WEB_DATA_DIR>/logs` | console tee target — daily `server-YYYYMMDD.log` (ISO timestamps + info/warn/error); broken dir falls back to console-only |
 | `PI_WEB_EXIT_ON_STDIN_CLOSE` | off | run the full graceful-shutdown sequence when the parent closes the server's stdin pipe (pipe-friendly Ctrl+C equivalent; used by tests — on Windows a cross-process `kill(SIGINT)` TerminateProcesses without running handlers) |
+| `PI_WEB_WS_DEFLATE` | on | `off` disables permessage-deflate on the agent/sync WebSockets (state frames are the multi-MB path — leave on unless profiling) |
 | `PI_WEB_TERM_COLS` / `PI_WEB_TERM_LINES` | `110` / `32` | terminal grid size (stty in the pty tier, COLUMNS/LINES env in the pipe tier) |
-| `PI_WEB_TERM_BRIDGE` | auto | `0`/`pipes` forces the pipe tier; a path uses that exe as an msys-pty-bridge; unset → auto-provision msys2 `util-linux` `script.exe` into `data/bin/script/` (sha256-pinned `util-linux-2.40.2-2` package from repo.msys2.org, 8MB size cap, extracts a 63KB exe — once) |
+| `PI_WEB_TERM_BRIDGE` | auto | `conhost` forces Windows ConPTY; `0`/`pipes` forces the pipe tier; a path uses that exe as an msys-pty-bridge; unset → auto-provision msys2 `util-linux` `script.exe` into `data/bin/script/` (sha256-pinned `util-linux-2.40.2-2` package from repo.msys2.org, 8MB size cap, extracts a 63KB exe — once). The bridge is then **proven by running it** with the shell it will drive (that shell must get `isatty(stdin)==true`); a bridge that cannot allocate a pty is refused, and the reason appears in the dock instead of a silent downgrade |
 | `PI_WEB_TERM_ORIGIN` | auto | extra `host[:port]` **names for the global Host/Origin allowlist** — every `/api/*` route and all three WS endpoints (`/ws/sync`, `/ws/agent`, `/ws/terminal`), not just the terminal. Comma-separated, scheme stripped. Matching is EXACT on `host:port`: a missing Origin port means the scheme default (http→80, https→443) and a portless Host is tried as the app port plus 80/443 — so a TLS reverse proxy needs its public form spelled out (`PI_WEB_TERM_ORIGIN=name:443`). Localhost, `os.hostname()` and every interface IP are always allowed |
 | `PI_WEB_ORIGIN_GATE` | `auto` | how strictly the DNS-rebinding Host/Origin allowlist applies: `auto` = **loopback peers only** (a remote peer must present the API token — that is what lets the UI work on any domain/DDNS name with no config), `strict` = every peer (pre-2026-10-23 behaviour, only allowlisted names pass), `off` = no host check at all (**foot-gun**, warns at boot: a rebinding page can read `/api/sessions` with no token) |
 | `PROXY_IDLE_MS` | `150000` | LLM proxy stall timeout |
 
 Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
+
+## Session loading (tail-first) & IndexedDB cache
+
+Large sessions (2–7.3MB observed) no longer re-download their whole body on every open.
+Layered design — the server decides transfer sizes, the client decides display granularity:
+
+- **Wire compression (every chat):** the full session GET gzips (>2KB bodies, 7.3MB → 1.92MB
+  measured); WS state frames use permessage-deflate (`PI_WEB_WS_DEFLATE=off` to disable).
+- **Tail-first attach (large chats):** a client advertising `tailFirst` receives only the last
+  ~1MB of serialized messages plus a sparse envelope `{fromSeq, messageCount, rewriteSeq,
+  rewrittenFrom}`; small chats attach fully as before.
+- **`GET /api/agent/session/:id/range`** serves a seq window (`fromSeq`/`toSeq`, or `tailBytes=`)
+  as **raw application/gzip** NDJSON (write-through: the same bytes go into IndexedDB and
+  DecompressionStream on read). The 1MB cap keeps the HIGH end of the requested window (windows
+  stay adjacent to the loaded tail) and aligns the start down to the nearest **user turn**.
+  Identity headers: `X-Session-Mutate-Epoch` (rewrite generation), `X-Session-Message-Count`,
+  `X-Range-From/To-Seq`, `X-Rewritten-From` (chunks strictly below this seq survive rewrites).
+- **Aligned windows + no re-send (C4)**: `/range` windows and live-written chunks share one 64-message
+  boundary (`lib/chunk-window.mjs`, imported by both sides — no seam), and the WS attach takes the
+  boundary (`lib/chunk-window.mjs`, imported by both sides — no seam), every fetched window is BOUNDED
+  to the seqs that were asked for (the headers always describe exactly the bytes sent), and the WS attach takes the
+  client's cached reach (`haveTo`) so it does not re-send it: measured, the 1.49MB tail → **0 bytes** when
+  the cache covers it, with the client filling that prefix from IndexedDB (a miss falls back to `/range`).
+- **IndexedDB cache** (`pi-session-cache`, **schema v2**): per-chunk gzip blobs keyed
+  `[sessionId, rewriteSeq, fromSeq]` + a tiny coverage record PER GENERATION. Miss-set = interval diff
+  (one small meta get). LRU 200MB (superseded generations evicted first). A rewrite never erases
+  anything — the new generation is a fresh key space and the old one is unreachable — a date-based
+  `sweepStale()` collects it (5-minute grace once superseded, 30-day hard TTL) on attach and on tab
+  focus, and a chunk that fails the on-read integrity check is dropped so the next read refetches.
+  **Live write-through:** the attached tail and every later turn are written into IDB as they arrive
+  (aligned 64-message windows; the remnant is rewritten in place on `agent_end`/idle/tab-hide), so
+  reopening an untouched session no longer re-downloads the tail — nothing about the render changes.
+  Wedge-proof by design: lazy open (boot never touches IDB), 2s timeout on every op (a timeout
+  is a MISS, not an error), 3-failure circuit breaker, per-session serialized writes, server
+  fallback always available.
+- **Rewrite invalidation:** every transcript rewrite (✎ edit / 🕘 restore / retry tail-drop /
+  compact) bumps a persisted `rewriteSeq` and records `rewrittenFrom` — the seq where the rewrite
+  started. Cached chunks strictly below it survive (an edit at 950 of 976 keeps chunks 0–799;
+  compaction keeps the prefix below its span start). The client validates the generation on
+  every cache read and refetches on mismatch. The generation also survives server restarts.
+- **Display by user turn:** sparse (large) sessions render ONE conversational turn (from its
+  user message down); “⤒ Load earlier turns” reveals the previous turn per click — pure view
+  change when it is in memory, a range fetch when it isn't. Small chats display fully.
+- **Transfer policy:** `navigator.connection` (saveData / effectiveType / type) decides — fast
+  links background-warm the whole body into IDB; metered links stay manual (expand per click).
+  Server fallback: `/api/health` reports `netClass: lan | remote` (peer/Host classification).
+- **UI:** the session list shows each session's IDB footprint (“IDB 1.2MB (7 chunks)”); the
+  active-sessions dialog has a 🧹 clear button beside Kill — safe during a live run (the cache
+  is read-only data; in-flight backfill writes are dropped via a generation guard).
+
+Measured on real sessions: gzip chunking ratio penalty nil (26.4% single vs 26.5–26.6% chunked);
+per-chunk browser decompress 3.4–5ms (512KB–1MB); repeat open of a warm 7.3MB session = zero
+network. Full analysis: `pr-idb.md`.
 
 ## Notes
 
@@ -180,6 +234,17 @@ Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
   CDN URLs (esm.sh/jsdelivr) remain as runtime fallbacks only. The shell lives on the server
   (`terminal-hub.mjs`, WS `/ws/terminal`, JSON frames — replay ring 128KB on attach, output
   coalesced 30ms, idle TTL 15min, max 6 sessions, stdin cap 64KB):
+  - **which tier is active is PROVED, not assumed**: the bridge must give the shell it drives a
+    real tty. When it cannot (e.g. the msys runtime that Git for Windows ships cannot create
+    `/dev/ptmx` on that install), the dock says so — "⚠ no pty — nano/vim need one" plus the
+    bridge's own error — and runs the pipe tier. `node tests/term-pty.test.mjs` reports the same
+    diagnosis headlessly (`PI_REQUIRE_PTY=1` makes a working pty a hard requirement); the fix is a
+    repaired/reinstalled Git for Windows, or `PI_WEB_TERM_BRIDGE` pointing at a `script.exe` built
+    for that runtime. **When the msys pty route is unavailable the hub falls back to Windows' own
+    ConPTY server** (`conhost.exe --headless`: a real console for the shell, forwarded as VT over the
+    hub's pipes — no download, no native module). Verified end to end: `isatty(stdin)=true`,
+    `stty size` answers, OSC 133/7 still arrive, and **nano renders**. The dock names the bridge in
+    use (`bash — pty (conhost)` / `bash — pty (msys)`).
   - tier `pty` (default, auto-provisioned): **msys2 `script.exe`** allocates a REAL msys pty
     and bridges our stdio — bash gets `/dev/ptyN`, so interactive TUIs work: `nano`/`vim` pass
     the isatty check (the old "standard input is not a terminal" is fixed — verified with a

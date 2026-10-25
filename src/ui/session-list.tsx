@@ -5,6 +5,8 @@
 // PIN to the top with a badge + one-line lastText preview.
 import { useEffect, useState } from "preact/hooks";
 import { sessionSync, type RuntimeRecord } from "../session-sync.js";
+import { idbStats } from "../idb-cache.js";
+const fmtBytes = (n: number) => (n >= 1024 * 1024 ? (n / 1024 / 1024).toFixed(1) + "MB" : Math.max(1, Math.round(n / 1024)) + "KB");
 
 export interface SessionMeta {
 	id: string;
@@ -30,8 +32,14 @@ export function SessionListDialog({
 	const [listErr, setListErr] = useState<string | null>(null);
 	const [loading, setLoading] = useState(false);
 	const [runtime, setRuntime] = useState<ReadonlyMap<string, RuntimeRecord>>(sessionSync.runtimeSnapshot());
+	// IDB footprint per session (user request): fetched once per dialog open
+	const [idbSizes, setIdbSizes] = useState<Map<string, { bytes: number; chunks: number }>>(new Map());
 	// applied OUTSIDE the 5s metadata throttle — status feels live
 	useEffect(() => sessionSync.onRuntime(() => setRuntime(new Map(sessionSync.runtimeSnapshot()))), []);
+	useEffect(() => {
+		if (!open) return;
+		void idbStats().then((m) => setIdbSizes(m)).catch(() => {});
+	}, [open]);
 
 	// Escape closes (pi-web-ui dialog parity)
 	useEffect(() => {
@@ -149,6 +157,7 @@ export function SessionListDialog({
 								<div class="pw-session-sub">
 									{s.messageCount ? `${s.messageCount} messages · ` : ""}
 									{fmtDate(s.lastModified)}
+									{idbSizes.get(s.id) ? ` · IDB ${fmtBytes(idbSizes.get(s.id)!.bytes)} (${idbSizes.get(s.id)!.chunks} chunks)` : ""}
 								</div>
 							</div>
 							<button

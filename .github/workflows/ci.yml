@@ -54,6 +54,11 @@ jobs:
 
       # Hermetic, node-only suites (no provider keys, no pty/bash, scratch
       # servers on random ports with a temp data dir where needed).
+      # NOTE (review 2026-10-25): the tail-first/IDB branch shipped test:range,
+      # test:idb and test:hydration — none of which were wired here, so the suites
+      # that cover its new machinery never ran in CI. Both reviewers then found
+      # bounds bugs in that machinery within a day. They are hermetic (pure
+      # functions + the hub with the faux provider), so they run on both runners.
       - name: "Tests (store, runtime, ssrf, zombie, versions)"
         run: |
           npm run test:store
@@ -61,5 +66,12 @@ jobs:
           npm run test:ssrf
           npm run test:zombie
           npm run test:versions
+      - name: "Tests (tail-first / IDB cache, ranges, sparse hydration, view gate)"
+        run: |
+          npm run test:range
+          npm run test:idb
+          npm run test:hydration
+          npm run test:gate
+          npm run test:pty
       - name: "Tests (security gates — token + origin/Host allowlist)"
         run: npm run test:security

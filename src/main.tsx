@@ -1,7 +1,11 @@
 import { render } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { Agent, type AgentMessage, type AgentState } from "@earendil-works/pi-agent-core";
-import { getModel, type TextContent } from "@earendil-works/pi-ai";
+// pi-ai 1.4.0: getModel + the generic streamSimple moved to the compat subpath
+// (root only ships per-api modules now); TextContent still lives in root types
+import { getModel } from "@earendil-works/pi-ai/compat";
+import { streamSimple } from "@earendil-works/pi-ai/compat";
+import type { TextContent } from "@earendil-works/pi-ai";
 import { customConvertToLlm } from "./llm.js";
 import { makeId } from "./id.js";
 import { SessionListDialog } from "./ui/session-list.js";
@@ -249,6 +253,9 @@ const createAgent = async (initialState?: Partial<AgentState>) => {
 		? (Object.fromEntries(Object.entries(initialState).filter(([, v]) => v !== undefined)) as Partial<AgentState>)
 		: {};
 	agent = new Agent({
+		// pi-ai 1.4.0: streamFn is REQUIRED — start with the compat generic
+		// dispatcher; the proxy-aware streamFn below replaces it immediately
+		streamFn: streamSimple as any,
 		initialState: {
 			systemPrompt: piSystemPrompt || "You are a helpful AI assistant.",
 			model: bootModel,
@@ -342,7 +349,9 @@ const loadSession = async (sessionId: string): Promise<boolean> => {
 		// snapshot delivers messages + model — works from any device (the session
 		// list on the phone opens the same transcript the PC is streaming)
 		try {
-			const r = await fetch(`/api/agent/session/${encodeURIComponent(sessionId)}`, { signal: AbortSignal.timeout(8000) });
+			// ?meta=1: existence + counts ONLY — the old call downloaded the full
+			// 2-7.3MB body just to read j.exists (tail-first plan)
+			const r = await fetch(`/api/agent/session/${encodeURIComponent(sessionId)}?meta=1`, { signal: AbortSignal.timeout(8000) });
 			if (r.ok) {
 				const j = await r.json();
 				if (j.exists === false && !(Array.isArray(j.messages) && j.messages.length > 0)) {
@@ -694,7 +703,7 @@ function App() {
 					)}
 				</div>
 			)}
-			{agent ? <ChatView agent={agent} /> : <div class="pw-chat" />}
+			{agent ? <ChatView agent={agent} retryState={currentSessionId ? runtime.get(currentSessionId)?.retry : undefined} onCancelRetry={() => { const a: any = agent; void a?.cancelRetry?.()?.catch?.(() => {}); }} /> : <div class="pw-chat" />}
 			{toast && <div class="pi-toast">{toast}</div>}
 			<AliveSessionsDialog
 				open={aliveOpen}

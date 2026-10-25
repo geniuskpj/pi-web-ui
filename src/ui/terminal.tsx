@@ -52,6 +52,12 @@ interface ShellState {
 	exit: number | null;
 	error: string | null;
 	pid: number | null;
+	/** which bridge provides the shell's tty ("conhost --headless (ConPTY)",
+	 *  "script.exe (msys pty)", …) — null in the pipe tier. */
+	bridge: string | null;
+	/** why the pipe tier is in use, when it is a BRIDGE problem (server-sent):
+	 *  nano/vim need a real pty, and "pipes" alone is not a diagnosis. */
+	bridgeNote: string | null;
 }
 
 const OSC_PATTERNS = ["\x1b]133;D;", "\x1b]7;"];
@@ -454,6 +460,8 @@ export function TerminalPanel({
 						exit: Number.isFinite(m.s?.exit) ? Number(m.s.exit) : null,
 						error: m.s?.error ?? null,
 						pid: Number.isFinite(m.s?.pid) ? Number(m.s.pid) : null,
+						bridge: m.s?.bridge ? String(m.s.bridge) : null,
+						bridgeNote: m.s?.bridgeNote ? String(m.s.bridgeNote) : null,
 					};
 					setShell(s);
 				}
@@ -729,6 +737,12 @@ export function TerminalPanel({
 			: wsStatus === "open" && shell?.phase === "ready"
 				? "pw-term-dot pw-dot-ok"
 				: "pw-term-dot pw-dot-wait";
+	// pipes + a BRIDGE problem (no pty): say so in the status line — the note row
+	// below carries the reason. Computed here so the ternary below stays flat.
+	const pipesLabel = shell?.bridgeNote ? "bash — pipes (no pty: nano/vim unavailable)" : "bash — pipes (readline)";
+	// WHICH bridge gave the shell its tty matters for support: a msys pty and ConPTY
+	// behave differently (resize, ^C, job control), so name it.
+	const ptyLabel = /conhost/i.test(shell?.bridge || "") ? "bash — pty (conhost)" : shell?.bridge ? "bash — pty (msys)" : "bash — pty";
 	const statusText = loadError
 		? "terminal failed to load"
 		: wsStatus !== "open"
@@ -739,8 +753,8 @@ export function TerminalPanel({
 				? "waiting for shell…"
 				: shell.phase === "ready"
 					? shell.tier === "pty"
-						? "bash — pty (msys)"
-						: "bash — pipes (readline)"
+						? ptyLabel
+						: pipesLabel
 					: shell.phase === "dead"
 						? `shell exited (${shell.exit ?? "?"})`
 						: shell.phase === "error"
@@ -761,6 +775,11 @@ export function TerminalPanel({
 			>
 				<span />
 			</div>
+			{shell?.bridgeNote && shell.tier === "pipes" && (
+				<div class="pw-term-note" role="status" title={shell.bridgeNote}>
+					⚠ no pty — nano/vim need one. {shell.bridgeNote}
+				</div>
+			)}
 			<div class="pw-term-head">
 				<span class={dotClass} aria-hidden="true" />
 				<span class="pw-term-status" aria-live="polite" aria-atomic="true">

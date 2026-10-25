@@ -23,13 +23,46 @@ Covers `terminal-hub.mjs` (server), `src/ui/terminal.tsx` (client dock), `src/ui
 - Auto-fallback: the pty bridge dying non-zero within 4s of spawn (`PTY_FALLBACK_MS`) downgrades that
   session to pipes once (`fallbackTried`); a pipes-started session may upgrade to pty on later respawns.
 
+## Bridge kinds: `script` (msys pty) and `conhost` (Windows ConPTY)
+
+`pickBridge` proves candidates in order and returns the FIRST that works, with its kind:
+
+1. **`script`** — msys2 util-linux `script.exe`, which allocates a real msys pty. Preferred when
+   the msys runtime can allocate one, because it is a true msys tty (job control, WINCH resize).
+2. **`conhost`** — `conhost.exe --headless <bash> --noprofile [--rcfile rc] -i`: Windows' ConPTY
+   server gives the shell a real CONSOLE (so `isatty(stdin)` is true, `stty size` answers, nano/vim
+   render, OSC 133/7 pass through) while the hub keeps plain pipes for stdio. No download, no native
+   module, no console needed in the server process. Added 2026-10-25 after a machine whose msys
+   runtime could not allocate a pty *at all* (`/dev/ptmx: Too many open files` even with a console,
+   `script.exe` failing identically under one) — ConPTY was unaffected, and `nano` worked through
+   the dock again. Its grid is fixed at spawn (`--width/--height`), the same limitation `script.exe`
+   has (see the resize note); it re-uses the same session/protocol plumbing.
+
+## Bridge CAPABILITY (`bridgeProbe` / `conhostProbe` / `pickBridge`)
+
+A bridge is only adopted if it can allocate a pty FOR THE SHELL IT WILL DRIVE:
+`bridgeProbe(exe, bashPath)` runs `exe -q -f -e -c "<bash> -c 'test -t 0'" /dev/null` and requires
+exit 0 (`-e`/--return makes `script` propagate the child's status, so this asserts
+`isatty(stdin)` — exactly what nano/vim need). `conhostProbe` does the same through ConPTY with a
+MARKER in the output, because conhost does NOT propagate the child's exit status (verified: `bash -c
+"exit 7"` comes back 0). The verdict and the bridge's own stderr are cached
+per process; `pickBridge` walks the candidates and keeps the last failure reason, which becomes
+`state.bridgeNote` (the dock renders it) and blocks adoption.
+
+Why: a bridge that passes the old PE-header/size check but cannot create a pty (it binds a
+different msys runtime than the one that ships with Git) was adopted, died instantly, and silently
+downgraded the tier to `pipes` — where nano/vim fail with "standard input is not a terminal" and
+nothing explained it. Regression suite: `node tests/term-pty.test.mjs` (with `PI_REQUIRE_PTY=1` a
+real pty becomes a hard requirement).
+
 ## Bridge provisioning (`provisionScriptBridge`)
 
 Downloads a PINNED package (`util-linux-2.40.2-2` from repo.msys2.org, sha256-pinned constant,
 8MB cap), requires node zlib `zstdDecompressSync` (node ≥ 22.15), decompresses, extracts ONLY
 `usr/bin/script.exe` with **System32 tar** (never PATH-searched) into a unique tmp dir
 (`.tmp-<pid>-<ts>`), validates it (`bridgeUsable`: regular file, 8KB–2MB, `MZ` header), then
-`renameSync` (atomic publish) into `data/bin/script/script.exe`. Failures back off
+`renameSync` (atomic publish) into `data/bin/script/script.exe`. The extracted exe must also pass
+`bridgeProbe` first (`pinned bridge cannot create a pty: …`), so a broken bridge is never published. Failures back off
 `PROVISION_RETRY_MS` (60s). `PI_WEB_TERM_BRIDGE=0|pipes` forces pipes; a configured PATH must exist
 (a typo fails loudly instead of triggering the auto-download).
 
@@ -56,7 +89,7 @@ Downloads a PINNED package (`util-linux-2.40.2-2` from repo.msys2.org, sha256-pi
 | s→c | `{t:"replay", d}` | ring history on (re)attach |
 | s→c | `{t:"d", d}` | live output (stdout+stderr merged) |
 | s→c | `{t:"clear"}` | other sockets drop the dead screen on reset |
-| s→c | `{t:"state", s}` | `{phase: starting|ready|dead|error, tier, exit, error, pid}` |
+| s→c | `{t:"state", s}` | `{phase: starting|ready|dead|error, tier, exit, error, pid, bridge, bridgeNote}` — `bridge` names the working bridge ("conhost --headless (ConPTY)", "script.exe (msys pty)"), `bridgeNote` explains why the pipe tier is in use when that is a BRIDGE problem |
 
 ## Session lifecycle (all proc handlers generation-guarded via `sess.gen`)
 

@@ -474,3 +474,64 @@ request naming a foreign Host still reports 403 (rebinding defence) instead of 4
 server.mjs, and the terminal hub receives the same origin rule as a PREDICATE (`originAllowed`) so the
 two checks cannot drift. Tests: `npm run test:security` (64 checks — other-port Origin, loopback +
 public Host without token, portless proxy form, `off`-mode token independence).
+
+## `length > 0` is not a hydration flag (2026-10-24)
+
+**Symptom that exposed it:** a fresh browser origin opening `?session=<a 1056-message session>` rendered
+an EMPTY chat; a direct WS attach probe against the same server reported `messages: 1, sparse: null`.
+The mirror on disk was intact — the transcript was simply never loaded into that process.
+
+**Cause:** `agent-hub.mjs` guarded hydration with `if (entry && entry.agent.state.messages.length > 0)
+return entry;`. A freshly created entry ALREADY holds one message (pi materializes the system prompt into
+`state.messages`), so a pre-hydration entry looked hydrated forever. Any path that creates the entry
+before the transcript load — an attach that loses a race with the store read, a prompt on a cold hub, an
+earlier attach — poisoned that session for the life of the process. A hub restart "fixed" it, which is
+the tell: the data was never lost, only never loaded.
+
+**Fix:** an explicit flag, plus let the attach do the loading. `entry.hydrated` is set when the caller
+SUPPLIES messages (`getSession(id, {messages})` — the caller asserts the transcript), set after a
+successful store load, and set on a store MISS (so a new session does not re-query the store on every
+attach); a store *error* leaves it unset so a later call retries. Hydration fills an entry only when it
+has no non-system messages, so a live transcript is never clobbered. And `attach()` became async: it
+awaits `_ensureEntry()` before snapshotting, which makes the fix independent of WHO created the entry.
+
+**Lesson:** never infer "this object is populated" from a count that includes an always-present element.
+Track the fact you actually mean (`hydrated`) — and fix the *ordering* at the entry point (attach) rather
+than only patching the guard, because the guard alone still lets the first frame be empty. Regression
+suite: `npm run test:hydration` (12 checks, incl. the sparse-attach-on-a-pre-created-entry case).
+
+## The suite that reported "30 passed" while failing (2026-10-25)
+
+`npm run test:versions` printed `[versions] 30 check(s) passed` **and exited 1**: its `check()`
+incremented a single counter on success and wrote ✗ to **stderr** on failure, so the summary could
+not show a failure and every stdout-only read (mine included, twice) saw a green suite. The hidden
+failure was real — the check hard-coded `versions.get(S, 2)` while the sidecar's content-hash dedupe
+legitimately reuses vid 1 for a byte-identical re-edit, shifting the following capture to vid 2. It was
+caught only because CI runs the suite.
+
+**Lesson:** a summary that cannot count failures is worse than no summary — and a test must assert the
+PROMISE (everything is restorable), never an identifier a valid implementation may reuse.
+
+## "script.exe has gone" — validating a file instead of a capability (2026-10-25)
+
+User report: "script.exe has gone and terminal with nano is not working". The exe was on disk,
+byte-identical to a fresh extraction of its sha256-pinned package, and the branch does not touch
+terminal code at all — but it could not create a pty in this environment (`script: failed to create
+pseudo-terminal: No such file or directory`; `/dev/ptmx` fails even for a plain `bash -lc 'exec
+3<>/dev/ptmx'`, so this Git install's msys runtime cannot provide ptys at all). The hub's
+`bridgeUsable()` checked only the PE header + size, so the bridge was adopted, died immediately, and
+the tier silently became `pipes` — where nano/vim fail with "standard input is not a terminal" and
+NOTHING in the UI said why.
+
+**Lesson:** an integrity check ("this is a plausible binary") is not a capability check ("this binary
+can do the job I am about to give it"). Prove the capability by RUNNING it with the real collaborator,
+and surface the reason when it fails — a silent downgrade reads as "the feature is gone".
+
+**Resolution (2026-10-25):** the msys route stayed broken on that machine, and the fix came from a
+SECOND bridge kind rather than a repair: **Windows ConPTY** (`conhost.exe --headless`) gives the shell a
+real console with no download and no native module, and the hub now probes it after `script.exe` (it
+prefers whichever PROVES it can give the shell a tty). Verified end to end: nano renders through the
+dock. The environment itself turned out to be a resource leak, not a descriptor limit: 16.8M kernel
+event objects, 293 days of uptime, and 130 leaked `bash`+`conhost` pairs from servers that were killed
+hard (which skips the hub's reap). Corollary worth remembering: **killing a server leaves its terminal
+shells and consoles alive** — reap them (or shut down gracefully), or the next pty allocation may fail.

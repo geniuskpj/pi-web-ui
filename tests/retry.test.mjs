@@ -18,7 +18,8 @@
 //   5. auth/context errors are NOT retried (no quota burn)
 //   6. an ✎ edit whose resubmit hit a 429 KEEPS its parked version and continues
 //   7. retry refuses when nothing failed (never regenerates a healthy turn)
-import { registerFauxProvider, fauxAssistantMessage, fauxText } from "@earendil-works/pi-ai";
+// pi-ai 1.4.0: the faux provider + generic dispatcher live on the compat subpath
+import { registerFauxProvider, fauxAssistantMessage, fauxText } from "@earendil-works/pi-ai/compat";
 import { AgentHub } from "../agent-hub.mjs";
 
 let pass = 0, fail = 0;
@@ -233,6 +234,118 @@ async function waitFor(fn, ms = 5000) {
 	check("did NOT retry before the requested wait (10 ms delay overridden by retry-after: 1)", early === false, early ? "retried too early" : "");
 	const later = await waitFor(() => textOf(msgsOf(hub, id).at(-1)).includes("after honouring retry-after"), 4000);
 	check("retried after the requested wait", later);
+}
+
+// --- 4) retry after a 429 that killed the run MID-TOOL-ROUND (user report) ----
+// "toolcall and assistant turn removed after clicking retry": transcript ends
+// user → assistant(thinking+toolCall, NO result) → assistant(429). The old
+// repair stripped the dangling call → assistant tail → RESEND fallback
+// truncated the whole turn. Now the call gets an interrupted toolResult and
+// retry continues FROM the toolcall.
+{
+	const { hub, faux } = makeHub();
+	faux.setResponses([ok("continued after the interrupted tool")]);
+	const id = "retrytest0000000000000000000004";
+	hub.getSession(id, {
+		messages: [
+			{ role: "user", content: [{ type: "text", text: "run the tool" }], timestamp: 0 },
+			{ role: "assistant", content: [{ type: "thinking", thinking: "let me count" }, { type: "toolCall", id: "cx", name: "countme", arguments: {} }], stopReason: "toolUse", timestamp: 1 },
+			// placeholder result so the call survives getSession's hydration repair
+			// (normalizeRestoredMessages strips dangling calls) — removed right after
+			// to recreate the LIVE pre-retry shape: the 429 killed the run before the
+			// tool ever produced a result
+			{ role: "toolResult", toolCallId: "cx", toolName: "countme", content: [{ type: "text", text: "placeholder" }], timestamp: 2 },
+			{ role: "assistant", content: [{ type: "text", text: "" }], stopReason: "error", errorMessage: "429 Too Many Requests — rate limit exceeded", timestamp: 3 },
+		],
+	});
+	hub.sessions.get(id).agent.state.messages.splice(2, 1); // cx now dangles, as live
+	const r = await hub.retry(id);
+	const msgs = msgsOf(hub, id);
+	check("mode = continue (NOT the resend fallback)", r?.ok === true && r.mode === "continue", JSON.stringify(r));
+	check("the toolCall + thinking turn SURVIVES", msgs.some((m) => m.role === "assistant" && Array.isArray(m.content) && m.content.some((p) => p.type === "toolCall" && p.id === "cx")));
+	check("a synthetic interrupted toolResult was created", msgs.some((m) => m.role === "toolResult" && m.toolCallId === "cx" && m.isError === true));
+	check("still one user turn", msgs.filter((m) => m.role === "user").length === 1);
+	check("the retried answer landed", textOf(msgs[msgs.length - 1]).includes("continued after the interrupted tool"));
+}
+
+// --- 5) same death, but the dangling call was ALREADY stripped (restart or ---
+// prompt repair ran first): the transcript ends on a DEAD-END assistant
+// (toolUse, no calls). The dead-end is popped so retry continues from the user
+// turn via continue() — the RESEND fallback (full user-turn re-add) must not fire.
+{
+	const { hub, faux } = makeHub();
+	faux.setResponses([ok("recovered from the dead end")]);
+	const id = "retrytest0000000000000000000005";
+	hub.getSession(id, {
+		messages: [
+			{ role: "user", content: [{ type: "text", text: "run the tool" }], timestamp: 0 },
+			{ role: "assistant", content: [{ type: "thinking", thinking: "let me count" }], stopReason: "toolUse", timestamp: 1 },
+			{ role: "assistant", content: [{ type: "text", text: "" }], stopReason: "error", errorMessage: "429 Too Many Requests — rate limit exceeded", timestamp: 2 },
+		],
+	});
+	const r = await hub.retry(id);
+	const msgs = msgsOf(hub, id);
+	check("dead-end: mode = continue (NOT resend)", r?.ok === true && r.mode === "continue", JSON.stringify(r));
+	check("dead-end: the broken thinking turn is gone", !msgs.some((m) => m.role === "assistant" && m.stopReason === "toolUse"));
+	check("dead-end: still one user turn", msgs.filter((m) => m.role === "user").length === 1);
+	check("dead-end: the retried answer landed", textOf(msgs[msgs.length - 1]).includes("recovered from the dead end"));
+}
+
+// --- 6) auto-retry UI: cancel + fire-time guards (user request 2026-10-24) ----
+// the pending retry must be VISIBLE (runtime.retry) and CANCELLABLE — and the
+// old bugs stay dead: disable cancels pending timers (A1), the callback rechecks
+// enabled/discarded/compacting at fire time, and a refusal burns NO attempt (A2).
+{
+	const { hub, faux } = makeHub();
+	hub.setAutoRetry({ enabled: true, attempts: 3, delayMs: 50 });
+	faux.setResponses([RATE_LIMIT()]);
+	const id = "retrytest0000000000000000000006";
+	hub.getSession(id, { messages: [] });
+	await hub.prompt(id, "hello");
+	const entry = hub.sessions.get(id);
+	// scheduled: runtime.retry is server-driven (every device renders the countdown)
+	const rt1 = hub.getRuntime(id);
+	check("pending retry ships on the runtime frame", rt1?.retry?.state === "scheduled" && rt1.retry.attempt === 1 && rt1.retry.attempts === 3 && typeof rt1.retry.retryAt === "number" && typeof rt1.retry.epoch === "number", JSON.stringify(rt1?.retry));
+	// CANCEL: this pending retry only — auto-retry stays enabled, attempt NOT burned
+	const rc = hub.cancelPendingRetry(id);
+	check("cancelPendingRetry ok", rc?.ok === true, JSON.stringify(rc));
+	check("cancel clears the runtime marker", hub.getRuntime(id)?.retry === undefined);
+	check("cancel does not burn the attempt", entry.retryAttempts === 0);
+	// a NEW failure still auto-schedules (auto-retry itself is still on)
+	faux.setResponses([RATE_LIMIT()]);
+	await hub.prompt(id, "again");
+	check("cancel keeps auto-retry enabled (next failure re-schedules)", hub.getRuntime(id)?.retry?.state === "scheduled" && hub.getRuntime(id)?.retry?.attempt === 1, JSON.stringify(hub.getRuntime(id)?.retry));
+}
+{
+	const { hub, faux } = makeHub();
+	hub.setAutoRetry({ enabled: true, attempts: 3, delayMs: 400 });
+	faux.setResponses([RATE_LIMIT()]);
+	const id = "retrytest0000000000000000000007";
+	hub.getSession(id, { messages: [] });
+	await hub.prompt(id, "hello");
+	check("(disable) pending before the timer fires", hub.getRuntime(id)?.retry?.state === "scheduled");
+	hub.setAutoRetry({ enabled: false }); // A1: must cancel the ALREADY-SCHEDULED timer
+	const callsAfterDisable = faux.calls ?? 0;
+	await new Promise((r) => setTimeout(r, 650)); // past the original fire time
+	check("disable cancels the pending retry (A1) — nothing fired", hub.sessions.get(id).retryPending === null && hub.getRuntime(id)?.retry === undefined && msgsOf(hub, id).at(-1)?.stopReason === "error", JSON.stringify(hub.getRuntime(id)?.retry));
+	check("disable cleared the retryNote", hub.sessions.get(id).retryNote === null);
+}
+{
+	const { hub, faux } = makeHub();
+	hub.setAutoRetry({ enabled: true, attempts: 3, delayMs: 30 });
+	faux.setResponses([RATE_LIMIT()]);
+	const id = "retrytest0000000000000000000008";
+	hub.getSession(id, { messages: [] });
+	await hub.prompt(id, "hello");
+	const entry = hub.sessions.get(id);
+	entry.compacting = true; // compaction starts AFTER scheduling, BEFORE firing
+	// waitMs = delayMs(30) + jitter(0-250) — poll instead of a fixed sleep
+	await waitFor(() => entry.retryPending === null && entry.retryNote === null);
+	check("fire-time compacting guard: NO attempt burned (A2)", entry.retryAttempts === 0 && entry.retryPending === null && entry.retryNote === null, JSON.stringify({ attempts: entry.retryAttempts, note: entry.retryNote }));
+	entry.compacting = false;
+	faux.setResponses([RATE_LIMIT()]);
+	await hub.prompt(id, "later");
+	check("budget intact — next failure is still attempt 1", hub.getRuntime(id)?.retry?.attempt === 1, JSON.stringify(hub.getRuntime(id)?.retry));
 }
 
 console.log(`\n[retry] ${pass} passed, ${fail} failed`);

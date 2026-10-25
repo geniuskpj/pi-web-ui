@@ -12,6 +12,7 @@ fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 try { for (const f of fs.readdirSync(SESSIONS_DIR)) if (f.endsWith(".tmp")) fs.unlinkSync(path.join(SESSIONS_DIR, f)); } catch { /* ignore */ }
 
 import { SESSION_ID_RE } from "./session-id.mjs";
+import { makeVersionsStore } from "./lib/versions-sidecar.mjs";
 const sessionFile = (id) => path.join(SESSIONS_DIR, `${id}.jsonl`);
 // VERSIONS sidecar (user design 2026-10-23): per-session delta records — the
 // removed tail of every edit/rewrite, keyed by a monotonic vid + turn number +
@@ -84,36 +85,13 @@ async function delOne(id) {
 }
 
 // --- versions sidecar (delta records with simple meta) -----------------------
-async function readVersions(id) {
-	let raw = "";
-	try { raw = await fsp.readFile(versionsFile(id), "utf8"); } catch { return []; }
-	return raw.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-}
-
-async function versionsAppend(id, record) {
-	const existing = await readVersions(id);
-	const vid = existing.reduce((m, r) => Math.max(m, Number(r.vid) || 0), 0) + 1;
-	const full = { ...record, vid, at: Date.now() };
-	await fsp.appendFile(versionsFile(id), JSON.stringify(full) + "\n", "utf8");
-	return full;
-}
-
-async function versionsList(id) {
-	// meta only — never ship the message bodies for a list. preview = first text
-	// of the record's first message (80 chars) so the picker rows are readable
-	// (arena review: users distinguish versions by content, not ids)
-	const previewOf = (r) => {
-		const m = (r.messages || [])[0];
-		if (!m) return "";
-		const t = typeof m.content === "string" ? m.content : (m.content || []).filter((b) => b?.type === "text").map((b) => b.text || "").join(" ");
-		return String(t).replace(/\s+/g, " ").trim().slice(0, 80);
-	};
-	return (await readVersions(id)).map((r) => ({ vid: r.vid, at: r.at, turn: r.turn, firstId: r.firstId, count: r.count, reason: r.reason, preview: previewOf(r) }));
-}
-
-async function versionsGet(id, vid) {
-	return (await readVersions(id)).find((r) => Number(r.vid) === Number(vid)) || null;
-}
+// Extracted to lib/versions-sidecar.mjs (content-hash dedupe + sha — clickng
+// "switch to" used to re-park byte-identical tails, user report 2026-10-24);
+// same call signatures as before.
+const versionsStore = makeVersionsStore(SESSIONS_DIR);
+const versionsAppend = (id, record) => versionsStore.append(id, record);
+const versionsList = (id) => versionsStore.list(id);
+const versionsGet = (id, vid) => versionsStore.get(id, vid);
 
 parentPort.on("message", async (msg) => {
 	const { id, op } = msg || {};

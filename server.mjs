@@ -39,9 +39,16 @@ import { WebSocketServer } from "ws";
 import { Agent as UndiciAgent, fetch as undiciFetch } from "undici";
 import util from "node:util";
 import { Agent } from "@earendil-works/pi-agent-core";
+// pi-ai 1.4.0: AgentOptions.streamFn is REQUIRED (compat generic dispatcher)
+import { streamSimple } from "@earendil-works/pi-ai/compat";
+// pi-ai 1.4.0 builtin catalog — the no-.pi fallback for the model list (5.6KB
+// aggregation module; the per-provider model data loads alongside it)
+import { getBuiltinProviders, getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { AgentHub } from "./agent-hub.mjs";
 import { createTerminalHub } from "./terminal-hub.mjs";
 import { stripBoilerplate } from "./lib/hp2.mjs";
+import { netClassOf } from "./lib/net-class.mjs";
+import { planRangeWindow } from "./lib/range-window.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, "public");
@@ -110,8 +117,32 @@ function piConfig() {
 		if (models.length === 0) continue;
 		providers.push({ name, baseUrl: models.find((m) => m.baseUrl)?.baseUrl || "", models });
 	}
+	// CATALOG FALLBACK (user request 2026-10-24): a deploy without .pi (no
+	// models-store.json, or one with no providers) used to boot with ZERO models —
+	// an empty picker that could never chat. pi-ai 1.4.0 ships a maintained builtin
+	// catalog (providers/all — 42 providers, records in exactly the models-store
+	// shape), so seed from it. Options considered: (2) REST GET {baseUrl}/models
+	// discovery — needs a key + network and returns bare ids without metadata
+	// (context window, reasoning flags) — rejected; (3) a backup-model-store.json
+	// in the repo — static, goes stale, duplicates upstream data — rejected. The
+	// builtin catalog is upstream-maintained, offline and key-free. Store entries
+	// ALWAYS win when present: they may carry custom ids/baseUrls the catalog lacks.
+	let catalogFallback = false;
+	if (providers.length === 0) {
+		try {
+			for (const name of getBuiltinProviders()) {
+				const models = getBuiltinModels(name);
+				if (models.length === 0) continue;
+				providers.push({ name, baseUrl: models.find((m) => m.baseUrl)?.baseUrl || "", models });
+			}
+			catalogFallback = providers.length > 0;
+		} catch (err) {
+			console.error("[pi-web] builtin model catalog unavailable:", err?.message || err);
+		}
+	}
 	return {
 		providers,
+		modelSource: providers.length === 0 ? "none" : catalogFallback ? "builtin-catalog" : "models-store",
 		defaults: {
 			provider: settings.default_provider || settings.defaultProvider || undefined,
 			model: settings.default_model || settings.defaultModel || undefined,
@@ -332,7 +363,18 @@ app.use("*", async (c, next) => {
 	}
 });
 
-app.get("/api/health", (c) => c.json({ ok: true, bootId: BOOT_ID, buildId: BUILD_ID, piDir: PI_DIR }));
+app.get("/api/health", (c) => {
+	// TRANSFER POLICY (tail-first plan, 2026-10-24): the client decides tail-only
+	// vs full backfill from navigator.connection + this netClass fallback (the
+	// HTTP layer cannot see the client's link type — peer/Host classification is
+	// the server's only signal; the browser's NIA outranks it client-side).
+	const peer = c.env?.incoming?.socket?.remoteAddress || c.req.header("x-forwarded-for")?.split(",")[0]?.trim() || "";
+	const host = c.req.header("host") || "";
+	// Host parsing + private-range classification live in lib/net-class.mjs: pure,
+	// unit-tested, IPv6-aware (the old inline split(":")[0] broke every IPv6 host).
+	const netClass = netClassOf(peer, host);
+	return c.json({ ok: true, bootId: BOOT_ID, buildId: BUILD_ID, piDir: PI_DIR, netClass });
+});
 app.get("/api/version", (c) => c.json({ buildId: BUILD_ID, bootId: BOOT_ID }));
 app.get("/api/pi/config", (c) => { refreshModelsStore(); agentHub.defaultModelId = piDefaultModelId(); return c.json(piConfig()); });
 // pi system-prompt files — mirror pi-coding-agent resource-loader resolution exactly:
@@ -1829,8 +1871,26 @@ function storeOp(op, payload = {}) {
 
 // --- agent hub (server-side agents) -------------------------------------------
 let piModelsStore = {};
+// CATALOG FALLBACK for the HUB too: _getModel iterates modelsStore[provider].models,
+// so a missing .pi would leave even the /api/pi/config fallback powerless (the picker
+// would list models the hub refuses to run). Same precedence: store entries win.
+function builtinModelsStore() {
+	try {
+		const out = {};
+		for (const name of getBuiltinProviders()) {
+			const models = getBuiltinModels(name);
+			if (models.length === 0) continue;
+			out[name] = { name, models };
+		}
+		return out;
+	} catch (err) {
+		console.error("[pi-web] builtin model catalog unavailable:", err?.message || err);
+		return {};
+	}
+}
 function refreshModelsStore() {
-	try { const j = readJsonSafe("models-store.json"); if (j && typeof j === "object") piModelsStore = j; } catch {}
+	try { const j = readJsonSafe("models-store.json"); if (j && typeof j === "object" && Object.keys(j).length > 0) piModelsStore = j; } catch {}
+	if (Object.keys(piModelsStore).length === 0) piModelsStore = builtinModelsStore();
 }
 refreshModelsStore();
 
@@ -1859,6 +1919,7 @@ const agentHub = new AgentHub({
 	// off. Structured checkpoint format mirrors pi's SUMMARIZATION_PROMPT.
 	summarize: async ({ model, serialized, previousSummary, signal }) => {
 		const summaryAgent = new Agent({
+			streamFn: streamSimple, // pi-ai 1.4.0: streamFn required
 			initialState: {
 				model,
 				thinkingLevel: "off",
@@ -1906,7 +1967,7 @@ import { SESSION_ID_RE } from "./session-id.mjs"; // shared with session-worker.
 let legacySyncPuts = 0; // count of legacy {data,metadata} puts — compat shim (bugs.md #15)
 let lastLegacyPutAt = 0; // epoch ms of last legacy put — decides when the shim can be removed
 const agentClients = new Map();
-const wss = new WebSocketServer({ noServer: true, maxPayload: 25 * 1024 * 1024 });
+const wss = new WebSocketServer({ noServer: true, maxPayload: 25 * 1024 * 1024, perMessageDeflate: process.env.PI_WEB_WS_DEFLATE === "off" ? false : { threshold: 1024, zlibDeflateOptions: { level: 6 } } });
 
 // --- pseudo-terminal hub (NO node-pty): winpty.exe ships with Git for Windows
 // (real hidden console → echo/colors/^C/history); falls back to bash -i over
@@ -2125,6 +2186,8 @@ function agentConn(ws) {
 							modelId: prev.metadata.modelId,
 							thinkingLevel: prev.metadata.thinkingLevel,
 							messages: prev.messages,
+							rewriteSeq: prev.metadata.rewriteSeq,
+							rewrittenFrom: prev.metadata.rewrittenFrom,
 						});
 						} else {
 						// fresh session: honor the client's chosen model/effort (grok r3:
@@ -2132,8 +2195,12 @@ function agentConn(ws) {
 						agentHub.getSession(currentSession, { modelId: m.modelId, thinkingLevel: m.thinkingLevel });
 						}
 					} catch (err) { console.warn("[agent-ws] cold-load:", err.message); }
-					const state = agentHub.getState(currentSession);
-					safeSend(ws, { type: "state", sessionId: currentSession, ...state });
+					// TAIL-FIRST ATTACH (2026-10-24): a client that advertises tailFirst gets
+					// the last ~512KB + a sparse envelope (fromSeq/messageCount) and backfills
+					// the prefix via /range into IDB — instead of every attach shipping 2-7MB.
+					// attach() now hydrates the entry itself before snapshotting (2026-10-24) —
+					// await it so the first frame can never be an empty pre-hydration state
+					await agentHub.attach(currentSession, (msg) => safeSend(ws, msg), { tailFirst: !!m.tailFirst, haveTo: Number(m.haveTo) || 0 });
 					break;
 				}
 				case "prompt": {
@@ -2185,6 +2252,13 @@ function agentConn(ws) {
 					break;
 				}
 
+				case "cancel-retry": {
+					// auto-retry UI (2026-10-24): cancel THIS pending retry only — auto-retry
+					// stays enabled. Attach-gated like retry (acts on the current session).
+					if (!currentSession) { safeSend(ws, { type: "error", id: m.id, error: "attach first" }); break; }
+					safeSend(ws, { type: "retry-cancelled", id: m.id, ...agentHub.cancelPendingRetry(currentSession) });
+					break;
+				}
 				case "fork": {
 					// llama.cpp-webui-style fork: clone the transcript prefix into a NEW
 					// session (original untouched); the client navigates to the new id
@@ -2343,14 +2417,93 @@ app.get("/api/agent/continuation/:id", async (c) => {
 app.get("/api/agent/session/:id", async (c) => {
 	try {
 		const id = c.req.param("id");
+		// ?meta=1 (tail-first plan): metadata ONLY — the open-session flow just needs
+		// existence + counts; shipping the full 2-7.3MB body for a boolean was waste
+		const metaOnly = c.req.query("meta") === "1";
 		if (!agentHub.has(id)) {
 			const stored = await storeOp("get", { id });
 			if (stored?.metadata && stored?.messages) {
-				agentHub.getSession(id, { modelId: stored.metadata.modelId, thinkingLevel: stored.metadata.thinkingLevel, messages: stored.messages });
+				agentHub.getSession(id, { modelId: stored.metadata.modelId, thinkingLevel: stored.metadata.thinkingLevel, messages: stored.messages, rewriteSeq: stored.metadata.rewriteSeq, rewrittenFrom: stored.metadata.rewrittenFrom });
 			}
 		}
+		if (metaOnly) {
+			const st = agentHub.getState(id);
+			return c.json({
+				sessionId: id,
+				exists: !!st.exists,
+				messageCount: Array.isArray(st.messages) ? st.messages.length : 0,
+				rewriteSeq: st.rewriteSeq ?? 0,
+				rewrittenFrom: st.rewrittenFrom ?? 0,
+			});
+		}
 		const state = agentHub.getState(id);
-		return c.json({ sessionId: id, ...state });
+		const payload = JSON.stringify({ sessionId: id, ...state });
+		// wire compression (transfer plan, 2026-10-24): these bodies reach 2-7.3MB
+		// and the browser decompresses Content-Encoding natively — zero client code
+		const accept = c.req.header("accept-encoding") || "";
+		if (Buffer.byteLength(payload, "utf8") > 2048 && /gzip/.test(accept)) { // bytes, not UTF-16 units
+			return c.body(zlib.gzipSync(payload), 200, { "Content-Type": "application/json", "Content-Encoding": "gzip", Vary: "Accept-Encoding" });
+		}
+		return c.body(payload, 200, { "Content-Type": "application/json", Vary: "Accept-Encoding" });
+	} catch (err) { return c.json({ error: err.message }, 500); }
+});
+
+// RANGE endpoint (tail-first client cache, 2026-10-24): a seq window of the
+// CURRENT transcript, raw application/gzip so the client can put the SAME
+// bytes into IndexedDB and DecompressionStream them on read (Content-Encoding
+// would strip gzip before JS). X-headers carry the cache identity.
+app.get("/api/agent/session/:id/range", async (c) => {
+	try {
+		const id = c.req.param("id");
+		if (!agentHub.has(id)) {
+			const stored = await storeOp("get", { id });
+			if (stored?.metadata && stored?.messages) {
+				agentHub.getSession(id, { modelId: stored.metadata.modelId, thinkingLevel: stored.metadata.thinkingLevel, messages: stored.messages, rewriteSeq: stored.metadata.rewriteSeq, rewrittenFrom: stored.metadata.rewrittenFrom });
+			}
+		}
+		const tailBytes = Number(c.req.query("tailBytes")) || 0;
+		let fromSeq = Number(c.req.query("fromSeq")) || 0;
+		let toSeq = c.req.query("toSeq") ? Number(c.req.query("toSeq")) : Infinity;
+		if (tailBytes > 0) {
+			// tail: walk backwards accumulating serialized size (server-side mirror
+			// of the hub's attach tail slice)
+			const st = agentHub.getState(id);
+			const msgs = st.exists ? st.messages : [];
+			let acc = 0, from = msgs.length;
+			while (from > 0 && (acc < tailBytes || from === msgs.length)) {
+				from--;
+				try { acc += JSON.stringify(msgs[from]).length; } catch { acc += 256; }
+			}
+			fromSeq = from;
+			toSeq = Infinity;
+		}
+		// cap uncompressed JSON at 1MB per response — KEEP THE HIGH END (grok review
+		// 01a16a54): expand/tail windows must stay ADJACENT to the loaded tail
+		// (filledFrom). Dropping low seqs (not high) prevents seq gaps next to the
+		// dense window. At least one message is always kept.
+		const range = agentHub.getRange(id, { fromSeq, toSeq });
+		if (!range) return c.json({ error: "session not found" }, 404);
+		// WINDOW PLANNING (review 2026-10-25): the budget walk, the user-turn walk and
+		// the C4 chunk snapping all live in ONE pure, unit-tested place
+		// (lib/range-window.mjs) — both reviewers found bounds bugs in the inline copy
+		// that no test could see. Contract: fromSeq <= start <= end <= min(toSeq, count),
+		// and the headers below describe exactly the bytes in the slice.
+		const { start, end } = planRangeWindow({ messages: range.messages, fromSeq: range.fromSeq, toSeq: range.toSeq, messageCount: range.messageCount });
+		const slice = start >= end ? [] : range.messages.slice(start - range.fromSeq, end - range.fromSeq);
+		const ndjson = slice.map((m) => JSON.stringify(m)).join("\n");
+		// 204 MUST NOT carry a body (RFC 9110) — the headers alone describe the empty
+		// window, and the client keys its "nothing more to load" decision off re <= rs.
+		const gz = slice.length === 0 ? null : zlib.gzipSync(ndjson);
+		return c.body(gz, slice.length === 0 ? 204 : 200, {
+			"Content-Type": "application/x-ndjson",
+			"X-Pi-Encoding": "gzip",
+			"X-Session-Mutate-Epoch": String(range.rewriteSeq),
+			"X-Session-Message-Count": String(range.messageCount),
+			"X-Range-From-Seq": String(start),
+			"X-Range-To-Seq": String(end),
+			"X-Rewritten-From": String(range.rewrittenFrom),
+			Vary: "Accept-Encoding",
+		});
 	} catch (err) { return c.json({ error: err.message }, 500); }
 });
 app.post("/api/agent/session", async (c) => {

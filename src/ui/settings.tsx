@@ -9,6 +9,7 @@ import type { Agent } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import { useEffect, useState } from "preact/hooks";
 import { getAppStorage } from "../storage.js";
+import { enterSendsPref } from "./chat.js";
 import { getProxyUrlSync } from "./proxy-stream.js";
 import { retryServerAuth } from "../server-auth.js"; // re-probe after a token change (clears the banner)
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
@@ -30,10 +31,21 @@ export function SettingsDialog({
 	const [proxyUrl, setProxyUrl] = useState("");
 	const [token, setToken] = useState("");
 	// auto-retry on 429/network errors (default ON) — mirrors localStorage `pi.autoRetry`
+	// (+ attempts/delayMs, auto-retry UI 2026-10-24: the old UI could only toggle on/off
+	// with "3× · 3s" hardcoded in the label — now the real config is editable)
 	const [autoRetry, setAutoRetry] = useState(() => {
 		try { return localStorage.getItem("pi.autoRetry") !== "0"; } catch { return true; }
 	});
+	const [retryAttempts, setRetryAttempts] = useState(() => {
+		try { return Math.max(0, Math.min(10, Number(localStorage.getItem("pi.autoRetryAttempts")) || 3)); } catch { return 3; }
+	});
+	const [retryDelayMs, setRetryDelayMs] = useState(() => {
+		try { return Math.max(1000, Math.min(60000, Number(localStorage.getItem("pi.autoRetryDelayMs")) || 3000)); } catch { return 3000; }
+	});
 	const [keys, setKeys] = useState<string[]>([]);
+	// Enter-key behavior (mobile multi-line, sonnet-5 design): tri-state pref read
+	// from the same localStorage key the Editor consumes (pi.enterSends)
+	const [enterPref, setEnterPref] = useState<string>(() => enterSendsPref());
 	const [quota, setQuota] = useState<{ usage: number; percent: number } | null>(null);
 	const [saved, setSaved] = useState("");
 	// thinking level is read from agent.state at render (no stale local snapshot —
@@ -222,6 +234,28 @@ export function SettingsDialog({
 					</section>
 
 					<section class="pw-set-section">
+						<h3>Composer</h3>
+						<label class="pw-set-row">
+							<span>Enter key</span>
+							<select
+								class="pi-input pw-set-input"
+								value={enterPref}
+								onChange={(e) => {
+									const v = (e.target as HTMLSelectElement).value;
+									setEnterPref(v as any);
+									try { localStorage.setItem("pi.enterSends", v); } catch { /* quota */ }
+									flash(v === "always" ? "Enter sends — Shift+Enter for newline" : v === "never" ? "Enter makes a newline — send with the button" : "Enter: auto (newline on touch, send on desktop)");
+								}}
+							>
+								<option value="auto">Auto — newline on touch, send on desktop</option>
+								<option value="always">Always send</option>
+								<option value="never">Always newline (send with the button)</option>
+							</select>
+						</label>
+						<div class="pw-hint">Long-press one of YOUR messages to edit it on touch screens. Ctrl/Cmd+Enter always sends, in every mode.</div>
+					</section>
+
+					<section class="pw-set-section">
 						<h3>CORS proxy</h3>
 						<label class="pw-set-row">
 							<input
@@ -252,16 +286,45 @@ export function SettingsDialog({
 									const on = (e.target as HTMLInputElement).checked;
 									setAutoRetry(on);
 									try { localStorage.setItem("pi.autoRetry", on ? "1" : "0"); } catch { /* quota */ }
-									void (agent as any)?.setAutoRetry?.({ enabled: on });
-									flash(on ? "Auto-retry on (3× · 3s)" : "Auto-retry off");
+									void (agent as any)?.setAutoRetry?.({ enabled: on, attempts: retryAttempts, delayMs: retryDelayMs });
+									flash(on ? `Auto-retry on (${retryAttempts}× · ${Math.round(retryDelayMs / 1000)}s)` : "Auto-retry off");
 								}}
 							/>
-							<span>Auto-retry on rate limit / network errors — 3 attempts, 3 s apart</span>
+							<span>Auto-retry on rate limit / network errors</span>
 						</label>
+						<div class="pw-set-subrow" aria-disabled={!autoRetry ? "true" : undefined}>
+							<label class="pw-set-inline">
+								<span>Attempts</span>
+								<input
+									type="number" min={0} max={10} step={1} disabled={!autoRetry}
+									value={retryAttempts}
+									onChange={(e) => {
+										const v = Math.max(0, Math.min(10, Math.floor(Number(e.currentTarget.value)) || 0));
+										setRetryAttempts(v);
+										try { localStorage.setItem("pi.autoRetryAttempts", String(v)); } catch { /* quota */ }
+										void (agent as any)?.setAutoRetry?.({ enabled: autoRetry, attempts: v, delayMs: retryDelayMs });
+									}}
+								/>
+							</label>
+							<label class="pw-set-inline">
+								<span>Delay (s)</span>
+								<input
+									type="number" min={1} max={60} step={1} disabled={!autoRetry}
+									value={Math.round(retryDelayMs / 1000)}
+									onChange={(e) => {
+										const v = Math.max(1, Math.min(60, Math.floor(Number(e.currentTarget.value)) || 1)) * 1000;
+										setRetryDelayMs(v);
+										try { localStorage.setItem("pi.autoRetryDelayMs", String(v)); } catch { /* quota */ }
+										void (agent as any)?.setAutoRetry?.({ enabled: autoRetry, attempts: retryAttempts, delayMs: v });
+									}}
+								/>
+							</label>
+						</div>
 						<div class="pw-hint">
 							A retry drops the 429/error message and continues the same transcript at the failure point: the user
-							turn stays exactly once and tool calls that already finished are not re-run. Parked ✎-edit versions
-							survive a retry.
+							turn stays exactly once and tool calls that already finished are not re-run. While a retry is pending
+							the chat shows a countdown — <b>Cancel</b> stops this pending retry (auto-retry stays on for future
+							errors), <b>Retry now</b> fires it immediately. Parked ✎-edit versions survive a retry.
 						</div>
 					</section>
 

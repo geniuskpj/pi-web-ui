@@ -26,15 +26,20 @@
     "test:fetch": "node tests/fetch-tool.test.mjs",
     "test:fork": "node tests/fork-rewrite.test.mjs",
     "test:versions": "node tests/versions.test.mjs",
+    "test:range": "node tests/range.test.mjs",
     "test:compact": "node tests/compact.test.mjs",
     "test:shutdown": "node tests/shutdown.test.mjs",
     "test:killstop": "node tests/killstop.e2e.mjs",
     "test:zombie": "node tests/zombie.test.mjs",
-    "test:retry": "node tests/retry.test.mjs"
+    "test:retry": "node tests/retry.test.mjs",
+    "test:idb": "node tests/idb-cache.test.mjs",
+    "test:hydration": "node tests/hub-hydration.test.mjs",
+    "test:gate": "node tests/display-gate.test.mjs",
+    "test:pty": "node tests/term-pty.test.mjs"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "0.75.3",
-    "@earendil-works/pi-ai": "0.75.3",
+    "@earendil-works/pi-agent-core": "1.4.0",
+    "@earendil-works/pi-ai": "1.4.0",
     "@hono/node-server": "^1.13.7",
     "diff": "^8.0.4",
     "domhandler": "^6.0.1",
@@ -63,8 +68,5 @@
   },
   "allowScripts": {
     "esbuild@0.25.12": true
-  },
-  "engines": {
-    "node": ">=22"
   }
 }

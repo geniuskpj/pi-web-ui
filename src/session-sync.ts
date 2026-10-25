@@ -30,6 +30,17 @@ export interface RuntimeRecord {
 	pendingPrompts?: number;
 	clients?: number;
 	seq?: number;
+	// auto-retry UI (2026-10-24): server-driven pending countdown / give-up note.
+	// Presence is the signal — absent when nothing is pending.
+	retry?: {
+		state: "scheduled" | "given-up";
+		attempt?: number;
+		attempts?: number;
+		retryAt?: number; // epoch ms (server clock) — clients tick locally
+		delayMs?: number;
+		epoch?: number;
+		note?: string;
+	};
 }
 
 type AnyRecord = Record<string, any>;

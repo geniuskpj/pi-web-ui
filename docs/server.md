@@ -148,6 +148,14 @@ inside the mutation queue.
 6. Write-back restores BOM + original CRLF; `details` carries jsdiff context diff, unified patch,
    `firstChangedLine`, `matchForm`. No-op (identical content) is an error.
 
+**attach + hydration (2026-10-24)**: `/ws/agent` `{type:"attach"}` and `AgentHub.attach()` HYDRATE first —
+`attach()` awaits `_ensureEntry()` before it builds the state snapshot, so a session whose entry was
+created by an earlier attach/prompt/raced store read can never ship an empty window. `entry.hydrated`
+is the flag: `getSession(id, {messages})` sets it (the caller asserts the transcript), `_ensureEntry()`
+sets it after a successful store load, and a store miss sets it WITHOUT retrying per call. Hydration only
+fills an entry that has no non-system messages — a live transcript is never overwritten — and a store
+*error* leaves the flag false so a later call retries. Regression suite: `npm run test:hydration`.
+
 **bash**: spawn `BASH_PATH -c <cmd>` (verified constant path; `PI_WEB_BASH_SHELL` override), cwd =
 WORKSPACE_DIR, env = `getShellEnv()` (prepends PI bin dir, bash's dir — msys DLL resolution — and the
 running node's dir to PATH). Two sinks per stream: RAW-BYTE spill file (≤256MB, best-effort) and a
