@@ -1604,6 +1604,19 @@ html.dark { --stat-warn: #fbbf24; --stat-danger: #f87171; --stat-ok: #4ade80; --
 @media (prefers-reduced-motion: reduce) {
 	.pw-dot-wait { animation: none; }
 }
+/* why the pipe tier is in use (no pty → nano/vim unavailable): the reason
+   must be readable without hovering a tooltip */
+.pw-term-note {
+	padding: 2px 10px;
+	font-size: 11px;
+	line-height: 1.5;
+	color: var(--warn, #e0a23c);
+	background: rgba(224, 162, 60, 0.08);
+	border-bottom: 1px solid rgba(224, 162, 60, 0.25);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
 .pw-term-status {
 	white-space: nowrap;
 	overflow: hidden;

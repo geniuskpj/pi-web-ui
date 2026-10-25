@@ -269,6 +269,55 @@ function bridgeUsable(p) {
 	}
 }
 
+// INTEGRITY vs CAPABILITY (user report 2026-10-25): bridgeUsable() only proves the
+// file is a PE image of a sane size. It says nothing about whether that image can
+// allocate a pty in THIS environment — and msys2's script.exe binds the msys
+// runtime that ships with Git for Windows, which is a different build. When it
+// cannot (observed: "script: failed to create pseudo-terminal: No such file or
+// directory"), the pty tier fell back to pipes and the user-visible symptom was
+// "nano is not working / script.exe is gone" with nothing in the UI explaining it.
+// So run the candidate once, with the SHELL IT WILL DRIVE, and remember the
+// verdict (plus the bridge's own stderr, which is the actual diagnosis).
+//
+// -e/--return makes script propagate the child's exit status, so with a bash path
+// this checks the WHOLE property: bash must see isatty(stdin) === true.
+let bridgeVerdict = null; // { exe, bash, ok, reason }
+// exported for tests/term-pty.test.mjs: the probe is the fix, so it must be pinned
+// (it is what stops a present-but-incapable bridge from being adopted silently)
+export function bridgeProbe(exe, bashPath) {
+	const key = `${exe}|${bashPath || ""}`;
+	if (bridgeVerdict && bridgeVerdict.key === key) return bridgeVerdict;
+	const fwd = (p) => String(p).replace(/\\/g, "/");
+	const cmdLine = bashPath ? `"${fwd(bashPath)}" -c "test -t 0"` : "exit 0";
+	let ok = false, reason = null;
+	try {
+		const r = spawnSync(exe, ["-q", "-f", "-e", "-c", cmdLine, "/dev/null"], { stdio: "pipe", timeout: 5000, windowsHide: true, encoding: "utf8" });
+		ok = r.status === 0;
+		if (!ok) reason = (String(r.stderr || "").trim() || `exit ${r.status}`).slice(0, 300);
+	} catch (err) {
+		reason = String(err?.message || err).slice(0, 300);
+	}
+	bridgeVerdict = { key, exe, bash: bashPath || null, ok, reason };
+	return bridgeVerdict;
+}
+
+/** Find a bridge that can actually create a pty for THIS shell. The provisioned
+ *  exe is tried first (the intended path), then anything beside the shell itself
+ *  (a Git build that happens to ship one) — each candidate is PROVEN, and the
+ *  failure reason of the last one is what the UI gets to show. */
+function pickBridge(dataDir, bashPath) {
+	const seen = new Set();
+	const cands = [scriptBridgePath(dataDir), bashPath ? path.join(path.dirname(bashPath), SCRIPT_EXE_NAME) : null]
+		.filter((p) => p && !seen.has(p) && seen.add(p) && bridgeUsable(p));
+	let last = null;
+	for (const c of cands) {
+		const v = bridgeProbe(c, bashPath);
+		if (v.ok) return { exe: c, note: null };
+		last = v;
+	}
+	return { exe: null, note: last ? `${SCRIPT_EXE_NAME} cannot create a pty here — ${last.reason}` : null };
+}
+
 function provisionScriptBridge(dataDir, debug) {
 	const exe = scriptBridgePath(dataDir);
 	if (bridgeUsable(exe)) return Promise.resolve(exe);
@@ -313,6 +362,9 @@ function provisionScriptBridge(dataDir, debug) {
 				if (r.status !== 0) throw new Error(`tar exited ${r.status}: ${String(r.stderr || "").slice(0, 200)}`);
 				const extracted = path.join(tmpDir, SCRIPT_EXE_NAME);
 				if (!bridgeUsable(extracted)) throw new Error("script.exe missing or invalid after extraction");
+				// do not ADOPT a bridge that cannot allocate a pty (see bridgeProbe)
+				const probe = bridgeProbe(extracted, null);
+				if (!probe.ok) throw new Error(`pinned bridge cannot create a pty: ${probe.reason}`);
 				fs.renameSync(extracted, exe); // atomic publish
 				debug("[term] provisioned msys pty bridge:", exe);
 				return exe;
@@ -483,7 +535,12 @@ export function createTerminalHub({
 	function stateFrame(sess) {
 		return {
 			t: "state",
-			s: { phase: sess.phase, tier: sess.tier, exit: sess.exit, error: sess.error ? stripWs(sess.error) : null, pid: sess.pid },
+			s: {
+				phase: sess.phase, tier: sess.tier, exit: sess.exit, error: sess.error ? stripWs(sess.error) : null, pid: sess.pid,
+				// why the pipe tier is in use, when it is a BRIDGE problem — the user-visible
+				// half of the fix: "terminal is in pipes mode" is not a diagnosis.
+				bridgeNote: sess.bridgeNote ? stripWs(sess.bridgeNote) : null,
+			},
 		};
 	}
 
@@ -623,6 +680,7 @@ export function createTerminalHub({
 		// never exits non-zero on its own otherwise
 		if (sess.tier === "pty" && !sess.fallbackTried && !sess.resetting && code !== 0 && elapsed < PTY_FALLBACK_MS) {
 			sess.fallbackTried = true;
+			sess.bridgeNote = sess.bridgeNote || "the pty bridge died immediately — pipe tier active (nano/vim need a real pty)";
 			debug("[term] pty bridge died instantly — falling back to pipe tier");
 			beginSpawn(sess, "pipes");
 			// banner WITHOUT the phase flip: the noise filter must stay armed
@@ -672,8 +730,13 @@ export function createTerminalHub({
 			} else if (override !== "auto") {
 				bridge = override;
 			} else {
-				bridge = bridgeUsable(scriptBridgePath(dataDir)) ? scriptBridgePath(dataDir) : null;
-				if (!bridge) void ensureBridge(); // keep provisioning in the background
+				// CAPABILITY, not just integrity: pickBridge runs each candidate once and
+				// keeps the reason when none works, so the client can SAY why nano/vim are
+				// unavailable instead of silently serving the pipe tier.
+				const picked = pickBridge(dataDir, bashPath);
+				bridge = picked.exe;
+				if (!bridge && picked.note) sess.bridgeNote = picked.note;
+				if (!bridgeUsable(scriptBridgePath(dataDir))) void ensureBridge(); // keep provisioning in the background
 			}
 		}
 		// sh -c injection guard (grok P1-7): the -c command string is parsed by sh —
