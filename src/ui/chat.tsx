@@ -31,6 +31,7 @@ import type { SystemNotificationMessage } from "../llm.js";
 import { getAppStorage } from "../storage.js";
 import { looksLikeAuthError, createApiKeyResolver } from "./proxy-stream.js";
 import { copyText } from "../id.js";
+import { gateIndex, gateSeqOfLastUser, prevUserSeq, resolveGateSeq } from "../../lib/display-gate.mjs";
 import { FilePickerDialog, type PickedFile } from "./file-picker.js";
 import { TerminalPanel, termBus } from "./terminal.js";
 import { renderMarkdown } from "./markdown.js";
@@ -682,39 +683,39 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 	// already in memory, a /range fetch when it isn't. null = show everything
 	// (small sessions / full state frames — never gated). Only sparse (large)
 	// sessions get the gated view.
-	const [displayFrom, setDisplayFrom] = useState<number | null>(null);
+	// SEQ SPACE (review 2026-10-25 #4): the gate is the SEQ of the last user turn,
+	// never an array index — fillWindow prepends older messages (and mutates the
+	// sparse envelope in place, so the "new envelope" trigger never fires again) and
+	// a fully-warm reopen attaches an EMPTY window where no index exists at all.
+	// Before this, the warm path rendered the whole filled window instead of one turn.
+	const [displayFromSeq, setDisplayFromSeq] = useState<number | null>(null);
 	const sparseSeen = useRef<any>(null);
-	const displayFromRef = useRef<number | null>(null);
-	displayFromRef.current = displayFrom;
 	// SYNC: a NEW sparse envelope (attach) gates the view to the LAST user turn;
 	// full state frames / small chats (no sparse) clear the gate.
 	useEffect(() => {
 		const sp = (state as any).sparse;
 		if (sp && sp !== sparseSeen.current) {
 			sparseSeen.current = sp;
-			let idx = 0;
-			for (let i = state.messages.length - 1; i >= 0; i--) if (state.messages[i]?.role === "user") { idx = i; break; }
-			setDisplayFrom(idx);
-		} else if (!sp && sparseSeen.current) { sparseSeen.current = null; setDisplayFrom(null); }
+			setDisplayFromSeq(gateSeqOfLastUser(state.messages, Number(sp.filledFrom ?? sp.fromSeq) || 0));
+		} else if (!sp && sparseSeen.current) { sparseSeen.current = null; setDisplayFromSeq(null); }
 	});
 	/** ⤒ reveal the PREVIOUS user turn: pure view change when it is already in
 	 *  memory (instant); a /range fetch (user-turn aligned server-side) when it
-	 *  isn't. Anchor by message IDENTITY — array indices shift on prepend. */
+	 *  isn't. Anchor by message IDENTITY (indices shift on prepend) and store the
+	 *  gate as a SEQ, so the next prepend cannot invalidate it. */
 	const expandTurns = async () => {
 		const msgs = state.messages;
 		const df = displayFromRef.current ?? 0;
-		for (let i = df - 1; i >= 0; i--) {
-			if (msgs[i]?.role === "user") { setDisplayFrom(i); return; }
-		}
+		const prev = prevUserSeq(msgs, df - 1, filledSeq);
+		if (prev != null) { setDisplayFromSeq(prev); return; }
 		const anchor = msgs[df] || msgs[msgs.length - 1];
 		const ok = await (agent as any).expandEarlier?.();
 		if (!ok) { note("could not load earlier turns — check the server log"); return; }
 		const arr = state.messages;
+		const newFilled = Number((state as any).sparse?.filledFrom ?? 0) || 0;
 		const anchorIdx = anchor ? arr.indexOf(anchor) : -1;
-		for (let i = (anchorIdx >= 0 ? anchorIdx : arr.length) - 1; i >= 0; i--) {
-			if (arr[i]?.role === "user") { setDisplayFrom(i); return; }
-		}
-		setDisplayFrom(0);
+		const prev2 = prevUserSeq(arr, (anchorIdx >= 0 ? anchorIdx : arr.length) - 1, newFilled);
+		setDisplayFromSeq(prev2 != null ? prev2 : newFilled);
 	};
 	// UI-ONLY streaming partials for running tools (never enters messages)
 	const partials = useRef(new Map<string, string>());
@@ -1014,6 +1015,16 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 	};
 
 	const state = agent.state;
+	// derived PER RENDER from the gate seq (see the gate comment above) — the seq
+	// survives every prefix fill, the index never did
+	const filledSeq = Number((state as any).sparse?.filledFrom ?? (state as any).sparse?.fromSeq) || 0;
+	// resolveGateSeq re-anchors the fallback an empty-window attach had to use (see
+	// lib/display-gate.mjs) — that is what makes a fully-warm reopen show ONE turn
+	// instead of the whole filled window.
+	const gateSeq = resolveGateSeq(displayFromSeq, filledSeq, state.messages);
+	const displayFrom = gateIndex(gateSeq, filledSeq, state.messages.length);
+	const displayFromRef = useRef<number | null>(null);
+	displayFromRef.current = displayFrom;
 	// compact progress: server truth (state.compacting) drives the banner so ALL
 	// devices see it and it survives a client-side await timeout (the server
 	// keeps compacting and the next state frame clears the banner)
@@ -1121,7 +1132,7 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 							class="pw-expand-btn"
 							onClick={() => { void expandTurns(); }}
 						>
-							⤒ Load earlier turns{displayFrom ? ` (${displayFrom} msgs hidden)` : ""}
+							⤒ Load earlier turns{gateSeq ? ` (${gateSeq} msgs hidden)` : ""}
 						</button>
 					</div>
 					)}
