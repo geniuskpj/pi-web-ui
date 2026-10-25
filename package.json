@@ -33,7 +33,9 @@
     "test:zombie": "node tests/zombie.test.mjs",
     "test:retry": "node tests/retry.test.mjs",
     "test:idb": "node tests/idb-cache.test.mjs",
-    "test:hydration": "node tests/hub-hydration.test.mjs"
+    "test:hydration": "node tests/hub-hydration.test.mjs",
+    "test:gate": "node tests/display-gate.test.mjs",
+    "test:pty": "node tests/term-pty.test.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "1.4.0",
