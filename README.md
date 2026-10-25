@@ -139,7 +139,7 @@ Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
   deps, e.g. `@opentelemetry/api`, and fails — that is what broke CI on node 18/20/22).
 - **Node ≥ 22** (`engines` in package.json; 18/20 are EOL — 18 never worked, `npm run
   build` fails there because npm 9 drops the file: overrides). CI: `.github/workflows/ci.yml`
-  runs node 22 + 24 on ubuntu + windows — `npm ci` → `typecheck` → `build` → the hermetic
+  runs node 22 + 24 on Ubuntu — Windows is temporarily disabled on this branch — `npm ci` → `typecheck` → `build` → the hermetic
   suites (store, runtime, ssrf, retry, security-gates). The real-LLM suites
   (`test:agent`, `test:steer`, `test:killstop`) and the Windows/pty-specific `term-smoke`
   stay opt-in; `compact`/`fork`/`shutdown` need a bash/pty host, so they are local too.
