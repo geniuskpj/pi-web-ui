@@ -73,5 +73,6 @@ jobs:
           npm run test:hydration
           npm run test:gate
           npm run test:pty
+          npm run test:toolcall
       - name: "Tests (security gates — token + origin/Host allowlist)"
         run: npm run test:security
