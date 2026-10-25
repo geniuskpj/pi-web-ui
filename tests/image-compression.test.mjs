@@ -18,7 +18,7 @@ import zlib from "node:zlib";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createMediaStore, hashOf, hydrateImageData, missingImageHashes } from "../lib/media-egress.mjs";
+import { createMediaStore, hashOf, hydrateImageData, missingImageHashes, sniffImageMime } from "../lib/media-egress.mjs";
 import { size } from "./_wire-bytes.mjs";
 
 let passed = 0, failed = 0;
@@ -130,6 +130,28 @@ const row = (name, from, to) => `    ${name.padEnd(26)} ${size(from.length).padS
 		check("D1b the file on disk is exactly the image — not base64, not JSON", fs.statSync(path.join(dir, hash.slice(0, 2), hash)).size === png.length);
 		check("D2 RETENTION server (default): the blob is on disk, so a restart, a retry or another device can still read it",
 			store.get(hash)?.persisted === true && store.has(hash));
+		// grok review 2026-10-25: promotion (memory-only → disk) and eviction that cannot drop the ONLY copy
+		check("D2c a memory-only image is PROMOTED to disk when the retention changes (first writer no longer wins)",
+			(() => {
+				const d2 = fs.mkdtempSync(path.join(os.tmpdir(), "pi-media-promo-"));
+				try {
+					const s = createMediaStore({ dir: d2 });
+					const h = hashOf(png);
+					s.put(h, png, "image/png", { persist: false });
+					const before = fs.existsSync(path.join(d2, h.slice(0, 2), h));
+					s.put(h, png, "image/png", { persist: true });
+					return before === false && s.get(h).persisted === true && fs.existsSync(path.join(d2, h.slice(0, 2), h));
+				} finally { fs.rmSync(d2, { recursive: true, force: true }); }
+			})());
+		check("D2d eviction never drops the only (memory-only) copy while persisted blobs remain",
+			(() => {
+				const s = createMediaStore({ maxBytes: 200 * 1024, dir });
+				const mem = Buffer.concat([png, Buffer.from("mem")]);
+				const disk = Buffer.concat([png, Buffer.from("disk")]);
+				s.put(hashOf(mem), mem, "image/png", { persist: false });
+				for (let i = 0; i < 5; i++) s.put(hashOf(Buffer.concat([disk, Buffer.from(String(i))])), Buffer.concat([disk, Buffer.from(String(i))]), "image/png");
+				return s.get(hashOf(mem)) !== null;   // the un-restorable one survived the pressure
+			})());
 		check("D2b RETENTION browser: the same put with persist:false leaves nothing on disk",
 			(() => {
 				const other = Buffer.concat([png, Buffer.from("\u0000variant")]);
@@ -156,6 +178,17 @@ const row = (name, from, to) => `    ${name.padEnd(26)} ${size(from.length).padS
 			missingImageHashes(hydrated).length === 0);                                               // hydrated ⇒ nothing missing
 		check("D5d the Content-Type survives a restart (magic-byte sniff, not the transcript)",
 			(() => { const cold = createMediaStore({ dir }); return cold.get(hash)?.mimeType === "image/png"; })());
+		// grok review 2026-10-25, should-fix: the sniffer must not guess wildly
+		check("D6 a short JPEG sniffs as image/jpeg (3 bytes are enough)", sniffImageMime(Buffer.from([0xff, 0xd8, 0xff, 0xe0])) === "image/jpeg");
+		check("D6b an MP4/MOV (ftyp but not an image brand) is NOT called an image",
+			sniffImageMime(Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from("ftypisom", "ascii"), Buffer.alloc(8)])) === "application/octet-stream");
+		check("D6c the real ISO-BMFF image brands still resolve",
+			sniffImageMime(Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from("ftypavif", "ascii"), Buffer.alloc(8)])) === "image/avif" &&
+			sniffImageMime(Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from("ftypheic", "ascii"), Buffer.alloc(8)])) === "image/heic");
+		check("D6d an empty/odd buffer is octet-stream, never a crash", sniffImageMime(Buffer.alloc(0)) === "application/octet-stream" && sniffImageMime(null) === "application/octet-stream");
+		// grok review: an empty `data` string counts as MISSING
+		check("D6e data:'' is reported as missing, not as present",
+			missingImageHashes([{ role: "user", content: [{ type: "image", mimeType: "image/png", hash, data: "" }] }]).length === 1);
 		check("D5b …and nothing on disk grew a base64 copy of it",
 			fs.readdirSync(path.join(dir, hash.slice(0, 2))).every((f) => fs.statSync(path.join(dir, hash.slice(0, 2), f)).size <= png.length));
 	} finally {

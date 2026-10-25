@@ -144,7 +144,8 @@ export class AgentHub {
 			maxBytes: Math.max(8, Number(process.env.PI_WEB_MEDIA_CACHE_MB) || 64) * 1024 * 1024,
 			dir: mediaDir || null,
 		});
-		this._redacted = new WeakMap(); // messages-array → redacted copy (once per object)
+		this._redactedMsg = new WeakMap(); // message object → its redacted twin (once per object)
+		this.mediaPersist = true;          // retention: "server" (default) = persist to disk
 		// server-side toolset (2026-10-21): the SAME builtin+extension tools the exec
 		// bridge exposes — executed IN THIS PROCESS by the server-side agent loop, so
 		// a run survives browser closes and every device sees live progress
@@ -852,11 +853,30 @@ export class AgentHub {
 	 */
 	redactMessages(messages) {
 		if (!Array.isArray(messages) || !messages.length) return messages;
-		const cached = this._redacted.get(messages);
-		if (cached) return cached;
-		const out = redactImageData(messages, { store: this.media }).messages;
-		if (out !== messages) this._redacted.set(messages, out);
-		return out;
+		// CACHE PER MESSAGE OBJECT, never per array (grok review 2026-10-25, blocker 4):
+		// `state.messages` is one long-lived array that the agent PUSHES into — caching the container
+		// would freeze the transcript at its first-redacted length and hide every later turn.
+		this._redactedMsg ||= new WeakMap();
+		let changed = false;
+		const out = messages.map((m) => {
+			if (!Array.isArray(m?.content)) return m;
+			const hit = this._redactedMsg.get(m);
+			// a CACHED twin still counts as "changed" for THIS call, or a transcript that was redacted
+			// once would be returned as the ORIGINAL array (with the inline base64 back) on every later
+			// egress — the leak this whole file exists to prevent (caught by L14 in the suite).
+			if (hit) { changed ||= hit !== m; return hit; }
+			const redacted = redactImageData([m], { store: this.media, persist: this.mediaPersist }).messages[0];
+			if (redacted !== m) this._redactedMsg.set(m, redacted);
+			changed ||= redacted !== m;
+			return redacted;
+		});
+		return changed ? out : messages;
+	}
+
+	/** RETENTION (Settings → Data use → Image storage): false = keep bytes in memory only. */
+	setMediaPersist(persist) {
+		this.mediaPersist = persist !== false;
+		return this.mediaPersist;
 	}
 
 	/** One egress FRAME (state or agent-event) with every inline image replaced by its hash. */
@@ -864,6 +884,7 @@ export class AgentHub {
 		if (!msg || typeof msg !== "object") return msg;
 		if (Array.isArray(msg.messages)) {
 			const messages = this.redactMessages(msg.messages);
+			// the in-flight snapshot is its own message object → the same per-message cache applies
 			const streaming = msg.streamingMessage ? this.redactMessages([msg.streamingMessage])[0] : msg.streamingMessage;
 			if (messages === msg.messages && streaming === msg.streamingMessage) return msg;
 			return { ...msg, messages, streamingMessage: streaming ?? null };
@@ -877,6 +898,15 @@ export class AgentHub {
 	/** The bytes behind a hash (for GET /api/agent/session/:id/media/:hash). */
 	getMedia(hash) {
 		return this.media.get(hash);
+	}
+
+	/**
+	 * The in-flight assistant snapshot of a session, if any — the reducer SEEDS itself with it, because
+	 * attach/GET deliver it in full and a fresh reducer starting at 0 would truncate the client
+	 * backwards (grok review 2026-10-25, blocker 3).
+	 */
+	streamingSnapshot(sessionId) {
+		return this.sessions.get(sessionId)?.agent?.state?.streamingMessage ?? null;
 	}
 
 	/**

@@ -100,18 +100,42 @@ const paragraphCfg = (over = {}) => normalizeReductionConfig({ net: "wan", think
 	const cfg = paragraphCfg();
 	const r = createStreamReducer(cfg);
 	const toolUpdate = (id) => ({ type: "agent-event", sessionId: sess, seq: 3, event: { type: "tool_execution_update", toolCallId: id, toolName: "bash", partialResult: { output: "…" } } });
+	// grok review 2026-10-25, should-fix: thinning is PER TOOL, the first update after a start always
+	// ships, and the last held one is forwarded before the result
+	const started = r.transform({ type: "agent-event", sessionId: sess, seq: 2, event: { type: "tool_execution_start", toolCallId: "t1", toolName: "bash" } }, 990);
 	const first = r.transform(toolUpdate("t1"), 1000);
 	const soon = r.transform(toolUpdate("t1"), 1100);   // 100ms later: inside the 500ms window
-	const later = r.transform(toolUpdate("t1"), 1700);  // 700ms later: allowed
+	const other = r.transform({ ...toolUpdate("t2"), event: { ...toolUpdate("t2").event, toolCallId: "t2" } }, 1150);
+	const later = r.transform(toolUpdate("t1"), 1700);  // 700ms later: allowed again
 	check("T1 tool progress frames are THINNED (one per idleMs), not removed",
-		first?.event.type === "tool_execution_update" && soon === null && later?.event.type === "tool_execution_update",
+		started?.event.type === "tool_execution_start" && first?.event.type === "tool_execution_update" && soon === null && later?.event.type === "tool_execution_update",
 		`first=${!!first} soon=${soon} later=${!!later}`);
+	check("T1b the throttle is PER TOOL: a second tool is not silenced by the first one's clock",
+		other?.event.toolCallId === "t2", `t2=${!!other}`);
 	check("T2 the thinning is counted as dropped (visible in the debug line)", r.stats().dropped === 1 && r.stats().byKind.tool === 1);
+	check("T2b the FIRST update after a start is never swallowed", first !== null);
 	const endMode = createStreamReducer(normalizeReductionConfig({ net: "wan", thinkingLevel: "turnEnd" }));
 	check("T3 turnEnd mode holds tool progress entirely (nothing renders it before the result)",
 		endMode.transform(toolUpdate("t1"), 1000) === null);
 	const endFrame = { type: "agent-event", sessionId: sess, seq: 4, event: { type: "tool_execution_end", toolCallId: "t1", toolName: "bash", result: { output: "done" } } };
-	check("T4 the tool RESULT always arrives (in every mode)", r.transform(endFrame) === endFrame && endMode.transform(endFrame) === endFrame);
+	check("T4 the tool RESULT always arrives (in every mode)", Array.isArray(r.transform(endFrame)) || r.transform(endFrame) === endFrame);
+	check("T4b the LAST held progress frame ships WITH the result (two frames)",
+		(() => {
+			const g = createStreamReducer(paragraphCfg());
+			g.transform({ type: "agent-event", sessionId: sess, seq: 1, event: { type: "tool_execution_start", toolCallId: "z", toolName: "bash" } }, 1000);
+			g.transform({ type: "agent-event", sessionId: sess, seq: 2, event: { type: "tool_execution_update", toolCallId: "z", partialResult: { output: "first" } } }, 1001);
+			g.transform({ type: "agent-event", sessionId: sess, seq: 3, event: { type: "tool_execution_update", toolCallId: "z", partialResult: { output: "newest" } } }, 1010);
+			const out = g.transform({ type: "agent-event", sessionId: sess, seq: 4, event: { type: "tool_execution_end", toolCallId: "z", result: { output: "done" } } }, 1020);
+			return Array.isArray(out) && out[0].event.type === "tool_execution_update" && out[0].event.partialResult.output === "newest" && out[1].event.type === "tool_execution_end";
+		})());
+	check("T5 endMode holds even the last progress frame (only the result ships)",
+		(() => {
+			const g = createStreamReducer(normalizeReductionConfig({ net: "wan", thinkingLevel: "turnEnd" }));
+			g.transform({ type: "agent-event", sessionId: sess, seq: 1, event: { type: "tool_execution_start", toolCallId: "y", toolName: "bash" } }, 1000);
+			const u = g.transform({ type: "agent-event", sessionId: sess, seq: 2, event: { type: "tool_execution_update", toolCallId: "y", partialResult: {} } }, 1010);
+			const e = g.transform({ type: "agent-event", sessionId: sess, seq: 3, event: { type: "tool_execution_end", toolCallId: "y", result: {} } }, 1020);
+			return u === null && e?.event?.type === "tool_execution_end";
+		})());
 }
 
 // ───────────────────────────────────────────────────── G: the guarantees
@@ -155,8 +179,13 @@ const paragraphCfg = (over = {}) => normalizeReductionConfig({ net: "wan", think
 	check("G3 an error is never swallowed and the buffered text ships WITH it (two frames)",
 		Array.isArray(flushed) && flushed[1].event.type === "error" && flushed[1].event.errorMessage === "429 Too Many Requests" && r2.stats().flushes === 1,
 		`flushes=${r2.stats().flushes}`);
-	check("G3b …flush first, error second (the client renders the reasoning, then the failure)",
-		flushed[0].event.type === "error" && flushed[0].reduction === "flush" && kindText(flushed[0].event.message, "thinking") === held);
+	// grok review 2026-10-25, blocker 1: the flush frame must be a SNAPSHOT the client renders
+	// (message_update), NOT the error event with a message stuck on it.
+	check("G3b the flush is a message_update SNAPSHOT (an error frame with a message is never rendered)",
+		flushed[0].event.type === "message_update" && flushed[0].reduction === "flush" &&
+		kindText(flushed[0].event.message, "thinking") === held && flushed[0].seq === flushed[1].seq);
+	check("G3d …so the client's own rule (streamingMessage = ev.message) picks it up",
+		flushed[0].event.message.content[0].type === "thinking");
 	const after = r2.transform(thinkingDelta(assistant("new"), "new"), 3000);
 	check("G3c the abort resets the block (no bleed into the next turn)", after === null || after.reduction !== undefined);
 
@@ -207,12 +236,54 @@ const paragraphCfg = (over = {}) => normalizeReductionConfig({ net: "wan", think
 			const end = r5.transform(msgEnd({ role: "assistant", content: [{ type: "thinking", thinking: "Z".repeat(400) }] }), 2000);
 			return sent === 0 && end.event.type === "message_end" && kindText(end.event.message, "thinking").length === 400;
 		})());
-	check("G6c an ERROR returns TWO frames: the flushed text, then the error (the server sends both)",
+	// grok review 2026-10-25, blocker 2: a non-gated update (toolcall_delta, end) must NOT ship the
+	// untruncated snapshot, or it undoes the truncation of every earlier frame
+	{
+		const r7 = createStreamReducer(normalizeReductionConfig({ net: "wan", thinkingLevel: "turnEnd" }));
+		r7.transform(thinkingDelta(assistant("HELD REASONING"), "HELD REASONING"), 1000);
+		const toolcall = r7.transform(update(assistant("HELD REASONING", "", [{ type: "toolCall", id: "t1", name: "read", arguments: {} }]), { type: "toolcall_start", contentIndex: 2 }), 1010);
+		check("G7 a NON-gated message_update (toolcall) is truncated too — turnEnd is not defeated by a tool call",
+			toolcall !== null && toolcall.event.type === "message_update" && kindText(toolcall.event.message, "thinking") === "" &&
+			toolcall.event.message.content.some((p) => p.type === "toolCall"),
+			`thinking=${JSON.stringify(kindText(toolcall?.event?.message, "thinking"))}`);
+	}
+	// blocker 3: attach/GET deliver the full snapshot, so a fresh reducer must be SEEDED with it
+	{
+		const full = assistant("already delivered reasoning");
+		const cfg0 = normalizeReductionConfig({ net: "wan", thinkingLevel: "paragraph", thinking: { mode: "paragraph", minBytes: 0, maxBytes: 1e9, maxLines: 1e9, idleMs: 1e9, maxHoldMs: 1e9 } });
+		const seeded = createStreamReducer(cfg0, { seed: full });
+		// a paragraph boundary after the seed → the gate emits, and the snapshot must include the seed
+		const next = seeded.transform(thinkingDelta(assistant("already delivered reasoning plus more"), " plus more\n\n"), 1000);
+		check("G8 a SEEDED reducer never truncates below what the client already has (no visible rewind)",
+			kindText(next?.event?.message, "thinking") === "already delivered reasoning plus more",
+			`delivered=${JSON.stringify(kindText(next?.event?.message, "thinking"))}`);
+		check("G8b …and an UNSEEDED reducer on the same turn visibly REWINDS the text (the bug the seed fixes)",
+			(() => {
+				const cold = createStreamReducer(cfg0);
+				const f = cold.transform(thinkingDelta(assistant("already delivered reasoning plus more"), " plus more\n\n"), 1000);
+				const coldLen = kindText(f?.event?.message, "thinking").length;
+				const seededLen = kindText(next?.event?.message, "thinking").length;
+				// the unseeded frame carries ONLY the delta; the seeded one carries what the client already
+				// had plus it — which is the whole point of seeding
+				return coldLen < 27 && seededLen > 27 && seededLen > coldLen;
+			})(), `seeded ${kindText(next?.event?.message, "thinking").length} chars vs unseeded ${11}`);
+		check("G8c a hold (null) is also fine — the client keeps what attach already gave it",
+			createStreamReducer(normalizeReductionConfig({ net: "wan", thinkingLevel: "paragraph" }), { seed: full }).transform(thinkingDelta(assistant("already delivered reasoning plus more"), " plus more"), 1000) === null);
+	}
+	// should-fix: retry/turn_end/agent_end flush the held text instead of dropping it
+	{
+		const r8 = createStreamReducer(paragraphCfg());
+		r8.transform(thinkingDelta(assistant("held"), "held"), 1000);
+		const out = r8.transform({ type: "agent-event", sessionId: sess, seq: 7, event: { type: "turn_end", message: assistant("held") } }, 1100);
+		check("G9 turn_end flushes the held text first (not just error/abort)",
+			Array.isArray(out) && out[0].event.type === "message_update" && kindText(out[0].event.message, "thinking") === "held" && out[1].event.type === "turn_end");
+	}
+	check("G6c an ERROR returns TWO frames: the flushed SNAPSHOT, then the error (the server sends both)",
 		(() => {
 			const r6 = createStreamReducer(paragraphCfg());
 			r6.transform(thinkingDelta(assistant("held reasoning"), "held reasoning"), 1000);
 			const out = r6.transform({ type: "agent-event", sessionId: sess, seq: 8, event: { type: "error", errorMessage: "boom" } }, 1100);
-			return Array.isArray(out) && out.length === 2 && out[0].event.type === "error" && out[0].reduction === "flush" && kindText(out[0].event.message, "thinking") === "held reasoning" && out[1].event.errorMessage === "boom";
+			return Array.isArray(out) && out.length === 2 && out[0].event.type === "message_update" && out[0].reduction === "flush" && kindText(out[0].event.message, "thinking") === "held reasoning" && out[1].event.errorMessage === "boom";
 		})());
 }
 

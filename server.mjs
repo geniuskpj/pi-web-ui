@@ -1960,6 +1960,25 @@ function piDefaultModelId() {
 	return String(s.default_model || s.defaultModel || "");
 }
 
+/**
+ * Turn an inbound prompt/steer `images` array into ImageContent parts the model can use: inline base64
+ * passes straight through, a `{hash}` part is hydrated from the binary media store (base64 is built
+ * HERE and nowhere else), and anything unresolvable is reported instead of being dropped
+ * (grok review 2026-10-25, blocker 5).
+ */
+function hydratePromptImages(raw) {
+	const parts = Array.isArray(raw) ? raw.filter((im) => im && im.type === "image" && typeof im.mimeType === "string").slice(0, 4) : [];
+	const images = [], missing = [];
+	for (const im of parts) {
+		if (typeof im.data === "string" && im.data) { images.push({ type: "image", data: im.data, mimeType: im.mimeType || "image/png" }); continue; }
+		if (!isMediaHash(im.hash)) continue;
+		const hit = agentHub.getMedia(im.hash);
+		if (!hit?.bytes) { missing.push(im.hash); continue; }
+		images.push({ type: "image", data: Buffer.from(hit.bytes).toString("base64"), mimeType: im.mimeType || hit.mimeType || "image/png" });
+	}
+	return { images, missing };
+}
+
 /** Data-reduction debug trace (PI_WEB_DATA_REDUCTION_DEBUG=1): one line per block, so the user can
  *  watch a live turn shrink. Off by default — this is the "let me test it on a debug server" switch. */
 const DR_DEBUG = process.env.PI_WEB_DATA_REDUCTION_DEBUG === "1";
@@ -2272,6 +2291,10 @@ function agentConn(ws) {
 					if (currentSession) detachAgentClient(currentSession, ws);
 					currentSession = String(m.sessionId || "").slice(0, 80) || crypto.randomUUID();
 					attachAgentClient(currentSession, ws);
+					// re-seed an opted-in reducer AFTER the attach snapshot goes out (see blocker 3): the
+					// snapshot carries the full streamingMessage, so the reducer must not replay it or
+					// truncate below it. Deferred one turn of the loop, i.e. after attach's deliver().
+					if (ws.__reducer?.enabled) setTimeout(() => { try { ws.__reducer?.seed(agentHub.streamingSnapshot(currentSession)); } catch { /* gone */ } }, 0);
 					agentHub.emitRuntime(currentSession); // clients count changed (fable5) — MUST go through the hub so seq advances
 					// ALWAYS ensure the hub session exists — fresh sessions have no store
 					// entry, and set-thinking/prompt assume a registered agent (2026-10-21)
@@ -2301,10 +2324,12 @@ function agentConn(ws) {
 				}
 				case "prompt": {
 					if (!currentSession) { safeSend(ws, { type: "error", error: "attach first" }); break; }
-					// images: base64 ImageContent parts from the composer (validated + capped)
-					const images = Array.isArray(m.images)
-						? m.images.filter((im) => im && im.type === "image" && typeof im.data === "string" && typeof im.mimeType === "string").slice(0, 4)
-						: undefined;
+					// images: ImageContent parts from the composer — either inline base64, or a `hash` that
+					// the BINARY media store resolves (user design 2026-10-25: the composer posts the encoded
+					// bytes and references them). A part whose bytes are gone is REPORTED, never dropped
+					// silently (grok review 2026-10-25, blocker 5).
+					const { images, missing } = hydratePromptImages(m.images);
+					if (missing.length) safeSend(ws, { type: "note", id: m.id, note: `${missing.length} image(s) are no longer on the server — re-attach them to resend` });
 					// id echoes on the accepted reply so the composer can restore text on a reject
 					agentHub.prompt(currentSession, String(m.content || ""), images?.length ? images : undefined)
 						.then((r) => safeSend(ws, { type: "accepted", id: m.id, ...r }))
@@ -2316,9 +2341,8 @@ function agentConn(ws) {
 					// the current thinking/toolcall completes (grok review P1: a prompt
 					// here would misroute post-Stop sends into leftover steers)
 					if (!currentSession) { safeSend(ws, { type: "error", error: "attach first" }); break; }
-					const images = Array.isArray(m.images)
-						? m.images.filter((im) => im && im.type === "image" && typeof im.data === "string" && typeof im.mimeType === "string").slice(0, 4)
-						: undefined;
+					const { images, missing } = hydratePromptImages(m.images);
+					if (missing.length) safeSend(ws, { type: "note", id: m.id, note: `${missing.length} image(s) are no longer on the server — re-attach them to resend` });
 					agentHub.steer(currentSession, String(m.content || ""), images?.length ? images : undefined)
 						.then((r) => safeSend(ws, { type: "accepted", id: m.id, ...r }))
 						.catch((err) => safeSend(ws, { type: "error", id: m.id, error: err.message }));
@@ -2353,8 +2377,13 @@ function agentConn(ws) {
 					// (plan §2.3). OFF by default — a client that never sends this keeps live streaming,
 					// and an unknown mode falls back to live rather than to a stronger reduction.
 					reduction.cfg = normalizeReductionConfig(m, m?.net === "lan" || m?.net === "metered" ? m.net : "wan");
-					reduction.reducer = createStreamReducer(reduction.cfg);
+					// SEED from the in-flight snapshot: this client already has the full text from the state
+					// frame it attached with, and a reducer starting at 0 would truncate it backwards
+					// (grok review 2026-10-25, blocker 3).
+					reduction.reducer = createStreamReducer(reduction.cfg, { seed: agentHub.streamingSnapshot(currentSession) });
 					ws.__reducer = reduction.reducer; // the broadcast loop reads it per socket
+					// RETENTION rides along with the same setting: "browser" must not write images to disk
+					agentHub.setMediaPersist(m?.imageRetention !== "browser");
 					safeSend(ws, {
 						type: "data-reduction", id: m.id, ok: true, enabled: reduction.reducer.enabled,
 						streamMode: reduction.cfg?.streamMode ?? "live",
@@ -2552,6 +2581,9 @@ app.post("/api/agent/session/:id/media", async (c) => {
 	try {
 		const mimeType = String(c.req.header("content-type") || "").split(";")[0].trim().toLowerCase();
 		if (!/^image\//.test(mimeType)) return c.json({ error: "only image/* bodies (set Content-Type)" }, 415);
+		// cap BEFORE buffering (grok review 2026-10-25): arrayBuffer() on a 200MB body would allocate it
+		const declared = Number(c.req.header("content-length") || 0);
+		if (!declared || declared > MAX_IMAGE_UPLOAD) return c.json({ error: `image must declare a Content-Length <= ${Math.round(MAX_IMAGE_UPLOAD / 1048576)}MB` }, 413);
 		const buf = Buffer.from(await c.req.arrayBuffer());
 		if (!buf.length) return c.json({ error: "empty body" }, 400);
 		if (buf.length > MAX_IMAGE_UPLOAD) return c.json({ error: `image too large (>${Math.round(MAX_IMAGE_UPLOAD / 1048576)}MB)` }, 413);

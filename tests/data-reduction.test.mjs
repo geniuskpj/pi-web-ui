@@ -31,8 +31,10 @@ import {
 	DATA_SETTING_KEYS, readDataSettings, resolvedImagePolicy, resolvedStreamPolicy,
 } from "../src/ui/data-settings.ts";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { AgentHub } from "../agent-hub.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -190,6 +192,44 @@ const msg = (text, parts = []) => ({ role: "user", content: [{ type: "text", tex
 		/\/api\/health/.test(dialogSrc) && /localStorage\.setItem\("pi\.netTier"/.test(dialogSrc));
 	check("L13f the hub push carries per-stream thresholds (server-side coalescing needs the numbers)",
 		/setDataReduction\?/.test(settingsSrc) && /thinking:\s*\{\s*mode/.test(settingsSrc) && /text:\s*\(\(\{ mode/.test(settingsSrc) && /tool:\s*\(\(\{ mode/.test(settingsSrc));
+}
+
+// ─── L3: the HUB's egress cache and retention (grok review 2026-10-25, blocker 4 + should-fix)
+{
+	const hubStub = (store) => ({ media: store, mediaPersist: true, _redactedMsg: new WeakMap() });
+	const redactWith = (hub, msgs) => AgentHub.prototype.redactMessages.call(hub, msgs);
+
+	const hub = hubStub(createMediaStore());
+	const first = msg("first", [imagePart(60, "image/png", 0x31)]);
+	const later = { role: "assistant", content: [{ type: "text", text: "later" }] };
+	const transcript = [first];
+	const once = redactWith(hub, transcript);
+	transcript.push(later); // the agent pushes into the SAME array — the normal case
+	const twice = redactWith(hub, transcript);
+	check("L14 a GROWING transcript is re-redacted (the cache is per message, not per array)",
+		twice.length === 2 && twice[1] === later && twice[0].content[1].data === undefined, `len=${twice.length}`);
+	check("L14b an unchanged message returns the SAME redacted object (still cached, no re-decode)",
+		twice[0] === once[0]);
+	check("L14c a transcript with no images is returned by IDENTITY (no copies, no cache churn)",
+		(() => { const plain = [msg("hi")]; return redactWith(hub, plain) === plain; })());
+	check("L14d the redacted part carries hash+bytes and no data, and the store has the bytes",
+		twice[0].content[1].hash !== undefined && twice[0].content[1].bytes > 0 && hub.media.has(twice[0].content[1].hash));
+
+	// RETENTION must reach the REDACT path too, not only POST /media (grok should-fix)
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-hub-media-"));
+	try {
+		const browserish = hubStub(createMediaStore({ dir }));
+		browserish.mediaPersist = false;
+		const shrunk = redactWith(browserish, [msg("keep it local", [imagePart(60, "image/png", 0x41)])]);
+		const h = shrunk[0].content[1].hash;
+		check("L15 retention 'browser' also applies to egress redaction (no disk write)",
+			!fs.existsSync(path.join(dir, h.slice(0, 2), h)) && browserish.media.get(h)?.persisted === false && browserish.media.get(h)?.bytes.length > 0);
+		const serverish = hubStub(createMediaStore({ dir }));
+		const kept = redactWith(serverish, [msg("keep it on the server", [imagePart(60, "image/png", 0x42)])]);
+		const h2 = kept[0].content[1].hash;
+		check("L15b retention 'server' (default) writes the blob to disk",
+			fs.existsSync(path.join(dir, h2.slice(0, 2), h2)) && serverish.media.get(h2)?.persisted === true);
+	} finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
 // ─────────────────────────────────────── I: what happens to one image (§2.2a, §6.2)
