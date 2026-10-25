@@ -175,7 +175,11 @@ export class AgentHub {
 			const model = this._getModel(modelId) || this._defaultModel();
 			if (!model) throw new Error("no models available");
 			const level = thinkingLevel || "high";
-			const systemPrompt = this.getSystemPrompt(); // undefined → pi's built-in chat default
+			// the server resolves this (lib/system-prompt.mjs): a prompt FILE when one is
+			// configured, otherwise a built-in prompt composed in code — so this is never
+			// undefined in practice, and the `systemPrompt ? … : …` belt-and-braces stays
+			// for embedders that pass no resolver at all.
+			const systemPrompt = this.getSystemPrompt();
 			const agent = new Agent({
 				streamFn: streamSimple, // pi-ai 1.4.0: streamFn required (compat generic dispatcher)
 				initialState: {

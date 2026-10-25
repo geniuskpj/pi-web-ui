@@ -89,8 +89,16 @@ See [architecture.md](architecture.md) for the module map and trust-boundary sum
 Mirrors pi's resource loader: `projectNeedsTrust()` (`.pi` symlink or any of settings.json/mcp.json/
 extensions/skills/prompts/themes/SYSTEM.md/APPEND_SYSTEM.md present) gates project files;
 `isProjectTrusted()` walks UP from the project dir through `.pi/trust.json` entries (fail-closed on
-unreadable). Precedence: `WEB_SYSTEM.md` (agent dir; web-UI-only filename, no trust gate) > project
-`.pi/SYSTEM.md` (trusted) > global `agentDir/SYSTEM.md`; `APPEND_SYSTEM.md` appends. The server
+unreadable). Precedence lives in ONE place — `lib/system-prompt.mjs`, used by both the hub and
+`/api/pi/system` — so the two cannot drift: `WEB_SYSTEM.md` (agent dir; web-UI-only filename, no trust
+gate) > project `.pi/SYSTEM.md` (trusted) > global `agentDir/SYSTEM.md`. `APPEND_SYSTEM.md` is PI'S
+filename, not a web-UI concept, but the web path appends it too: it is where the operator's standing
+instructions live (tool notes, permission rules, path conventions) and the web agent needs them.
+**When no prompt file exists at all** the resolver returns a prompt COMPOSED IN CODE (pi-style tagged
+sections: `preamble`/`tools`/`rules`/`docs`/`cwd`) instead of `undefined` — before 2026-10-25 a
+deployment with a missing `pi_dir` ran the agent with no system prompt at all (pi-agent-core has no
+built-in preamble, and the hub only passes `systemPrompt` when it is truthy). `/api/pi/system` reports
+which case applies via `effective.source` (`file` | `builtin`). Test: `npm run test:sysprompt`. The server
 computes `wins` flags so the client cannot drift. Content cap 1MB/file. `projectDir` = `PI_WS` or the
 parent of `PI_DIR` (assumes `.pi` is a direct child of the workspace root — worktrees need `PI_WS`).
 
@@ -347,8 +355,8 @@ toolResult.toolCallId, so after a restart the rehydrated history produced `role:
 without `tool_call_id` and nvidia NIM 400'd every prompt, permanently; error/stopReason/usage now
 survive restarts too). `getSession` runs restored messages through `normalizeRestoredMessages()` —
 re-links orphan toolResults to the preceding assistant's toolCall blocks in order, strips still-
-unmatched toolCalls, drops unmatchable orphans (idempotent; one-time bulk repair:
-`node tests/repair-mirror-toolcalls.mjs`). `attach()` =
+unmatched toolCalls, drops unmatchable orphans (idempotent; the one-time bulk repair script was
+removed once it had been run everywhere, 2026-10-25). `attach()` =
 subscribe-first: buffers events via a per-session `entry.buffer` hook while snapshotting (2026-10-21 —
 the old global broadcast swap was not reentrant), then delivers snapshot + buffered (dedup by seq).
 `prompt()` queues ONE follow-up while streaming (depth 2+ rejected). Eviction: idle >30min (flush

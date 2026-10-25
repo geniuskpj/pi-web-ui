@@ -102,6 +102,16 @@ Workspace file attach + image paste are BACK (plan.md §12–14) — see the exp
 Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
 
 
+## System prompt
+
+The server-side agent's prompt is resolved in one place (`lib/system-prompt.mjs`):
+`.pi/WEB_SYSTEM.md` > trusted project `.pi/SYSTEM.md` > `.pi/SYSTEM.md`, with `.pi/APPEND_SYSTEM.md`
+appended (pi's filename, honored here too — the operator's standing instructions live there). If **no**
+prompt file exists (e.g. `PI_DIR` points at a path that does not exist) the server composes a built-in
+prompt in code — pi-style `<preamble>/<tools>/<rules>/<cwd>` sections — so a fresh deployment still gets
+tool docs and its working directory instead of an agent with no prompt. `/api/pi/system` shows which
+case applies (`effective.source`: `file` | `builtin`).
+
 ## Session loading (tail-first) & IndexedDB cache
 
 Large sessions (2–7.3MB observed) no longer re-download their whole body on every open.

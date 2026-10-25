@@ -36,7 +36,8 @@
     "test:hydration": "node tests/hub-hydration.test.mjs",
     "test:gate": "node tests/display-gate.test.mjs",
     "test:pty": "node tests/term-pty.test.mjs",
-    "test:toolcall": "node tests/restore-toolcall.test.mjs"
+    "test:toolcall": "node tests/restore-toolcall.test.mjs",
+    "test:sysprompt": "node tests/system-prompt.test.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "1.4.0",

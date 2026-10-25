@@ -74,5 +74,6 @@ jobs:
           npm run test:gate
           npm run test:pty
           npm run test:toolcall
+          npm run test:sysprompt
       - name: "Tests (security gates — token + origin/Host allowlist)"
         run: npm run test:security

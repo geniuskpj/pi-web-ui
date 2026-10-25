@@ -49,6 +49,7 @@ import { createTerminalHub } from "./terminal-hub.mjs";
 import { stripBoilerplate } from "./lib/hp2.mjs";
 import { netClassOf } from "./lib/net-class.mjs";
 import { planRangeWindow } from "./lib/range-window.mjs";
+import { resolveSystemPrompt } from "./lib/system-prompt.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, "public");
@@ -405,21 +406,45 @@ function isProjectTrusted(projectDir, agentDir) {
 		}
 	} catch { return false; } // unreadable trust.json → fail-closed, like pi-web
 }
-// Effective system prompt for the SERVER-SIDE agent (same precedence the client
-// sees from /api/pi/system): WEB_SYSTEM.md > trusted project SYSTEM.md > global
-// SYSTEM.md; APPEND_SYSTEM.md appends. undefined → pi's built-in chat default.
+// Effective system prompt for the SERVER-SIDE agent. Precedence lives in ONE place
+// (lib/system-prompt.mjs) so the hub and /api/pi/system cannot drift:
+//   WEB_SYSTEM.md > trusted project .pi/SYSTEM.md > global SYSTEM.md, then
+//   .pi/APPEND_SYSTEM.md (the operator's standing instructions — pi's filename, honored
+//   here too) is appended.
+// When NO prompt file exists the resolver returns a BUILT-IN prompt composed in code
+// (pi-style sections: preamble/tools/rules/cwd) instead of undefined: pi-agent-core has
+// no built-in preamble and the hub only passes a systemPrompt when it is truthy, so the
+// old "undefined" case left the web agent with no prompt at all (2026-10-25).
 // Runtime-safe: AGENT_DIR/WORKSPACE_DIR are initialized before any call.
-function effectiveSystemPrompt() {
+function systemPromptReader() {
+	return (p) => {
+		try {
+			const st = fs.statSync(p);
+			return st.isFile() && st.size <= 1024 * 1024 ? fs.readFileSync(p, "utf8") : undefined;
+		} catch { return undefined; }
+	};
+}
+function resolveEffectiveSystemPrompt() {
 	const needsTrust = projectNeedsTrust(WORKSPACE_DIR);
 	const trusted = !needsTrust || isProjectTrusted(WORKSPACE_DIR, AGENT_DIR);
-	const read = (p) => { try { const st = fs.statSync(p); return st.isFile() && st.size <= 1024 * 1024 ? fs.readFileSync(p, "utf8") : undefined; } catch { return undefined; } };
-	const base = read(path.join(AGENT_DIR, "WEB_SYSTEM.md"))
-		|| (trusted ? read(path.join(WORKSPACE_DIR, ".pi", "SYSTEM.md")) : undefined)
-		|| read(path.join(AGENT_DIR, "SYSTEM.md"));
-	const append = (trusted ? read(path.join(WORKSPACE_DIR, ".pi", "APPEND_SYSTEM.md")) : undefined)
-		|| read(path.join(AGENT_DIR, "APPEND_SYSTEM.md"));
-	if (!base && !append) return undefined;
-	return [base, append].filter(Boolean).join("\n\n");
+	return resolveSystemPrompt({
+		agentDir: AGENT_DIR,
+		workspaceDir: WORKSPACE_DIR,
+		trusted,
+		read: systemPromptReader(),
+		docsPath: piDocsPath(),
+	});
+}
+/** The pi docs to advertise in the built-in prompt — only when they exist (a deployment
+ *  without pi_dir must not get a <docs> section pointing at a missing file). */
+function piDocsPath() {
+	const docs = path.join(AGENT_DIR, "docs");
+	if (fs.existsSync(docs)) return docs;
+	const readme = path.join(AGENT_DIR, "README.md");
+	return fs.existsSync(readme) ? readme : null;
+}
+function effectiveSystemPrompt() {
+	return resolveEffectiveSystemPrompt().text;
 }
 function systemFileMeta(p, scope, name) {
 	try {
@@ -449,6 +474,25 @@ app.get("/api/pi/system", (c) => {
 	const webBase = files.find((f) => f.name === "WEB_SYSTEM.md" && f.exists) || null;
 	const base = webBase || pick("SYSTEM.md");
 	const append = pick("APPEND_SYSTEM.md");
+	// the ACTUAL text the server-side agent gets — resolved through the same module the
+	// hub uses, so "effective" here is not a re-implementation that can drift. When no
+	// file exists this is a code-composed prompt, reported as source "builtin" (the old
+	// label "pi default" was misleading: nothing injects a pi default in this server).
+	const resolved = resolveSystemPrompt({
+		agentDir,
+		workspaceDir: projectDir,
+		trusted,
+		read: (p) => {
+			const m = files.find((f) => f.path === p && f.exists);
+			return m ? m.content : undefined;
+		},
+		docsPath: (() => {
+			const d = path.join(agentDir, "docs");
+			if (fs.existsSync(d)) return d;
+			const r = path.join(agentDir, "README.md");
+			return fs.existsSync(r) ? r : null;
+		})(),
+	});
 	// server computes precedence so the client can't drift from pick() (sonnet review)
 	for (const f of files) f.wins = f === base || f === append;
 	// NOTE: projectDir = PI_WS env || parent of agentDir — assumes .pi is a direct
@@ -459,7 +503,12 @@ app.get("/api/pi/system", (c) => {
 	// typically-tiny config files, not arbitrary user files.
 	return c.json({
 		agentDir, projectDir, needsTrust, trusted,
-		effective: { base: base ? base.path : "pi default", append: append ? append.path : null },
+		effective: {
+			base: base ? base.path : "built-in web default (composed in code)",
+			append: append ? append.path : null,
+			source: resolved.source,
+			chars: resolved.text.length,
+		},
 		files,
 	}, 200, { "Cache-Control": "no-cache" });
 });
