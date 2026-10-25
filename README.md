@@ -114,7 +114,7 @@ Workspace file attach + image paste are BACK (plan.md §12–14) — see the exp
 | `PI_WEB_EXIT_ON_STDIN_CLOSE` | off | run the full graceful-shutdown sequence when the parent closes the server's stdin pipe (pipe-friendly Ctrl+C equivalent; used by tests — on Windows a cross-process `kill(SIGINT)` TerminateProcesses without running handlers) |
 | `PI_WEB_WS_DEFLATE` | on | `off` disables permessage-deflate on the agent/sync WebSockets (state frames are the multi-MB path — leave on unless profiling) |
 | `PI_WEB_TERM_COLS` / `PI_WEB_TERM_LINES` | `110` / `32` | terminal grid size (stty in the pty tier, COLUMNS/LINES env in the pipe tier) |
-| `PI_WEB_TERM_BRIDGE` | auto | `0`/`pipes` forces the pipe tier; a path uses that exe as an msys-pty-bridge; unset → auto-provision msys2 `util-linux` `script.exe` into `data/bin/script/` (sha256-pinned `util-linux-2.40.2-2` package from repo.msys2.org, 8MB size cap, extracts a 63KB exe — once) |
+| `PI_WEB_TERM_BRIDGE` | auto | `0`/`pipes` forces the pipe tier; a path uses that exe as an msys-pty-bridge; unset → auto-provision msys2 `util-linux` `script.exe` into `data/bin/script/` (sha256-pinned `util-linux-2.40.2-2` package from repo.msys2.org, 8MB size cap, extracts a 63KB exe — once). The bridge is then **proven by running it** with the shell it will drive (that shell must get `isatty(stdin)==true`); a bridge that cannot allocate a pty is refused, and the reason appears in the dock instead of a silent downgrade |
 | `PI_WEB_TERM_ORIGIN` | auto | extra `host[:port]` **names for the global Host/Origin allowlist** — every `/api/*` route and all three WS endpoints (`/ws/sync`, `/ws/agent`, `/ws/terminal`), not just the terminal. Comma-separated, scheme stripped. Matching is EXACT on `host:port`: a missing Origin port means the scheme default (http→80, https→443) and a portless Host is tried as the app port plus 80/443 — so a TLS reverse proxy needs its public form spelled out (`PI_WEB_TERM_ORIGIN=name:443`). Localhost, `os.hostname()` and every interface IP are always allowed |
 | `PI_WEB_ORIGIN_GATE` | `auto` | how strictly the DNS-rebinding Host/Origin allowlist applies: `auto` = **loopback peers only** (a remote peer must present the API token — that is what lets the UI work on any domain/DDNS name with no config), `strict` = every peer (pre-2026-10-23 behaviour, only allowlisted names pass), `off` = no host check at all (**foot-gun**, warns at boot: a rebinding page can read `/api/sessions` with no token) |
 | `PROXY_IDLE_MS` | `150000` | LLM proxy stall timeout |
@@ -139,6 +139,8 @@ Layered design — the server decides transfer sizes, the client decides display
   `X-Range-From/To-Seq`, `X-Rewritten-From` (chunks strictly below this seq survive rewrites).
 - **Aligned windows + no re-send (C4)**: `/range` windows and live-written chunks share one 64-message
   boundary (`lib/chunk-window.mjs`, imported by both sides — no seam), and the WS attach takes the
+  boundary (`lib/chunk-window.mjs`, imported by both sides — no seam), every fetched window is BOUNDED
+  to the seqs that were asked for (the headers always describe exactly the bytes sent), and the WS attach takes the
   client's cached reach (`haveTo`) so it does not re-send it: measured, the 1.49MB tail → **0 bytes** when
   the cache covers it, with the client filling that prefix from IndexedDB (a miss falls back to `/range`).
 - **IndexedDB cache** (`pi-session-cache`, **schema v2**): per-chunk gzip blobs keyed
@@ -232,6 +234,13 @@ network. Full analysis: `pr-idb.md`.
   CDN URLs (esm.sh/jsdelivr) remain as runtime fallbacks only. The shell lives on the server
   (`terminal-hub.mjs`, WS `/ws/terminal`, JSON frames — replay ring 128KB on attach, output
   coalesced 30ms, idle TTL 15min, max 6 sessions, stdin cap 64KB):
+  - **which tier is active is PROVED, not assumed**: the bridge must give the shell it drives a
+    real tty. When it cannot (e.g. the msys runtime that Git for Windows ships cannot create
+    `/dev/ptmx` on that install), the dock says so — "⚠ no pty — nano/vim need one" plus the
+    bridge's own error — and runs the pipe tier. `node tests/term-pty.test.mjs` reports the same
+    diagnosis headlessly (`PI_REQUIRE_PTY=1` makes a working pty a hard requirement); the fix is a
+    repaired/reinstalled Git for Windows, or `PI_WEB_TERM_BRIDGE` pointing at a `script.exe` built
+    for that runtime.
   - tier `pty` (default, auto-provisioned): **msys2 `script.exe`** allocates a REAL msys pty
     and bridges our stdio — bash gets `/dev/ptyN`, so interactive TUIs work: `nano`/`vim` pass
     the isatty check (the old "standard input is not a terminal" is fixed — verified with a

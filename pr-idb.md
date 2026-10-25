@@ -226,6 +226,98 @@ the window start → unchanged; `haveTo=count` → **0 msgs / 0 bytes (100% off)
 The render path is untouched: dense window, `filledFrom`, the turn-gated display and the edit-index
 translation keep their semantics — the cache only supplies the prefix.
 
+## 9. REVIEW 2026-10-25 — every finding dispositioned
+
+Two external reviews of this branch (32 commits) plus one user report. **Every code
+finding was reproduced against the code before anything changed**; two claims did not
+survive that step and are recorded as such. The theme of the pass: the C4 seam and the
+cache tiers are where a wrong *bound* or a missing *key component* turns into silently
+wrong content — and my own suites could not see it, because (below) **none of them ran
+in CI**.
+
+| # | Finding (source) | Verdict | Fix |
+|---|---|---|---|
+| 1 | `/range` snapped the low end BELOW the requested `fromSeq` → negative `slice()` (JS counts from the array END) → body ≠ `X-Range-From/To-Seq`, client splices at wrong seqs, ~400 msgs/expand unreachable (reviewer1 #1 / reviewer2 #1, both P1) | **CONFIRMED** | `lib/range-window.mjs`: `start = max(alignedStart, fromSeq)` |
+| 2 | Memory tier keyed `(session, fromSeq)` without the generation → post-rewrite read renders pre-rewrite content (reviewer1 #2 / reviewer2 #3, P1) | **CONFIRMED** | `memKey(sessionId, rewriteSeq, fromSeq)`; `dropChunk` punches the mem entry; `clearSession`'s prefix wipe unchanged |
+| 3 | High end `alignUp` could exceed the requested `toSeq` → chunk claims more lines than it holds → dropped by `verifyChunkText` on EVERY read (reviewer1 #3) | **CONFIRMED** | `end = min(alignedEnd, messageCount, toSeq)` |
+| 4 | Display gate was an array INDEX captured at attach; a prefix fill moves it, and a fully-warm reopen (empty window) resolved to 0 → the whole window rendered (reviewer1 #4) | **CONFIRMED** | `lib/display-gate.mjs` + seq-space gate + `resolveGateSeq` re-anchor (`tests/display-gate.test.mjs`) |
+| 5 | Fetched windows were stored/spliced without `verifyChunkText` (live writes were checked) (reviewer1 #5) | **VALID (hardening)** | gunzip → verify → `putChunk` → splice; a bad body is a logged miss |
+| 6 | `sweepStale` cleared `currentGen` for every target, incl. old generations of live sessions (reviewer1 #6) | **VALID** | forget only when the NEWEST collected generation is the remembered one |
+| 7 | 204 carried a gzip body (RFC 9110) (reviewer1 #7) | **VALID** | 204 with no body, same headers; the client now bails on `re <= rs` |
+| 8 | Full-GET gzip gate used `payload.length` (UTF-16 units) (reviewer1 #8) | **VALID** | `Buffer.byteLength(payload, "utf8")` |
+| 9 | `coverageFor()`/`idbStats()` full-store `getAll()` per attach (reviewer1 #9) | **DEFERRED** | the meta store holds ONE record per generation, so `coverageFor` is already tiny; an index on the chunk store needs a schema v3 bump — not worth it for a single-user cache |
+| 10 | Cached expansion appended WHOLE chunks (incl. above `to`) but recorded the REQUESTED `from` as `filledFrom` → indices shift under the splice, edits land on the wrong turn (reviewer2 #2, P1) | **CONFIRMED** | `lib/chunk-splice.mjs` (`planCachedSplice`): trim at `to`, adopt the lowest chunk start |
+| 11 | `npm run test:versions` fails in CI (reviewer2 #4) | **CONFIRMED, different cause** | see below |
+| 12 | "script.exe has gone and terminal with nano is not working in this branch" (user) | **NOT a regression — a real defect anyway** | see below |
+
+### 11 — versions: the failing check, and why nobody saw it
+
+Reproduced: the check `intermediate tail still restorable (lossless)` failed **and the
+suite still printed "30 check(s) passed"** — its `check()` counted only passes, and the
+✗ goes to stderr, so every "green" read of it (mine included) was stdout-only. Root
+cause is NOT the reviewer's dedupe story in the way it was told: the sidecar's
+content-hash dedupe parks a byte-identical capture ONCE, so the test's second identical
+edit **reuses vid 1** and the switch-away capture becomes vid 2 — the assertion
+`versions.get(S, 2).messages.length === 4` therefore fails while the PRODUCT promise
+(everything restorable) still holds, verified by dumping the store: vid 1 = the edit
+tail, vid 2 = the grown tail, active transcript byte-identical to the original.
+Fixed on the test side (assert losslessness + the dedupe, not a vid) **and** in the
+summary (`32 passed, 0 failed`). The dedupe commit (`c3d166b`) exists only on this
+branch, so this red test was this branch's to fix.
+
+### 12 — the terminal: environment, not branch
+
+`terminal-hub.mjs`, `src/ui/terminal.tsx` and the vendored bridge are **byte-identical
+to main** on this branch, and `data/bin/script/script.exe` is byte-identical to a freshly
+extracted copy of the sha256-pinned msys2 package (pin re-verified: MATCHES). It still
+cannot allocate a pty here:
+
+```
+script: failed to create pseudo-terminal: No such file or directory
+```
+
+Git for Windows ships `msys-2.0.dll 3.6.7` (built 2026-04-21) and `/dev/ptmx` is
+equally broken for a plain `bash -lc 'exec 3<>/dev/ptmx'` ("Too many open files"), so no
+msys pty can exist in this environment at all — the hub fell back to the pipe tier, where
+nano/vim hit "standard input is not a terminal". **The product defect the report exposed
+is real**: the bridge was validated as a FILE (PE header + size), never as a CAPABILITY,
+so a bridge that cannot create a pty was adopted, died at once, and the tier silently
+became `pipes` with nothing explaining it. Now:
+
+- `bridgeProbe(exe, bashPath)` RUNS the candidate with the shell it will drive
+  (`-e`/--return ⇒ bash must see isatty(stdin)=true) and caches the verdict + the
+  bridge's own stderr;
+- `pickBridge()` refuses a bridge that fails the probe; provisioning refuses to PUBLISH
+  one ("pinned bridge cannot create a pty: …");
+- the reason reaches the client as `state.bridgeNote` and is rendered as a dock warning
+  ("⚠ no pty — nano/vim need one. …") with the status line saying `bash — pipes (no pty:
+  nano/vim unavailable)`;
+- `tests/term-pty.test.mjs` reports the capability and asserts the product behaviour
+  (probe agrees with the raw observation, names the reason, is cached); `PI_REQUIRE_PTY=1`
+  makes a working pty a hard requirement for CI on a known-good runner.
+
+Environment remediation is documented (repair/reinstall Git for Windows; or
+`PI_WEB_TERM_BRIDGE` → a script.exe built for that runtime). **The terminal dock stays on
+the pipe tier on this machine until the Git runtime is repaired** — that is not something a
+branch can fix, and it is now visible instead of silent.
+
+### The process finding: the new suites were never in CI
+
+`test:range`, `test:idb` and `test:hydration` were written for this branch and **never
+wired into `.github/workflows/ci.yml`** (which ran store/runtime/ssrf/zombie/versions +
+security only). Two reviewers found bounds bugs in covered-by-those-suites code within a
+day — including one that a W/invariant sweep now catches in 400 random windows. CI now
+runs range, idb, hydration, gate and pty.
+
+### Verification after the pass
+
+typecheck + build + **18/18 suites**: range **22**, idb-cache **76**, hub-hydration **19**,
+display-gate **19**, retry 50, security-gates 69, store 7, runtime 6, ssrf 5, zombie 11,
+versions **32** (was 30 + a hidden failure), compact 19, fork 23, shutdown 9, edit-tool 7,
+fetch 9, term-pty **8**, term-smoke 12. Working-tree churn check clean
+(`git diff --stat` == `git diff -w --stat`). The C4 measurements still hold
+(`haveTo=count` → 0 bytes).
+
 ---
 
 # PR 2 — retry + mobile: the branch base (`c461dee`, `b8f1aca`, `916c0ef`, `7bdcd03`)

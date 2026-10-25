@@ -499,3 +499,30 @@ awaits `_ensureEntry()` before snapshotting, which makes the fix independent of 
 Track the fact you actually mean (`hydrated`) — and fix the *ordering* at the entry point (attach) rather
 than only patching the guard, because the guard alone still lets the first frame be empty. Regression
 suite: `npm run test:hydration` (12 checks, incl. the sparse-attach-on-a-pre-created-entry case).
+
+## The suite that reported "30 passed" while failing (2026-10-25)
+
+`npm run test:versions` printed `[versions] 30 check(s) passed` **and exited 1**: its `check()`
+incremented a single counter on success and wrote ✗ to **stderr** on failure, so the summary could
+not show a failure and every stdout-only read (mine included, twice) saw a green suite. The hidden
+failure was real — the check hard-coded `versions.get(S, 2)` while the sidecar's content-hash dedupe
+legitimately reuses vid 1 for a byte-identical re-edit, shifting the following capture to vid 2. It was
+caught only because CI runs the suite.
+
+**Lesson:** a summary that cannot count failures is worse than no summary — and a test must assert the
+PROMISE (everything is restorable), never an identifier a valid implementation may reuse.
+
+## "script.exe has gone" — validating a file instead of a capability (2026-10-25)
+
+User report: "script.exe has gone and terminal with nano is not working". The exe was on disk,
+byte-identical to a fresh extraction of its sha256-pinned package, and the branch does not touch
+terminal code at all — but it could not create a pty in this environment (`script: failed to create
+pseudo-terminal: No such file or directory`; `/dev/ptmx` fails even for a plain `bash -lc 'exec
+3<>/dev/ptmx'`, so this Git install's msys runtime cannot provide ptys at all). The hub's
+`bridgeUsable()` checked only the PE header + size, so the bridge was adopted, died immediately, and
+the tier silently became `pipes` — where nano/vim fail with "standard input is not a terminal" and
+NOTHING in the UI said why.
+
+**Lesson:** an integrity check ("this is a plausible binary") is not a capability check ("this binary
+can do the job I am about to give it"). Prove the capability by RUNNING it with the real collaborator,
+and surface the reason when it fails — a silent downgrade reads as "the feature is gone".

@@ -23,13 +23,29 @@ Covers `terminal-hub.mjs` (server), `src/ui/terminal.tsx` (client dock), `src/ui
 - Auto-fallback: the pty bridge dying non-zero within 4s of spawn (`PTY_FALLBACK_MS`) downgrades that
   session to pipes once (`fallbackTried`); a pipes-started session may upgrade to pty on later respawns.
 
+## Bridge CAPABILITY (`bridgeProbe` / `pickBridge`)
+
+A bridge is only adopted if it can allocate a pty FOR THE SHELL IT WILL DRIVE:
+`bridgeProbe(exe, bashPath)` runs `exe -q -f -e -c "<bash> -c 'test -t 0'" /dev/null` and requires
+exit 0 (`-e`/--return makes `script` propagate the child's status, so this asserts
+`isatty(stdin)` — exactly what nano/vim need). The verdict and the bridge's own stderr are cached
+per process; `pickBridge` walks the candidates and keeps the last failure reason, which becomes
+`state.bridgeNote` (the dock renders it) and blocks adoption.
+
+Why: a bridge that passes the old PE-header/size check but cannot create a pty (it binds a
+different msys runtime than the one that ships with Git) was adopted, died instantly, and silently
+downgraded the tier to `pipes` — where nano/vim fail with "standard input is not a terminal" and
+nothing explained it. Regression suite: `node tests/term-pty.test.mjs` (with `PI_REQUIRE_PTY=1` a
+real pty becomes a hard requirement).
+
 ## Bridge provisioning (`provisionScriptBridge`)
 
 Downloads a PINNED package (`util-linux-2.40.2-2` from repo.msys2.org, sha256-pinned constant,
 8MB cap), requires node zlib `zstdDecompressSync` (node ≥ 22.15), decompresses, extracts ONLY
 `usr/bin/script.exe` with **System32 tar** (never PATH-searched) into a unique tmp dir
 (`.tmp-<pid>-<ts>`), validates it (`bridgeUsable`: regular file, 8KB–2MB, `MZ` header), then
-`renameSync` (atomic publish) into `data/bin/script/script.exe`. Failures back off
+`renameSync` (atomic publish) into `data/bin/script/script.exe`. The extracted exe must also pass
+`bridgeProbe` first (`pinned bridge cannot create a pty: …`), so a broken bridge is never published. Failures back off
 `PROVISION_RETRY_MS` (60s). `PI_WEB_TERM_BRIDGE=0|pipes` forces pipes; a configured PATH must exist
 (a typo fails loudly instead of triggering the auto-download).
 
@@ -56,7 +72,7 @@ Downloads a PINNED package (`util-linux-2.40.2-2` from repo.msys2.org, sha256-pi
 | s→c | `{t:"replay", d}` | ring history on (re)attach |
 | s→c | `{t:"d", d}` | live output (stdout+stderr merged) |
 | s→c | `{t:"clear"}` | other sockets drop the dead screen on reset |
-| s→c | `{t:"state", s}` | `{phase: starting|ready|dead|error, tier, exit, error, pid}` |
+| s→c | `{t:"state", s}` | `{phase: starting|ready|dead|error, tier, exit, error, pid, bridgeNote}` — `bridgeNote` explains why the pipe tier is in use when that is a BRIDGE problem |
 
 ## Session lifecycle (all proc handlers generation-guarded via `sess.gen`)
 
