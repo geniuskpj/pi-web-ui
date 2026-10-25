@@ -209,8 +209,11 @@ directly, so the two sides cannot drift. `/range` snaps the LOW end DOWN (after 
 turn is never cut) and the HIGH end UP (capped at the session end); the attach tail snaps DOWN too — but
 never to 0, which would turn a huge-message tail into a full attach. A fetched window and a live-written
 chunk now describe the SAME key: the seam is gone and a warm cache can serve a later attach.
-Measured: `[300,700)` → **[576,704)**, `[1000,…)` → **[960,1056)**, `tailBytes=1MB` → **[896,1056)** —
-all aligned, all still adjacent to the loaded tail.
+Measured (pre-fix numbers, kept as measured): `[300,700)` → **`[576,704)`**, `[1000,…)` →
+**`[960,1056)`**, `tailBytes=1MB` → **`[896,1056)`** — all aligned, all still adjacent to the loaded
+tail. The 2026-10-25 review found the bounds bugs *inside this table* (a start of 960 for a request at
+1000; an end of 704 for a request ending at 700); §9 states which rows the fix changes and why these
+numbers looked right when they were taken.
 
 **B. `haveTo` — the client says what it already has.** The attach carries `haveTo` (the end of this
 device's cached coverage, read from the IDB meta). The hub trims the low end to `alignDown(claim)` — a
@@ -237,7 +240,7 @@ in CI**.
 
 | # | Finding (source) | Verdict | Fix |
 |---|---|---|---|
-| 1 | `/range` snapped the low end BELOW the requested `fromSeq` → negative `slice()` (JS counts from the array END) → body ≠ `X-Range-From/To-Seq`, client splices at wrong seqs, ~400 msgs/expand unreachable (reviewer1 #1 / reviewer2 #1, both P1) | **CONFIRMED** | `lib/range-window.mjs`: `start = max(alignedStart, fromSeq)` |
+| 1 | `/range` snapped the low end BELOW the requested `fromSeq` → negative `slice()` (JS counts from the array END) → body ≠ `X-Range-From/To-Seq`, client splices at wrong seqs, ~400 msgs/expand unreachable (reviewer1 #1 / reviewer2 #1, both P1) | **CONFIRMED** | `lib/range-window.mjs`: `start = max(alignedStart, fromSeq)` — see the note below on why §8's measurements could not have caught it |
 | 2 | Memory tier keyed `(session, fromSeq)` without the generation → post-rewrite read renders pre-rewrite content (reviewer1 #2 / reviewer2 #3, P1) | **CONFIRMED** | `memKey(sessionId, rewriteSeq, fromSeq)`; `dropChunk` punches the mem entry; `clearSession`'s prefix wipe unchanged |
 | 3 | High end `alignUp` could exceed the requested `toSeq` → chunk claims more lines than it holds → dropped by `verifyChunkText` on EVERY read (reviewer1 #3) | **CONFIRMED** | `end = min(alignedEnd, messageCount, toSeq)` |
 | 4 | Display gate was an array INDEX captured at attach; a prefix fill moves it, and a fully-warm reopen (empty window) resolved to 0 → the whole window rendered (reviewer1 #4) | **CONFIRMED** | `lib/display-gate.mjs` + seq-space gate + `resolveGateSeq` re-anchor (`tests/display-gate.test.mjs`) |
@@ -249,6 +252,16 @@ in CI**.
 | 10 | Cached expansion appended WHOLE chunks (incl. above `to`) but recorded the REQUESTED `from` as `filledFrom` → indices shift under the splice, edits land on the wrong turn (reviewer2 #2, P1) | **CONFIRMED** | `lib/chunk-splice.mjs` (`planCachedSplice`): trim at `to`, adopt the lowest chunk start |
 | 11 | `npm run test:versions` fails in CI (reviewer2 #4) | **CONFIRMED, different cause** | see below |
 | 12 | "script.exe has gone and terminal with nano is not working in this branch" (user) | **NOT a regression — a real defect anyway** | see below |
+
+**Why §8's measurements did not catch it — and which of them change:** the 9.6MB session averages
+~9.1KB per message, so the 1MB keep-high clamp pushes the start far above the requested `fromSeq`
+(a 400-message request clamps to ~110 messages). Where that clamp landed ABOVE the request, the
+snap-down was a no-op and §8 still holds (`[300,700) → [576,704)`, tailBytes `→ [896,1056)`). But
+where the requested `fromSeq` sat above the snapped boundary, the old code answered BELOW the
+request — §8's own row measured `from=960` for a request at `fromSeq=1000`, so the defect was
+sitting in the measurement table: that window now reads `[1000,1056)`. It took a reader who
+trusted the arithmetic over my table to see it, which is the whole argument for section W (both
+shapes, plus a 400-window sweep).
 
 ### 11 — versions: the failing check, and why nobody saw it
 
