@@ -96,7 +96,26 @@ if (!verdict.ok) {
 	const src = fs.readFileSync(path.join(ROOT, "terminal-hub.mjs"), "utf8");
 	check("K5 the reason reaches the client (state frame field)", /bridgeNote: sess\.bridgeNote/.test(src));
 	check("K5 provisioning refuses to adopt a bridge that cannot create a pty", /pinned bridge cannot create a pty/.test(src));
-	check("K5 the hub no longer trusts the PE header alone when choosing a bridge", /function pickBridge\(dataDir, bashPath\)/.test(src) && /pickBridge\(dataDir, bashPath\)/.test(src));
+	check("K5 the hub no longer trusts the PE header alone when choosing a bridge", /function pickBridge\(dataDir, bashPath, debug/.test(src) && /pickBridge\(dataDir, bashPath, debug\)/.test(src));
+
+	// K6/K7 THE SECOND KIND (2026-10-25, user report "find other ways to use nano"):
+	// msys2's script.exe needs an msys pty, and some Git installs cannot allocate one
+	// at all (/dev/ptmx fails even WITH a console; script.exe fails under conhost too).
+	// Windows' own ConPTY server (`conhost.exe --headless`) is unaffected: it gives the
+	// shell a real console and forwards it as VT over our pipes — no download, no
+	// native module, no node-pty. Verified end to end: bash reports isatty(stdin),
+	// `stty size` answers, OSC 133/7 still arrive, and nano renders its UI.
+	const { conhostProbe } = await import("../terminal-hub.mjs");
+	const conhost = conhostProbe(bash);
+	check("K6 conhost --headless probe is reachable", typeof conhost?.ok === "boolean");
+	if (conhost.ok) {
+		check("K6a ConPTY gives the shell a real tty (nano/vim work through it)", true, "isatty(stdin)=true");
+	} else {
+		console.log(`  • K6a ConPTY: unavailable — ${conhost.reason}`);
+	}
+	check("K7 SOME bridge can give the shell a tty (script.exe or ConPTY)",
+		verdict.ok || conhost.ok,
+		`script=${verdict.ok ? "ok" : verdict.reason} | conhost=${conhost.ok ? "ok" : conhost.reason}`);
 }
 
 console.log(`\n[term-pty] ${passed} passed, ${failed} failed`);

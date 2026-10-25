@@ -52,6 +52,9 @@ interface ShellState {
 	exit: number | null;
 	error: string | null;
 	pid: number | null;
+	/** which bridge provides the shell's tty ("conhost --headless (ConPTY)",
+	 *  "script.exe (msys pty)", …) — null in the pipe tier. */
+	bridge: string | null;
 	/** why the pipe tier is in use, when it is a BRIDGE problem (server-sent):
 	 *  nano/vim need a real pty, and "pipes" alone is not a diagnosis. */
 	bridgeNote: string | null;
@@ -457,6 +460,7 @@ export function TerminalPanel({
 						exit: Number.isFinite(m.s?.exit) ? Number(m.s.exit) : null,
 						error: m.s?.error ?? null,
 						pid: Number.isFinite(m.s?.pid) ? Number(m.s.pid) : null,
+						bridge: m.s?.bridge ? String(m.s.bridge) : null,
 						bridgeNote: m.s?.bridgeNote ? String(m.s.bridgeNote) : null,
 					};
 					setShell(s);
@@ -736,6 +740,9 @@ export function TerminalPanel({
 	// pipes + a BRIDGE problem (no pty): say so in the status line — the note row
 	// below carries the reason. Computed here so the ternary below stays flat.
 	const pipesLabel = shell?.bridgeNote ? "bash — pipes (no pty: nano/vim unavailable)" : "bash — pipes (readline)";
+	// WHICH bridge gave the shell its tty matters for support: a msys pty and ConPTY
+	// behave differently (resize, ^C, job control), so name it.
+	const ptyLabel = /conhost/i.test(shell?.bridge || "") ? "bash — pty (conhost)" : shell?.bridge ? "bash — pty (msys)" : "bash — pty";
 	const statusText = loadError
 		? "terminal failed to load"
 		: wsStatus !== "open"
@@ -746,7 +753,7 @@ export function TerminalPanel({
 				? "waiting for shell…"
 				: shell.phase === "ready"
 					? shell.tier === "pty"
-						? "bash — pty (msys)"
+						? ptyLabel
 						: pipesLabel
 					: shell.phase === "dead"
 						? `shell exited (${shell.exit ?? "?"})`
