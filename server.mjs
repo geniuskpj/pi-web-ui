@@ -46,6 +46,11 @@ import { streamSimple } from "@earendil-works/pi-ai/compat";
 import { getBuiltinProviders, getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { AgentHub } from "./agent-hub.mjs";
 import { createTerminalHub } from "./terminal-hub.mjs";
+// per-connection stream reduction (plan §2.3): OFF unless the client opts in with
+// {type:"setDataReduction"}. Pure module → tests/stream-reduce.test.mjs.
+import { createStreamReducer, normalizeReductionConfig, describeReduction } from "./lib/stream-reduce.mjs";
+// egress media: the hash validator for GET /api/agent/session/:id/media/:hash
+import { isMediaHash } from "./lib/data-reduction.mjs";
 import { stripBoilerplate } from "./lib/hp2.mjs";
 import { netClassOf } from "./lib/net-class.mjs";
 import { planRangeWindow } from "./lib/range-window.mjs";
@@ -1337,6 +1342,8 @@ function normalizeToolResult(r) {
 // auth.json (provider API keys) — a human-facing browser must not expose them.
 // Paths are returned WORKSPACE-RELATIVE ("/"-separated) — absolute paths leak the
 // server layout and made the client breadcrumbs wrong (grok p6/p7).
+/** Upload cap for one client-encoded image (the browser already resized it, so this is generous). */
+const MAX_IMAGE_UPLOAD = 12 * 1024 * 1024;
 const IMAGE_MIME = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp" };
 const WORKSPACE_REAL = fs.realpathSync(WORKSPACE_DIR);
 // the system prompt files are browsable in the file viewer (user request:
@@ -1953,13 +1960,39 @@ function piDefaultModelId() {
 	return String(s.default_model || s.defaultModel || "");
 }
 
+/** Data-reduction debug trace (PI_WEB_DATA_REDUCTION_DEBUG=1): one line per block, so the user can
+ *  watch a live turn shrink. Off by default — this is the "let me test it on a debug server" switch. */
+const DR_DEBUG = process.env.PI_WEB_DATA_REDUCTION_DEBUG === "1";
+
 const agentHub = new AgentHub({
 	modelsStore: piModelsStore,
 	getAuth: () => readJsonSafe("auth.json") || {},
 	persist: async (id, jsonl) => { await storeOp("put", { id, jsonl }); broadcastSessions().catch(() => {}); },
-	broadcast: (sessionId, msg) => {
-		const payload = JSON.stringify({ type: "agent", sessionId, ...msg });
-		for (const c of agentClients.get(sessionId) || []) { if (c.readyState === 1) c.send(payload); }
+	// THE delivery boundary: the only place in the app that is per-CONNECTION, which is why stream
+	// reduction (plan §2.3) lives here. A socket that never opted in keeps `__reducer.enabled ===
+	// false`, so this loop stays byte-for-byte the old one for every existing client.
+	broadcast: (sessionId, incoming) => {
+		// EGRESS REDACTION (plan §2.2b): once per broadcast, not per socket — content-addressed, so
+		// all clients can share the same redacted copy (and the hub caches it per message object).
+		const msg = agentHub.redactFrame(incoming);
+		for (const c of agentClients.get(sessionId) || []) {
+			if (c.readyState !== 1) continue;
+			let out = msg;
+			const reducer = c.__reducer; // (redaction happens ONCE per broadcast, below)
+			if (reducer?.enabled) {
+				out = reducer.transform(msg, Date.now());
+				if (!out) continue; // this client asked for the frame to be held
+				// a dying turn returns [flushed-text, error] — both must reach the client
+				const frames = Array.isArray(out) ? out : [out];
+				if (DR_DEBUG && frames.some((f) => f.event?.type === "turn_end" || f.event?.type === "error" || f.event?.type === "aborted")) {
+					const s = reducer.stats();
+					if (s.forwarded || s.dropped) console.log(`[data-reduction] ${sessionId} block end: ${describeReduction(s, reducer.cfg)}`);
+				}
+				for (const f of frames) c.send(JSON.stringify({ type: "agent", sessionId, ...f }));
+				continue;
+			}
+			c.send(JSON.stringify({ type: "agent", sessionId, ...out }));
+		}
 	},
 	// server-side agent loop (2026-10-21, now the DEFAULT chat path): the same
 	// tool objects the exec bridge exposes run IN-PROCESS; the system prompt and
@@ -1968,6 +2001,10 @@ const agentHub = new AgentHub({
 	// store READ accessor: forkSession self-hydrates cold sessions (hub restart,
 	// no attach yet) straight from the JSONL mirror
 	loadMessages: async (id) => { try { const j = await storeOp("get", { id }); return j?.messages?.length ? { messages: j.messages, metadata: j.metadata } : null; } catch { return null; } },
+	// BINARY image store on disk (user design 2026-10-25): the browser sends the ENCODED image
+	// (webp/jpeg), we keep those bytes — never the raw original, never base64 — and base64 is
+	// generated only when the LLM request is built.
+	mediaDir: path.join(DATA_DIR, "media"),
 	// /compact (pi parity): the summarization LLM call runs through a THROWAWAY
 	// Agent — reuses the whole conversion/retry pipeline; no tools, thinkingLevel
 	// off. Structured checkpoint format mirrors pi's SUMMARIZATION_PROMPT.
@@ -2108,7 +2145,7 @@ async function pushWatched(id) {
 	// same shape as the explicit "get" branch: the worker returns
 	// {jsonl, metadata, messages} — the old `data: j.data` was undefined, so
 	// watched-session notifications carried NO body (P2 fix)
-	const payload = JSON.stringify({ type: "session", id, data: { messages: j.messages }, metadata: j.metadata, jsonl: j.jsonl });
+	const payload = JSON.stringify({ type: "session", id, data: { messages: agentHub.redactMessages(j.messages) }, metadata: j.metadata });
 	for (const c of syncClients) {
 		if (c.watch.has(id) && c.ws.readyState === 1 && c.ws.bufferedAmount <= MAX_BUFFERED) c.ws.send(payload);
 	}
@@ -2203,8 +2240,10 @@ function syncConn(ws) {
 				}
 			} else if (m.type === "get" && SESSION_ID_RE.test(id)) {
 				const j = await storeOp("get", { id });
-				// worker returns {jsonl, metadata, messages} — expose as data:{messages} for clients
-				if (j) safeSend(ws, { type: "session", id, data: { messages: j.messages }, metadata: j.metadata, jsonl: j.jsonl });
+				// worker returns {jsonl, metadata, messages} — expose as data:{messages} for clients.
+				// jsonl is NOT sent: the client only reads data/metadata, and it carried a second, raw
+				// copy of every inline image — the biggest egress leak in the app (2026-10-25).
+				if (j) safeSend(ws, { type: "session", id, data: { messages: agentHub.redactMessages(j.messages) }, metadata: j.metadata });
 			} else if (m.type === "watch" && SESSION_ID_RE.test(id)) {
 				client.watch.add(id);
 				pushWatched(id).catch(() => {});
@@ -2221,6 +2260,9 @@ function syncConn(ws) {
 function agentConn(ws) {
 	console.log("[agent-ws] client connected");
 	let currentSession = null;
+	// per-CONNECTION reduction state (two devices on one session may want different modes).
+	// `null` config ⇒ pass-through, i.e. today's behaviour, at the cost of one `if` per frame.
+	const reduction = { cfg: null, reducer: createStreamReducer(null) };
 	ws.on("message", async (raw) => {
 		let m;
 		try { m = JSON.parse(raw.toString()); } catch { return; }
@@ -2303,6 +2345,22 @@ function agentConn(ws) {
 					// client setting (Settings → Retry): pushed on every (re)attach + change
 					const cfg = agentHub.setAutoRetry({ enabled: !!m.enabled, attempts: m.attempts, delayMs: m.delayMs });
 					safeSend(ws, { type: "auto-retry", id: m.id, ...cfg });
+					break;
+				}
+
+				case "setDataReduction": {
+					// client setting (Settings → Data use): stream coalescing for THIS connection only
+					// (plan §2.3). OFF by default — a client that never sends this keeps live streaming,
+					// and an unknown mode falls back to live rather than to a stronger reduction.
+					reduction.cfg = normalizeReductionConfig(m, m?.net === "lan" || m?.net === "metered" ? m.net : "wan");
+					reduction.reducer = createStreamReducer(reduction.cfg);
+					ws.__reducer = reduction.reducer; // the broadcast loop reads it per socket
+					safeSend(ws, {
+						type: "data-reduction", id: m.id, ok: true, enabled: reduction.reducer.enabled,
+						streamMode: reduction.cfg?.streamMode ?? "live",
+						kinds: reduction.cfg ? Object.fromEntries(Object.entries(reduction.cfg.kinds).map(([k, v]) => [k, v.mode])) : {},
+					});
+					console.log(`[data-reduction] ${currentSession || "-"} ${describeReduction(reduction.reducer.stats(), reduction.cfg)}`);
 					break;
 				}
 
@@ -2468,6 +2526,46 @@ app.get("/api/agent/continuation/:id", async (c) => {
 		return c.json({ continuation: best ? { id: best.id, title: best.title, messageCount: best.messageCount, lastModified: best.lastModified } : null });
 	} catch (err) { return c.json({ error: err.message }, 500); }
 });
+// EGRESS MEDIA (user design 2026-10-25): the BINARY bytes behind an image part, content-addressed by
+// sha256. Sits under /api/* so it inherits the SAME auth gate as everything else — a hash is an
+// address, never a capability. Immutable + private caching: the browser renders an image once and
+// never re-downloads it (that is what makes a warm reopen cost 0 bytes). NO Content-Encoding: the
+// image is already encoded and gz/br on image bytes measured ~0% (`tests/image-compression.test.mjs`),
+// so a second pass would only cost CPU and a copy.
+app.get("/api/agent/session/:id/media/:hash", (c) => {
+	const hash = c.req.param("hash");
+	if (!isMediaHash(hash)) return c.json({ error: "bad hash" }, 400);
+	const entry = agentHub.getMedia(hash);
+	if (!entry) return c.json({ error: "not found" }, 404);
+	return c.body(entry.bytes, 200, {
+		"Content-Type": entry.mimeType || "application/octet-stream",
+		"Content-Length": String(entry.bytes.length),
+		"Cache-Control": "private, max-age=31536000, immutable",
+	});
+});
+
+// BINARY IMAGE UPLOAD (user design 2026-10-25): the browser posts the bytes it already encoded
+// (resize + webp), so no base64 ever travels up and nothing raw is ever stored. The body IS the
+// image; the content-type is its mime. Auth comes from the /api/* gate like every other route.
+// Returns just the content address — the prompt frame then references it by hash.
+app.post("/api/agent/session/:id/media", async (c) => {
+	try {
+		const mimeType = String(c.req.header("content-type") || "").split(";")[0].trim().toLowerCase();
+		if (!/^image\//.test(mimeType)) return c.json({ error: "only image/* bodies (set Content-Type)" }, 415);
+		const buf = Buffer.from(await c.req.arrayBuffer());
+		if (!buf.length) return c.json({ error: "empty body" }, 400);
+		if (buf.length > MAX_IMAGE_UPLOAD) return c.json({ error: `image too large (>${Math.round(MAX_IMAGE_UPLOAD / 1048576)}MB)` }, 413);
+		// RETENTION (Settings → Data use): "server" (default) persists the blob on disk, "browser" keeps
+		// it in memory only — the client holds its own copy in IDB and re-uploads if a restart lost it.
+		// Header first, query as the fallback (so a curl test can pick it too).
+		const retention = String(c.req.header("x-pi-media-retention") || c.req.query("retention") || "server").toLowerCase();
+		const persist = retention !== "browser" && retention !== "memory";
+		const stored = agentHub.putMedia(buf, mimeType, { persist });
+		if (!stored) return c.json({ error: "empty body" }, 400);
+		return c.json({ hash: stored.hash, mimeType, bytes: stored.bytes, persisted: stored.persisted });
+	} catch (err) { return c.json({ error: err.message }, 500); }
+});
+
 app.get("/api/agent/session/:id", async (c) => {
 	try {
 		const id = c.req.param("id");

@@ -457,8 +457,23 @@ export function createTerminalHub({
 	const loopbackOf = typeof isLoopback === "function" ? isLoopback : () => false;
 
 	// dedicated WSS: the shared 25MB maxPayload would let one oversized frame
-	// allocate 25MB per socket; terminal frames are tiny
-	const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_INPUT + 64 * 1024 });
+	// allocate 25MB per socket; terminal frames are tiny.
+	//
+	// permessage-deflate (2026-10-25, plan item 2): terminal output is the most compressible
+	// traffic in the app (prompt echo, `ls`, build logs) and the client is often a phone on a
+	// metered link — 60-80% off a scrollback, lossless, zero client code (the browser decodes
+	// Content-Extension natively). Same shape as the agent socket in server.mjs: env kill switch
+	// + a threshold so tiny keystroke echoes stay uncompressed. A browser CANNOT switch the
+	// extension off, so there is deliberately no client toggle — the opt-outs are
+	// PI_WEB_WS_DEFLATE=off (server) and declining the extension (non-browser clients).
+	const wss = new WebSocketServer({
+		noServer: true,
+		maxPayload: MAX_INPUT + 64 * 1024,
+		perMessageDeflate: process.env.PI_WEB_WS_DEFLATE === "off" ? false : {
+			threshold: 1024,
+			zlibDeflateOptions: { level: 6 },
+		},
+	});
 	wss.on("connection", (ws, req) => conn(ws, req));
 
 	const sessions = new Map(); // id → session

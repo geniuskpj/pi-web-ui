@@ -8,6 +8,8 @@
 // Clients can disconnect at any time — long jobs keep running server-side.
 import { Agent } from "@earendil-works/pi-agent-core";
 import { alignDown } from "./lib/chunk-window.mjs";
+// egress redaction (plan §2.2b): inline base64 → content hash + the /media route
+import { createMediaStore, redactImageData, hydrateImageData } from "./lib/media-egress.mjs";
 // pi-ai 1.4.0: AgentOptions.streamFn is REQUIRED — the compat subpath exports the
 // generic streamSimple dispatcher (routes on model.api) and auto-registers the
 // builtin api providers on import
@@ -120,7 +122,7 @@ const serializeConversation = (messages) => {
 };
 
 export class AgentHub {
-	constructor({ modelsStore, getAuth, persist, broadcast, getTools, getSystemPrompt, defaultModelId, onRuntimeChange, loadMessages, summarize, backupMirror, versions }) {
+	constructor({ modelsStore, getAuth, persist, broadcast, getTools, getSystemPrompt, defaultModelId, onRuntimeChange, loadMessages, summarize, backupMirror, versions, mediaDir }) {
 		this.modelsStore = modelsStore;
 		this.getAuth = getAuth;
 		this.persist = persist; // async (id, data, metadata) — worker store (atomic)
@@ -134,6 +136,15 @@ export class AgentHub {
 		// simple meta (vid/turn/firstId/count) so versions are restorable
 		this.versions = versions || null;
 		this.broadcast = broadcast; // (sessionId, msg) — send to attached clients
+		// MEDIA STORE (user design 2026-10-25): the image is kept as BINARY — never base64, never the raw
+		// original (the browser already resized/encoded it). base64 is produced only when the LLM request
+		// is built (`hydrateImageData`). `dir` makes it survive a restart, which is what "keep the session
+		// image on the server" means; the in-memory LRU in front of it is just a read cache.
+		this.media = createMediaStore({
+			maxBytes: Math.max(8, Number(process.env.PI_WEB_MEDIA_CACHE_MB) || 64) * 1024 * 1024,
+			dir: mediaDir || null,
+		});
+		this._redacted = new WeakMap(); // messages-array → redacted copy (once per object)
 		// server-side toolset (2026-10-21): the SAME builtin+extension tools the exec
 		// bridge exposes — executed IN THIS PROCESS by the server-side agent loop, so
 		// a run survives browser closes and every device sees live progress
@@ -832,6 +843,54 @@ export class AgentHub {
 
 	/** Snapshot for attaching clients (cold sessions). Mid-run attachers get the
 	 *  in-flight streamingMessage + pending tool calls too (grok r3 Q1). */
+	/**
+	 * EGRESS redaction (plan §2.2b, 2026-10-25): every frame that leaves the process replaces inline
+	 * image base64 with {hash, bytes} + an address on the media route. The session FILE and the model
+	 * input keep the bytes — only what travels loses them. Content-addressed, so it is idempotent;
+	 * the WeakMap makes it once per message object (a live turn re-sends whole state frames, and
+	 * re-redacting the same object must not re-decode 8 photos).
+	 */
+	redactMessages(messages) {
+		if (!Array.isArray(messages) || !messages.length) return messages;
+		const cached = this._redacted.get(messages);
+		if (cached) return cached;
+		const out = redactImageData(messages, { store: this.media }).messages;
+		if (out !== messages) this._redacted.set(messages, out);
+		return out;
+	}
+
+	/** One egress FRAME (state or agent-event) with every inline image replaced by its hash. */
+	redactFrame(msg) {
+		if (!msg || typeof msg !== "object") return msg;
+		if (Array.isArray(msg.messages)) {
+			const messages = this.redactMessages(msg.messages);
+			const streaming = msg.streamingMessage ? this.redactMessages([msg.streamingMessage])[0] : msg.streamingMessage;
+			if (messages === msg.messages && streaming === msg.streamingMessage) return msg;
+			return { ...msg, messages, streamingMessage: streaming ?? null };
+		}
+		const event = msg.event;
+		if (!event?.message || !Array.isArray(event.message.content)) return msg;
+		const message = this.redactMessages([event.message])[0];
+		return message === event.message ? msg : { ...msg, event: { ...event, message } };
+	}
+
+	/** The bytes behind a hash (for GET /api/agent/session/:id/media/:hash). */
+	getMedia(hash) {
+		return this.media.get(hash);
+	}
+
+	/**
+	 * Store a client-encoded image (POST …/media) and return its content address.
+	 * `persist: false` = the "browser keeps its images" retention mode: memory only.
+	 */
+	putMedia(bytes, mimeType = "application/octet-stream", { persist = true } = {}) {
+		const buf = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+		if (!buf.length) return null;
+		const hash = crypto.createHash("sha256").update(buf).digest("hex");
+		const entry = this.media.put(hash, buf, mimeType, { persist });
+		return { hash, bytes: buf.length, persisted: !!entry?.persisted };
+	}
+
 	getState(sessionId) {
 		const entry = this.sessions.get(sessionId);
 		if (!entry) {
@@ -841,14 +900,15 @@ export class AgentHub {
 		const state = entry.agent.state;
 		const payload = {
 			exists: true,
-			messages: state.messages,
+			messages: this.redactMessages(state.messages),
 			model: state.model,
 			thinkingLevel: state.thinkingLevel,
 			isStreaming: state.isStreaming,
 			// tail-first cache: rewrite generation + seq floor (client IDB invalidation)
 			rewriteSeq: entry.rewriteSeq || 0,
 			rewrittenFrom: entry.rewrittenFrom || 0,
-			streamingMessage: state.streamingMessage ?? null,
+			// the in-flight snapshot can hold images too (a user message with photos while it streams)
+			streamingMessage: state.streamingMessage ? this.redactMessages([state.streamingMessage])[0] : null,
 			pendingToolCalls: state.pendingToolCalls instanceof Set ? [...state.pendingToolCalls] : [],
 			compacting: !!entry.compacting, // all devices show the progress banner
 			pendingPrompt: entry.pendingPrompt ?? null,
