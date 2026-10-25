@@ -123,5 +123,85 @@ const S = "rangetest00000000000000000000001";
 	check("compact → rewrittenFrom=0 (all cached chunks invalid)", r.rewrittenFrom === 0, JSON.stringify(r.rewrittenFrom));
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// W. /range WINDOW PLANNING (review 2026-10-25, findings #1 + #3 — both reviewers)
+//
+// The handler used to inline this arithmetic, so no suite could see it. Both
+// reviewers found the same two defects: the low end could snap BELOW the
+// requested fromSeq (negative slice → body ≠ headers → the client spliced
+// messages at the wrong seqs) and the high end could snap ABOVE the requested
+// toSeq (a chunk claiming more lines than it held → dropped on every read).
+// The contract tested here is the fix: fromSeq <= start <= end <= min(toSeq,count)
+// and the response headers describe exactly the messages carried.
+{
+	const { planRangeWindow } = await import("../lib/range-window.mjs");
+	const CH = 64;
+	const msgs = (tx, n) => {
+		const out = [];
+		for (let i = 0; i < n; i++) out.push(i % 3 === 0 ? user("u" + i) : asst("a" + i));
+		return out;
+	};
+	const plan = (o) => planRangeWindow({ messages: msgs(0, o.toSeq - o.fromSeq), ...o });
+
+	// W1 — the reported bug: an UNALIGNED request whose window fits the 1MB cap.
+	//      start must never fall below fromSeq (it used to snap 497 → 448).
+	{
+		const o = { fromSeq: 497, toSeq: 560, messageCount: 1056 };
+		const { start, end } = plan(o);
+		check("W1 unaligned fromSeq: start is NOT snapped below the request", start >= o.fromSeq, `start=${start} (fromSeq=${o.fromSeq})`);
+		check("W1 body length matches the reported window", end - start === msgs(0, o.toSeq - o.fromSeq).slice(start - o.fromSeq, end - o.fromSeq).length,
+			`[${start},${end})`);
+	}
+	// W2 — the high end never exceeds the requested toSeq (the "chunk claims more
+	//      lines than it holds" case: start=foo.toSeq=930 unaligned, count above).
+	{
+		const o = { fromSeq: 800, toSeq: 930, messageCount: 1056 };
+		const { start, end } = plan(o);
+		check("W2 alignUp never exceeds the requested toSeq", end <= o.toSeq, `end=${end} toSeq=${o.toSeq}`);
+		check("W2 end >= start (never an inverted window)", end >= start, `[${start},${end})`);
+	}
+	// W3 — alignment IS kept when it costs nothing (an aligned request stays aligned).
+	{
+		const o = { fromSeq: 512, toSeq: 1024, messageCount: 1056 };
+		const { start, end } = plan(o);
+		check("W3 an aligned request yields an aligned window", start % CH === 0 && end % CH === 0, `[${start},${end})`);
+	}
+	// W4 — a partial request (fromSeq 10 into a chunk) stays honest: it may start at
+	//      10, and then end must still be <= toSeq.
+	{
+		const o = { fromSeq: 10, toSeq: 40, messageCount: 1056 };
+		const { start, end } = plan(o);
+		check("W4 partial chunk request: bounds hold (10 <= start <= end <= 40)", start >= 10 && start <= end && end <= 40, `[${start},${end})`);
+	}
+	// W5 — the byte cap KEEPS THE HIGH END (a window too big for 1MB drops low seqs).
+	{
+		const heavy = Array.from({ length: 4000 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: [{ type: "text", text: "x".repeat(2000) }] }));
+		const { start, end } = planRangeWindow({ messages: heavy, fromSeq: 0, toSeq: 4000, messageCount: 4000 });
+		check("W5 the 1MB cap keeps the HIGH end", end === 4000 && start > 0, `[${start},${end})`);
+	}
+	// W6 — an empty window is expressed as start === end (the client's re <= rs bail).
+	{
+		const o = { fromSeq: 1000, toSeq: 1010, messageCount: 1010 };
+		const { start, end } = plan(o);
+		check("W6 a window at the session end is empty, not inverted", end >= start && end <= o.toSeq, `[${start},${end})`);
+	}
+	// W7 — property sweep over random (un)aligned windows: the invariant both
+	//      reviewers' bugs violated must hold for every one of them.
+	{
+		let bad = 0, checked = 0;
+		let seed = 12345;
+		const rnd = (n) => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) % n);
+		for (let i = 0; i < 400; i++) {
+			const count = 100 + rnd(1000);
+			const fromSeq = rnd(count);
+			const toSeq = Math.min(count, fromSeq + 1 + rnd(300));
+			const { start, end } = planRangeWindow({ messages: msgs(0, toSeq - fromSeq), fromSeq, toSeq, messageCount: count });
+			checked++;
+			if (!(fromSeq <= start && start <= end && end <= Math.min(toSeq, count))) bad++;
+		}
+		check(`W7 invariant sweep (400 random windows): fromSeq <= start <= end <= min(toSeq,count)`, bad === 0, `${bad}/${checked} violated`);
+	}
+}
+
 console.log(`\n[range] ${pass} passed`);
 process.exit(process.exitCode ? 1 : 0);

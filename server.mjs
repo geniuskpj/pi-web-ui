@@ -48,7 +48,7 @@ import { AgentHub } from "./agent-hub.mjs";
 import { createTerminalHub } from "./terminal-hub.mjs";
 import { stripBoilerplate } from "./lib/hp2.mjs";
 import { netClassOf } from "./lib/net-class.mjs";
-import { alignDown, isChunkAligned, chunkIndexOf, chunkFromSeq, chunkToSeq } from "./lib/chunk-window.mjs";
+import { planRangeWindow } from "./lib/range-window.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, "public");
@@ -2441,7 +2441,7 @@ app.get("/api/agent/session/:id", async (c) => {
 		// wire compression (transfer plan, 2026-10-24): these bodies reach 2-7.3MB
 		// and the browser decompresses Content-Encoding natively — zero client code
 		const accept = c.req.header("accept-encoding") || "";
-		if (payload.length > 2048 && /gzip/.test(accept)) {
+		if (Buffer.byteLength(payload, "utf8") > 2048 && /gzip/.test(accept)) { // bytes, not UTF-16 units
 			return c.body(zlib.gzipSync(payload), 200, { "Content-Type": "application/json", "Content-Encoding": "gzip", Vary: "Accept-Encoding" });
 		}
 		return c.body(payload, 200, { "Content-Type": "application/json", Vary: "Accept-Encoding" });
@@ -2483,36 +2483,17 @@ app.get("/api/agent/session/:id/range", async (c) => {
 		// dense window. At least one message is always kept.
 		const range = agentHub.getRange(id, { fromSeq, toSeq });
 		if (!range) return c.json({ error: "session not found" }, 404);
-		const MAX = 1024 * 1024;
-		let bytes = 0, start = range.toSeq;
-		while (start > range.fromSeq) {
-			let sz = 256;
-			try { sz = JSON.stringify(range.messages[start - 1 - range.fromSeq]).length; } catch { }
-			if (bytes + sz > MAX) break;
-			bytes += sz;
-			start--;
-		}
-		// USER-TURN ALIGNMENT (user request 2026-10-24: "reach until previous user
-		// turn"): a window that begins MID-TURN (inside an assistant's tool chain)
-		// reads broken. Walk the start DOWN to the nearest user message — each expand
-		// delivers whole conversational turns. Bounded scan (≤200 msgs / to fromSeq)
-		// so a monster turn can only stretch the window, never loop.
-		let aligned = start;
-		for (let k = 0; k < 200 && aligned > range.fromSeq; k++, aligned--) {
-			if (range.messages[aligned - range.fromSeq]?.role === "user") break;
-		}
-		start = aligned;
-		// C4 ALIGNMENT (2026-10-24): return WHOLE CHUNK_INTERVAL windows. The low end snaps
-		// DOWN (after the user-turn pass, so a turn is never cut) and the high end snaps UP
-		// (capped at the session end) so a stored window ENDS on a boundary and the next one
-		// starts exactly there. A fetched window and a live-written chunk then share a key —
-		// no seam, and the client's cache can serve the prefix of a later attach (see
-		// haveTo in agent-hub attach).
-		start = chunkFromSeq(chunkIndexOf(start));
-		const end = Math.min(isChunkAligned(range.toSeq) ? range.toSeq : chunkToSeq(chunkIndexOf(range.toSeq)), range.messageCount);
-		const slice = range.messages.slice(start - range.fromSeq, end - range.fromSeq);
+		// WINDOW PLANNING (review 2026-10-25): the budget walk, the user-turn walk and
+		// the C4 chunk snapping all live in ONE pure, unit-tested place
+		// (lib/range-window.mjs) — both reviewers found bounds bugs in the inline copy
+		// that no test could see. Contract: fromSeq <= start <= end <= min(toSeq, count),
+		// and the headers below describe exactly the bytes in the slice.
+		const { start, end } = planRangeWindow({ messages: range.messages, fromSeq: range.fromSeq, toSeq: range.toSeq, messageCount: range.messageCount });
+		const slice = start >= end ? [] : range.messages.slice(start - range.fromSeq, end - range.fromSeq);
 		const ndjson = slice.map((m) => JSON.stringify(m)).join("\n");
-		const gz = zlib.gzipSync(ndjson);
+		// 204 MUST NOT carry a body (RFC 9110) — the headers alone describe the empty
+		// window, and the client keys its "nothing more to load" decision off re <= rs.
+		const gz = slice.length === 0 ? null : zlib.gzipSync(ndjson);
 		return c.body(gz, slice.length === 0 ? 204 : 200, {
 			"Content-Type": "application/x-ndjson",
 			"X-Pi-Encoding": "gzip",
