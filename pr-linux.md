@@ -1,6 +1,12 @@
 # PR — Linux terminal support and pi 1.4.0
 
-**Branch:** `feat/linux-support` · **Base:** `feat/auth-gate-retry` · **Status:** local, not pushed
+**Branch:** `feat/linux-support` · **Base:** `main` · **Status:** merged latest `origin/main` locally; not pushed
+
+## Compatibility update — `main` merge (2026-10-25)
+
+- Merged `origin/main` at `2298a13` into the Linux branch in `402f474`.
+- The merge was clean. `agent-hub.mjs` now uses main's centralized `_settleRuntime` path while preserving the Linux branch's retry note and retry-policy result.
+- Branch is verified against updated main and is ahead of `origin/feat/linux-support`; the merge has not been pushed.
 
 ## Summary
 
@@ -31,8 +37,13 @@ Make the server's terminal and Bash execution usable on Linux while preserving t
 - `npm test` — 14 checks passed with Linux `script` installed; confirmed Bash sees a TTY.
 - `env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin "$(node -p 'process.execPath')" tests/term-smoke.mjs` — 13 checks passed with `script` unavailable; confirmed pipes fallback.
 - `npm run test:retry` — 31 checks passed.
+- After merging updated `main`: `npm run typecheck` and `npm run build` passed.
+- After merging updated `main`: `npm run test:security` — 64 checks passed; `npm run test:zombie` — 11 passed; `npm run test:runtime` — 6 passed.
+- After merging updated `main`: `npm run test:fetch` — 9 passed; `npm test` — 14 passed, including Linux `script` PTY and TTY checks.
+- `npm run test:killstop` did not pass: the test's LLM-backed run never started in this environment, so its kill/stop assertions could not run.
 
 ## Limitations
 
 - Linux requires the system util-linux `script` command for a real PTY. If it is absent, basic interactive Bash still works over pipes, but programs that require a TTY (for example, `nano`) do not.
 - macOS is not a supported target in this change.
+- `test:killstop` requires a configured, usable LLM to exercise an active run; that end-to-end behavior remains unverified here.
