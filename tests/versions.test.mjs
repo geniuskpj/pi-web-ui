@@ -25,10 +25,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-let pass = 0;
+let pass = 0, fail = 0;
 const check = (name, cond, detail = "") => {
 	if (cond) { pass++; console.log(`  ✓ ${name}`); }
-	else { console.error(`  ✗ ${name}${detail ? ` — ${detail}` : ""}`); process.exitCode = 1; }
+	else { fail++; console.error(`  ✗ ${name}${detail ? ` — ${detail}` : ""}`); process.exitCode = 1; }
 };
 
 const asst = (text) => ({ role: "assistant", content: [{ type: "text", text }], stopReason: "stop", timestamp: 1 });
@@ -73,7 +73,22 @@ hub.sessions.get(S).agent.state.messages.push(structuredClone(user("extra")), st
 const r3 = await hub.restoreVersion(S, 1); // bring the ORIGINAL tail back
 check("switch-away delta captured the grown tail", (await hub.listVersions(S)).some((v) => v.reason?.startsWith("switch-away") && v.turn === 2 && v.count === 2));
 check("restored-original content identical again", same(hub.sessions.get(S).agent.state.messages, base));
-check("intermediate tail still restorable (lossless)", (await hub.versions.get(S, 2))?.messages?.length === 4);
+// vid numbering is NOT stable across a dedupe: the sidecar parks a byte-identical
+		// capture ONCE (user report 2026-10-24 — every "switch to" click re-parked the
+		// same tail), so the second, identical edit reuses vid 1 and the switch-away
+		// capture becomes vid 2. LOSSLESSNESS is the promise; a hard-coded vid is not.
+// (This check used to assert versions.get(S, 2).messages.length === 4 and had been
+// failing since the dedupe landed — unseen, because the summary only counted passes.)
+check("a byte-identical re-edit is deduped (no new vid)", r3 != null && (await hub.listVersions(S)).filter((m) => m.reason === "edit").length === 1,
+	JSON.stringify((await hub.listVersions(S)).map((m) => `${m.vid}:${m.reason}`)));
+{
+	const metas = await hub.listVersions(S);
+	const recs = (await Promise.all(metas.map(async (m) => ({ m, rec: await hub.versions.get(S, m.vid) })))).filter((r) => r.rec);
+	const holdsEditTail = recs.some((r) => same(r.rec.messages, base.slice(2)));
+	const holdsGrownTail = recs.some((r) => (r.rec.messages || []).some((m) => m.content?.[0]?.text === "extra"));
+	check("intermediate tail still restorable (lossless)", holdsEditTail && holdsGrownTail,
+		`records=${metas.map((m) => `${m.vid}:${m.reason}:${m.count}`).join(",")}`);
+}
 const switchAway = (await hub.listVersions(S)).find((v) => v.reason?.startsWith("switch-away"));
 check("grown tail itself captured (restorable)", switchAway && (await hub.versions.get(S, switchAway.vid))?.messages?.length === 2);
 const before = structuredClone(base.slice(0, 2));
@@ -148,4 +163,4 @@ check("re-clicking the current version is a NOOP (no new version, no epoch bump)
 await hub.restoreVersion(S2, rd.version.vid); // flip once more
 check("flip again — still exactly 2 versions", (await versions.list(S2)).length === 2, `n=${(await versions.list(S2)).length}`);
 
-console.log(`[versions] ${pass} check(s) passed`);
+console.log(`[versions] ${pass} passed, ${fail} failed`);
