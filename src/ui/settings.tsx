@@ -12,6 +12,14 @@ import { getAppStorage } from "../storage.js";
 import { enterSendsPref } from "./chat.js";
 import { getProxyUrlSync } from "./proxy-stream.js";
 import { retryServerAuth } from "../server-auth.js"; // re-probe after a token change (clears the banner)
+// data-reduction LEVELS (images · reasoning/answer/tool streaming). All decisions live in the
+// tested pure layer; this file only persists them and prints the resolved parameters.
+import {
+    readDataSettings, readNetTier, setImageLevel, setThinkingLevel, pushDataReduction,
+    readImageRetention, setImageRetention, DEFAULT_IMAGE_RETENTION,
+    resolvedImagePolicy, resolvedStreamPolicy, describeImagePolicy, describeStreamPolicy,
+    imageLevelOptions, thinkingLevelOptions,
+} from "./data-settings.js";
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 
 export function SettingsDialog({
@@ -42,6 +50,14 @@ export function SettingsDialog({
 	const [retryDelayMs, setRetryDelayMs] = useState(() => {
 		try { return Math.max(1000, Math.min(60000, Number(localStorage.getItem("pi.autoRetryDelayMs")) || 3000)); } catch { return 3000; }
 	});
+	// data-reduction levels (pi.imageLevel / pi.thinkingLevel). The RESOLVED policies are computed on
+	// every render from localStorage, so the parameters shown always match what will be applied.
+	const [imageLevel, setImageLevelState] = useState<string>(() => readDataSettings().imageLevel || "auto");
+	const [thinkingLevel, setThinkingLevelState] = useState<string>(() => readDataSettings().thinkingLevel || "auto");
+	const [net, setNet] = useState<string>(() => readNetTier());
+	const [retention, setRetention] = useState<string>(() => readImageRetention());
+	const imagePolicy = resolvedImagePolicy(net);
+	const streamPolicies = { thinking: resolvedStreamPolicy("thinking", net), text: resolvedStreamPolicy("text", net), tool: resolvedStreamPolicy("tool", net) };
 	const [keys, setKeys] = useState<string[]>([]);
 	// Enter-key behavior (mobile multi-line, sonnet-5 design): tri-state pref read
 	// from the same localStorage key the Editor consumes (pi.enterSends)
@@ -82,6 +98,21 @@ export function SettingsDialog({
 			}
 		})();
 	}, [open, agent]);
+
+	// the link tier decides what "auto" means (lan/wired → high, wifi/wan → medium, metered → low).
+	// Read it from the server once per open, and keep it in localStorage for the composer.
+	useEffect(() => {
+		if (!open) return;
+		let alive = true;
+		void (async () => {
+			try {
+				const r = await fetch("/api/health", { signal: AbortSignal.timeout(3000) });
+				const j = await r.json();
+				if (alive && j?.netClass) { setNet(String(j.netClass)); try { localStorage.setItem("pi.netTier", String(j.netClass)); } catch { /* quota */ } }
+			} catch { /* offline: keep the conservative default */ }
+		})();
+		return () => { alive = false; };
+	}, [open]);
 
 	if (!open) return null;
 
@@ -230,6 +261,82 @@ export function SettingsDialog({
 							>
 								add key
 							</button>
+						</div>
+					</section>
+
+					<section class="pw-set-section">
+						<h3>Data use</h3>
+						<label class="pw-set-row" title="Two thresholds are applied to every image: a resolution cap AND a byte cap. The aspect ratio is always preserved.">
+							<span>Images</span>
+							<select
+								class="pi-input pw-set-input"
+								value={imageLevel}
+								onChange={(e) => {
+									const v = (e.target as HTMLSelectElement).value;
+									setImageLevelState(setImageLevel(v));
+									pushDataReduction(agent);
+									flash(v === "none" ? "Images: original (nothing is resized)" : `Images: ${v}`);
+								}}
+							>
+								{imageLevelOptions({ net }).map((o) => (
+									<option value={o.value} key={o.value}>{`${o.label} — ${o.params}`}</option>
+								))}
+							</select>
+						</label>
+						<div class="pw-set-subrow" style="margin-left:0">
+							<span class="pw-hint">Selected: <b>{imageLevel === "auto" ? `auto → ${imagePolicy.level}` : imageLevel}</b> · {describeImagePolicy(imagePolicy)}</span>
+						</div>
+						<label class="pw-set-row" title="One policy covers the reasoning, the assistant's answer and tool output — each stream keeps its own thresholds.">
+							<span>Reasoning &amp; stream</span>
+							<select
+								class="pi-input pw-set-input"
+								value={thinkingLevel}
+								onChange={(e) => {
+									const v = (e.target as HTMLSelectElement).value;
+									setThinkingLevelState(setThinkingLevel(v));
+									pushDataReduction(agent);
+									flash(`Streaming: ${v}`);
+								}}
+							>
+								{thinkingLevelOptions().map((o) => (
+									<option value={o.value} key={o.value}>{`${o.label} — ${o.params}`}</option>
+								))}
+							</select>
+						</label>
+						<div class="pw-set-subrow" style="margin-left:0;flex-direction:column;gap:2px">
+							<span class="pw-hint"><b>Reasoning</b> — {describeStreamPolicy(streamPolicies.thinking, "thinking")}</span>
+							<span class="pw-hint"><b>Answer</b> — {describeStreamPolicy(streamPolicies.text, "text")}</span>
+							<span class="pw-hint"><b>Tool output</b> — {describeStreamPolicy(streamPolicies.tool, "tool")}</span>
+						</div>
+						<label class="pw-set-row" title="Where a session image is kept after you send it. Server (default): the encoded bytes live in the server's media store, so any device can render them and the model can be re-run on them. Browser: the bytes stay on this device (the server keeps them only while it runs) — smaller footprint on the machine running pi, and the browser re-uploads when it must.">
+							<span>Image storage</span>
+							<select
+								class="pi-input pw-set-input"
+								value={retention}
+								onChange={(e) => {
+									const v = setImageRetention((e.target as HTMLSelectElement).value);
+									setRetention(v);
+									pushDataReduction(agent);
+									flash(v === "server" ? "Images are kept on the server" : "Images are kept in this browser");
+								}}
+							>
+								<option value="server">Server — any device can view them{retention === DEFAULT_IMAGE_RETENTION ? " (default)" : ""}</option>
+								<option value="browser">Browser — keep the bytes on this device</option>
+							</select>
+						</label>
+						<div class="pw-set-subrow" style="margin-left:0">
+							<span class="pw-hint">Selected: <b>{retention}</b> · {
+								retention === "server"
+									? "the encoded image is stored on disk (data/media) and served back by content hash; base64 is built only for the model request"
+									: "the encoded image stays in this browser; the server holds it in memory only and forgets it on restart"
+							}</span>
+						</div>
+						<div class="pw-hint">
+							Images are encoded once in this browser (resize + WebP) and kept as <b>binary</b> — never the raw
+							original, never base64: base64 is produced only when the model request is built. gz/br on an
+							encoded image saves ~0% (measured), so nothing is double-compressed. Frames below the socket's
+							deflate threshold do travel uncompressed, so larger stream chunks are also the cheaper ones;
+							sending the original and streaming every delta stay one click away (<b>None</b>).
 						</div>
 					</section>
 

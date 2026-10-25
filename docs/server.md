@@ -367,6 +367,90 @@ first) or LRU beyond HOT_AGENT_CAP+5 — non-streaming sessions only, so a live 
 persist per session) — wired to SIGINT/SIGTERM/SIGBREAK/stdin-close in server.mjs since 2026-10-21.
 `onEvents()` backs the SSE endpoint via the per-session subscriber Set (no swapping).
 
+## Data reduction on the agent path (`setDataReduction`, 2026-10-25 — contract)
+
+The browser owns the image half of the data plan (see `docs/client.md` → "the composer's image
+pipeline"); the SERVER owns the stream half, because the deltas are pumped server-side. The pure,
+tested decisions live in `lib/thinking-flush.mjs` (`resolveStreamPolicy(kind, net, settings)`,
+`createThinkingGate`), `lib/stream-reduce.mjs` (the per-connection reducer) and
+`lib/data-reduction.mjs` (`coalesceTurn`).
+
+**Status: IMPLEMENTED and OFF by default** (2026-10-25). `server.mjs`'s `agentConn` dispatch handles
+`setDataReduction` and stores the config on the CONNECTION (`ws.__reducer`); the delivery boundary is
+the per-socket loop in the hub's `broadcast()` callback, which runs `reducer.transform(msg)` per socket
+and sends whatever it returns (a frame, a truncated snapshot, an ARRAY of two frames, or nothing). A
+socket that never opts in keeps `enabled === false`, so that loop stays byte-for-byte the old one.
+Pure logic: `lib/stream-reduce.mjs`; suites: `tests/stream-reduce.test.mjs` (41 checks) and
+`tests/stream-reduce.e2e.mjs` (5 checks over a real socket).
+
+Debug it on its own port:
+
+```
+PORT=8899 PI_WEB_DATA_REDUCTION_DEBUG=1 npm start      # then open http://localhost:8899
+# Settings → Data use → Reasoning & stream: Paragraph / Turn end / None
+# one [data-reduction] line per block: modes · forwarded · dropped (bytes) · flushes
+```
+
+### The frame (per connection, like `set-auto-retry`)
+
+```jsonc
+c→s { type: "setDataReduction", id, net: "wan", imageLevel: "medium", thinkingLevel: "paragraph",
+      thinking: { mode, minBytes, maxBytes, maxLines, idleMs, maxHoldMs },
+      text:     { … }, tool: { … } }
+s→c { type: "data-reduction", id, ok: true, enabled, streamMode, kinds: { thinking, text, tool } }
+```
+
+`src/ui/data-settings.ts` sends exactly this through the optional `agent.setDataReduction()` call
+(Settings → Data use); a connection that never sends it stays LIVE, and an unrecognised mode falls
+back to `off`, never to a stronger reduction.
+
+### What the reducer does (`lib/stream-reduce.mjs`, one instance per connecting socket)
+
+* per kind (`thinking` | `text` | `tool`) keep ONE `createThinkingGate(policy)` per streaming block,
+  rebuilt at `message_start` and dropped at `message_end` / `turn_end` / `agent_end`;
+* a coalesced frame is a **TRUNCATED SNAPSHOT**, never a delta: the client renders
+  `state.streamingMessage = ev.message`, so the frame must carry exactly what has been delivered
+  (`truncateStreamSnapshot`); a `toolCall` part inside the snapshot is never hidden;
+* `mode: "off"` (level `none`) = today's behaviour: forward every delta, no state;
+* `mode: "end"` (level `turnEnd`) = forward nothing until the block ends; the complete text arrives with
+  `message_end`, which is history and is ALWAYS forwarded;
+* `tool_execution_update` is thinned to one frame per `idleMs` (the client renders tool output from the
+  RESULT message, so these are liveness hints) and dropped entirely in `end` mode;
+* `message_end` / tool results / `runtime` / `retry` / version frames pass through unchanged.
+
+### Guarantees (non-negotiable)
+
+1. **Always flush on error/abort** — a dying turn returns TWO frames (the held text, then the error)
+   so the reasoning that was in flight is still readable and the failure is never swallowed; and
+   `runtime` frames/pings keep flowing so a NAT/browser timeout cannot kill a quiet socket.
+2. **Per-connection memory bound** (`coalesceTurn`'s `capBytes`, 2MB): on overflow fall back to LIVE for
+   the rest of the turn and log it — never grow a buffer for a 5MB tool result.
+3. **Nothing changes for history**: coalesced frames are still the same full snapshots, so the client's
+   IDB write-through, `haveTo` and the tail-first/sparse-attach model are untouched (a warm reopen stays
+   0 bytes). Do not redact or reshape transcript egress here — that is the media route's job.
+4. **Frames must clear the socket's deflate threshold** (`perMessageDeflate.threshold: 1024` in the
+   agent WSS): `ws` skips the compressor below it, and a 67-byte per-delta frame is the worst case. That
+   is why the shipped presets use `minBytes ≥ 1024` with a soft idle rule + a hard visibility ceiling
+   (`maxHoldMs`) — measured, not guessed:
+
+   | stream policy | wire bytes | frames | first text |
+   |---|---|---|---|
+   | live (level `none`) | 23.2 KB | 346 | 0 ms |
+   | `paragraph` (level `paragraph`, wan) | 1.4 KB | 9 | +1.6 s |
+   | turn end (level `turnEnd`) | 0.2 KB | 1 | +13.8 s |
+
+   (`npm run bench:data` prints the full table: images, streams, tool output, resize budget.)
+5. **Steering while buffering**: a steer that arrives mid-block must still be accepted (it is injected
+   after the current thinking/tool call completes). Hide nothing, drop nothing — the buffered text is
+   flushed first.
+
+### Numbers the hub must not "fix"
+
+* `capBytes` 2MB per connection; text/tool frames ≥ the deflate threshold (text 256B floor is the one
+deliberate exception — prose latency beats a few hundred bytes);
+* thinking lighter on `lan` (256B floor, 0.8s idle), heavier on `metered` (1KB floor, 2.5s idle, 4s ceiling);
+* an unknown `kind` is treated as `thinking` (never as a silent no-op).
+
 ## Logging + graceful shutdown (2026-10-21)
 
 **Tee logger** (top of server.mjs): `console.log/warn/error` are wrapped — the original prints to

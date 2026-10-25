@@ -101,6 +101,47 @@ Workspace file attach + image paste are BACK (plan.md §12–14) — see the exp
 
 Full table with all defaults: [`docs/architecture.md`](docs/architecture.md).
 
+### Data use (Settings → Data use) — how much leaves the device
+
+Two dropdowns, both persisted in localStorage next to `pi.autoRetry`, both showing the parameters of
+the **selected** option (and the resolved policy, including any advanced override):
+
+| Setting (key) | Options | What it does |
+|---|---|---|
+| **Images** (`pi.imageLevel`) | `auto` · `high` · `medium` · `low` · `none` | decides per image whether to re-encode, and to what. Two thresholds are applied together — a RESOLUTION cap on the long edge **and** a BYTE cap on the upload — with a resolution FLOOR; the aspect ratio is always preserved (one scale factor for both axes, never a fixed box). `high` 2048px/≤1MB/q0.85 · `medium` 1280px/≤512KB/q0.72 · `low` 1024px/≤256KB/q0.65 · `none` = original bytes, untouched. `auto` = high on lan/wired, medium on wifi/wan/remote, low on metered (`pi.netTier`, from `/api/health`) |
+| **Reasoning & stream** (`pi.thinkingLevel`) | `auto` · `paragraph` · `turnEnd` · `none` | when the streamed **reasoning**, the assistant's **answer** and **tool output** are sent. `paragraph` = one frame per complete paragraph (or per N line breaks for tool output) with a byte floor, a soft idle rule and a hard visibility ceiling; `turnEnd` = hold and send ONE frame when the message/tool call ends; `none` = live, every delta (today's behaviour). Per-stream thresholds differ: the answer keeps a small 256B floor / 1.2s ceiling so prose still streams, tool output uses 2KB / 40 lines / 3s |
+| **Image storage** (`pi.imageRetention`) | `server` (default) · `browser` | where the encoded image is KEPT. `server`: the bytes live in the server's media store (`data/media/<xx>/<sha256>`, disk-backed) so any device can render them and the model can be re-run on them; `browser`: the bytes stay on this device (the server holds them in memory only and forgets them on restart — the browser re-uploads when it must) |
+
+Advanced overrides (no UI): `pi.imageMaxEdge`, `pi.imageMinEdge`, `pi.imageMaxBytes`,
+`pi.imageQuality`, `pi.textLevel`, `pi.toolLevel`. EXISTING sessions are never rewritten, so their stored
+images keep whatever form they had; a new session stores what the browser encoded. Nothing here changes
+what the model reads on the next turn — only what travels and what is kept.
+
+**How an image is stored (2026-10-25):** the browser ENCODES it (resize + webp/jpeg) and only the encoded
+bytes are stored, as **binary** — never the raw original, never base64 (base64 is 33% bigger and buys
+nothing). The server keeps them content-addressed under `data/media/<xx>/<sha256>` and builds base64
+**only when the LLM request is built**. Two routes carry it: `POST /api/agent/session/:id/media` (binary
+in → `{hash, bytes}`) and `GET …/media/:hash` (binary out, by content hash). **gz/br is dropped for
+images**: it was measured at ~0% (webp/jpeg/PNG are already entropy-/deflate-coded — a brotli pass is
+actually a few bytes BIGGER), and the only thing it ever paid for was base64, precisely the inflation
+that storing binary removes (`tests/image-compression.test.mjs` keeps the numbers).
+
+**Status (2026-10-25):** the stream half is DONE and **off by default** — `setDataReduction` is applied
+per connection, so no device starts coalescing until it asks
+([`docs/server.md` → "Data reduction on the agent path"](docs/server.md); debug it with
+`PORT=8899 PI_WEB_DATA_REDUCTION_DEBUG=1 npm start`). Atomic turns were DROPPED (the `turnEnd` level gives
+the same one-frame result). The image storage side is DONE too (binary store, the two routes, retention
+setting). Still to wire: the composer — encode on attach, `POST` the bytes, keep `{hash, bytes}` in the
+message instead of base64 — see [`docs/client.md` → "the image pipeline"](docs/client.md); until that
+lands the composer keeps sending base64 and the server redacts it on the way out.
+
+**Why frames are sized the way they are:** the agent socket negotiates
+`perMessageDeflate: { threshold: 1024 }` and `ws` SKIPS the compressor below that, so a 67-byte
+per-delta frame travels **uncompressed**. Coalescing to ≥1KB frames is what makes compression engage at
+all — measured: an 8.5KB reasoning turn goes from 23KB/346 frames (live) to 1.4KB/9 frames (paragraph)
+to 0.2KB/1 frame (turn end), with +1.6s / +13.8s to first text respectively (`npm run bench:data` prints
+the table; `tests/thinking-flush.test.mjs` pins the numbers).
+
 
 ## System prompt
 

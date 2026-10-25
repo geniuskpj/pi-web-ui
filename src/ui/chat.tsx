@@ -35,6 +35,8 @@ import { gateIndex, gateSeqOfLastUser, prevUserSeq, resolveGateSeq } from "../..
 import { FilePickerDialog, type PickedFile } from "./file-picker.js";
 import { TerminalPanel, termBus } from "./terminal.js";
 import { renderMarkdown } from "./markdown.js";
+// egress media (plan §2.2b): a transcript image part may carry only a hash → hydrate before re-sending
+import { hydrateImageParts, currentSessionId } from "./media.js";
 const ARG_PREVIEW_MAX = 160;
 const OUTPUT_TAIL_MAX = 2000;
 const PARTIAL_STORE_MAX = 4096; // cap UI-only partial strings (bash can stream MBs)
@@ -743,12 +745,19 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 		setSteerDraft({ text: pendingSteer.text || "", seq: steerSeq.current });
 		const steerImages = pendingSteer.images;
 		if (steerImages && steerImages.length) {
-			setImages((prev) => [
-				...prev,
-				...steerImages
-					.filter((im: any) => im?.type === "image" && im.data && im.mimeType)
-					.map((im: any, k: number) => ({ name: `steered-${k + 1}`, data: im.data, mimeType: im.mimeType, preview: `data:${im.mimeType};base64,${im.data}` })),
-			]);
+			// the pending steer's images come back through a state frame, i.e. REDACTED (hash only) —
+			// fetch the bytes back so the composer can send them again (async: fills in place)
+			void (async () => {
+				try {
+					const filled = await hydrateImageParts(steerImages.filter((im: any) => im?.type === "image"), currentSessionId(agent));
+					setImages((prev) => [
+						...prev,
+						...filled
+							.filter((im: any) => im?.data && im?.mimeType)
+							.map((im: any, k: number) => ({ name: `steered-${k + 1}`, data: im.data, mimeType: im.mimeType, preview: `data:${im.mimeType};base64,${im.data}` })),
+					]);
+				} catch { /* offline: the text still comes back */ }
+			})();
 		}
 		(agent as any).cancelSteering?.();
 	};
@@ -1008,9 +1017,19 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 		const u = msgs[uIdx] as UserMessage;
 		const text = textOf(u.content);
 		if (!text) return;
-		const imgs = (Array.isArray(u.content) ? u.content.filter((b: any) => b?.type === "image") : []) as any[];
+		const rawImgs = (Array.isArray(u.content) ? u.content.filter((b: any) => b?.type === "image") : []) as any[];
 		agent.state.messages = msgs.slice(0, uIdx);
-		void (imgs.length ? agent.prompt(text, imgs) : agent.prompt(text)).catch((err: any) => console.error("[chat] retry failed:", err));
+		// the transcript is redacted on egress (plan §2.2b): a hash-only image part must be hydrated
+		// from the media route before the model can see it again — the server DROPS image parts that
+		// have no `data`, so a silent retry would send a text-only turn.
+		void (async () => {
+			try {
+				const imgs = rawImgs.length ? await hydrateImageParts(rawImgs, currentSessionId(agent)) : [];
+				const sendable = imgs.filter((im: any) => typeof im?.data === "string" && im.data);
+				if (rawImgs.length && !sendable.length) console.warn(`[chat] retry: could not reload ${rawImgs.length} image(s) — sending text only`);
+				await (sendable.length ? agent.prompt(text, sendable) : agent.prompt(text));
+			} catch (err: any) { console.error("[chat] retry failed:", err); }
+		})();
 		forceStick();
 	};
 

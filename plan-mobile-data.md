@@ -1,5 +1,29 @@
 # plan-mobile-data.md — mobile data reduction (images · WS compression · atomic turns)
 
+> ## DECISIONS 2026-10-25 (implemented — this block overrides the sections it names)
+>
+> * **Item 3 (atomic turns) is DROPPED.** Single-digit KB per turn for a protocol branch that touches
+>   retry/steer/versions/sparse attach. What shipped instead: per-kind coalescing
+>   (`lib/thinking-flush.mjs`, `lib/stream-reduce.mjs`) with the three user levels **paragraph ·
+>   turnEnd · none**, applied per CONNECTION and **OFF by default** (`setDataReduction`).
+> * **Item 2 (WS deflate) is DONE** — the terminal WSS now negotiates `permessage-deflate` like the
+>   agent socket (`tests/ws-deflate.test.mjs`: 11 checks, 0 pending).
+> * **Item 1 changed shape.** The browser now ENCODES the image (resize + webp) and only the encoded
+>   bytes are ever stored; the server keeps them as **binary** (disk, content-addressed) and produces
+>   base64 **only when the LLM request is built**. No raw original is saved anywhere, and no base64 is
+>   stored. §2.2b's "session files keep full ImageContent" is therefore REVERSED: the transcript keeps
+>   `{hash, bytes}` references and the bytes live in the media store. New routes:
+>   `POST /api/agent/session/:id/media` (binary in) and `GET …/media/:hash` (binary out, br/gz when a
+>   variant pays).
+> * **gz/br on images: measured, and it does NOT help** (`tests/image-compression.test.mjs`): an
+>   encoded webp/jpeg/PNG gains ~0% from gzip/brotli (they are already entropy/deflate coded). The
+>   only thing that pays is base64 — gz/br recovers ~25% of its 33% inflation, i.e. exactly the harm
+>   that storing binary removes. The store keeps a variant only when it clears 3%.
+> * **User-selectable levels** replaced the net tiers in the UI: images **high · medium · low · none**
+>   and streaming **paragraph · turnEnd · none** (plus `auto`), persisted in localStorage and shown with
+>   their resolved parameters; the tier table below is only what `auto` resolves to.
+
+
 **Status:** design only, no code touched. Written 2026-10-25 for a fresh implementation session.
 **Repo:** `C:\pi-windows-x64\ws\pi-web-ui` (branch `main`), Node ≥22, `npm run typecheck` / `npm run build` /
 `npm run test:<suite>` (20 suites, all green at the time of writing), pi-ai 1.4.0 pinned.
