@@ -271,11 +271,10 @@ export class AgentHub {
 					// state.isStreaming stayed true indefinitely — any device attaching in
 					// that window saw a frozen "streaming" transcript that never updates
 					// (no further events come). The terminal event is ground truth.
-					if (entry.agent.state.isStreaming) entry.agent.state.isStreaming = false;
-					const lastA = [...entry.agent.state.messages].reverse().find((m) => m.role === "assistant");
-					const failed = lastA?.stopReason === "error";
-					entry.runtime = { status: failed ? "error" : "idle", startedAt: null, turn: 0, currentTool: null, lastText: entry.retryNote || null, pendingPrompts: entry.pendingPrompt ? 1 : 0 };
-					this.emitRuntime(sessionId); // explicit idle/error delta — the terminal state is never lost
+					// ONE implementation (main's _settleRuntime refactor): the retry
+					// feature's note rides along so an alive-sessions row still previews
+					// WHY the run failed.
+					const { lastA, failed } = this._settleRuntime(sessionId, entry, { lastText: entry.retryNote || null });
 					// RETRY policy (2026-10-23): a run that ended in an error either gets a
 					// scheduled auto-retry (rate limit / network / transient 5xx — see
 					// _isRetryableError) or stops retrying. The counter resets on success and
@@ -1065,11 +1064,14 @@ export class AgentHub {
 	 *  never come (wedged tool promise). Flips the runtime to idle + emits it so
 	 *  every device's alive row clears, and defensively clears pi's streaming
 	 *  flag (the phantom-streaming guard from a16f0b9, moved here per review). */
-	_settleRuntime(sessionId, entry) {
+	_settleRuntime(sessionId, entry, { lastText = null } = {}) {
 		if (entry.agent.state.isStreaming) entry.agent.state.isStreaming = false;
 		const lastA = [...entry.agent.state.messages].reverse().find((m) => m.role === "assistant");
-		entry.runtime = { status: lastA?.stopReason === "error" ? "error" : "idle", startedAt: null, turn: 0, currentTool: null, lastText: null, pendingPrompts: entry.pendingPrompt ? 1 : 0 };
+		const failed = lastA?.stopReason === "error";
+		entry.runtime = { status: failed ? "error" : "idle", startedAt: null, turn: 0, currentTool: null, lastText, pendingPrompts: entry.pendingPrompt ? 1 : 0 };
 		this.emitRuntime(sessionId);
+		// the caller (agent_end) still needs these for the retry policy — one scan, one place
+		return { lastA, failed };
 	}
 
 	/** Steering pending-state delta: broadcast to all attached /ws/agent clients
