@@ -119,6 +119,22 @@ few bytes bigger), so neither the store nor the media route compresses anything 
 encoded binary. The JSON/NDJSON paths keep their generic >2KB gzip gate, which is what pays when a legacy
 session still carries base64.
 
+### The client hop (LIVE since 2026-10-27)
+
+`ProxyAgent.setDataReduction(cfg)` exists, and the ATTACH handler re-pushes the stored levels on every
+(re)attach (next to `pushAutoRetrySetting`), because the hub's config is PER CONNECTION — a reload used to
+drop it and the whole feature read as "the setting does nothing" (report.md B1). Hub `note` frames now
+reach the composer chip through `agent.onNote`, and they no longer settle a pending prompt/steer reply
+(M1). The recalled images of ✎-edit AND Stop are hydrated before they go back into the composer (L1).
+
+**Latency (2026-10-27):** the visible cost of coalescing is the FIRST chunk, not the total. Every preset
+therefore carries `firstBytes` (thinking 64B, answer 32B, tool 512B): the first chunk of a block is
+released immediately (like live streaming), everything after it is coalesced, and the idle rule + the
+hard ceiling are driven by a per-socket 250ms tick on the server (`stream-reduce.mjs` `tick()`), so a
+slow provider can no longer leave held text invisible past the ceiling (report.md H2). Measured: the
+first text of a reasoning block now arrives +0.08s after the live baseline (was +1.6s), with the worst
+chunk still bounded at 1.6s.
+
 ### What is still to wire (`src/ui/chat.tsx`)
 
 Settings → **Data use** stores two LEVELS and prints their resolved parameters:

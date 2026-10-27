@@ -90,7 +90,7 @@ const levels = ["high", "medium", "low", "none"].map((level) => {
 const preset = resolveThinkingPolicy("wan", {});
 const modes = [
 	{ label: "live - today (every delta)", policy: { mode: "off" }, today: true },
-	{ label: `wan preset (floor ${preset.minBytes}B, hold <=${preset.maxHoldMs}ms)`, policy: { ...preset } },
+	{ label: `wan preset (floor ${preset.minBytes}B, first ${preset.firstBytes}B, hold <=${preset.maxHoldMs}ms)`, policy: { ...preset } },
 	{ label: `paragraph only (floor ${preset.minBytes}B, no idle)`, policy: { mode: "paragraph", minBytes: preset.minBytes, maxLines: 1e9, maxBytes: 1e9, minIntervalMs: 0, idleMs: 1e9 } },
 	{ label: `line threshold >=${preset.maxLines} breaks`, policy: { mode: "lines", maxLines: preset.maxLines, minBytes: preset.minBytes, maxBytes: 1e9, minIntervalMs: 0, idleMs: 1e9 } },
 	{ label: "hold until turn end (atomic)", policy: { mode: "end" } },
@@ -153,10 +153,10 @@ console.log(line([
 ]));
 console.log(line([
 	"terminal scrollback (5 MB build log)",
-	"no deflate on /ws/terminal",
-	"permessage-deflate (P1, not built)",
+	"deflate shipped (0 pending)",
+	"every frame compressed",
 	"n/a", "same",
-	"0 ms (lossless) - expect 60-80% on text",
+	"0 ms (lossless) - 60-80% on text (plan §7)",
 ]));
 console.log(`  · the media bytes are served once per device: ${size(mediaBytes)} stays server-side, only hashes travel`);
 
@@ -219,7 +219,7 @@ console.log("BOTTOM LINE");
 console.log(`  attach     ${size(sessionInline)} -> ${size(sessionRedactedBytes)}   ${pct(sessionInline, sessionRedactedBytes)} bytes, no extra wait (warm reopen: 0 B)`);
 console.log(`  upload     ${size(PHOTO.bytes)} -> ${size(uploads[2].outBytes)} ${uploads[2].pct} on metered, +0.1-0.3 s once before sending`);
 console.log(`  thinking   ${size(live.bytes)} / ${live.frames} frames -> ${size(thinking[1].bytes)} / ${thinking[1].frames} frames   ${vs(thinking[1]).bytes} bytes, ${vs(thinking[1]).frames} frames, +${secs(thinking[1].firstTextMs)} s to first text`);
-console.log("  terminal   pending (P1) - nothing to quote yet");
+console.log("  terminal   deflate shipped (ws-deflate suite: 0 pending)");
 console.log("");
 console.log("measured = JSON/zlib frames, counts and waits · estimated = image encode size · pending = terminal deflate");
 console.log("");

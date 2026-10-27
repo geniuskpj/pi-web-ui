@@ -882,17 +882,39 @@ export class AgentHub {
 	/** One egress FRAME (state or agent-event) with every inline image replaced by its hash. */
 	redactFrame(msg) {
 		if (!msg || typeof msg !== "object") return msg;
+		const out = { ...msg };
+		let changed = false;
+
 		if (Array.isArray(msg.messages)) {
 			const messages = this.redactMessages(msg.messages);
 			// the in-flight snapshot is its own message object → the same per-message cache applies
 			const streaming = msg.streamingMessage ? this.redactMessages([msg.streamingMessage])[0] : msg.streamingMessage;
-			if (messages === msg.messages && streaming === msg.streamingMessage) return msg;
-			return { ...msg, messages, streamingMessage: streaming ?? null };
+			if (messages !== msg.messages) { out.messages = messages; changed = true; }
+			if (streaming !== msg.streamingMessage) { out.streamingMessage = streaming ?? null; changed = true; }
 		}
+
+		// A pending STEER holds its images exactly as the client sent them, and it rides on STATE frames:
+		// redact those too, or every state/steering frame re-sends the full base64
+		// (review report.md L2, 2026-10-27).
+		const pendingImages = msg.pendingPrompt?.images;
+		const redactedImages = this.redactPromptImages(pendingImages);
+		if (redactedImages !== pendingImages) { out.pendingPrompt = { ...msg.pendingPrompt, images: redactedImages }; changed = true; }
+
 		const event = msg.event;
-		if (!event?.message || !Array.isArray(event.message.content)) return msg;
-		const message = this.redactMessages([event.message])[0];
-		return message === event.message ? msg : { ...msg, event: { ...event, message } };
+		if (event?.message && Array.isArray(event.message.content)) {
+			const message = this.redactMessages([event.message])[0];
+			if (message !== event.message) { out.event = { ...event, message }; changed = true; }
+		}
+
+		return changed ? out : msg;
+	}
+
+	/** Redact a bare ImageContent[] (the shape `pendingPrompt.images` uses). */
+	redactPromptImages(images) {
+		if (!Array.isArray(images) || !images.length) return images;
+		const wrapped = images.map((im) => ({ role: "user", content: [im] }));
+		const out = this.redactMessages(wrapped);
+		return out === wrapped ? images : out.map((m) => m.content[0]);
 	}
 
 	/** The bytes behind a hash (for GET /api/agent/session/:id/media/:hash). */

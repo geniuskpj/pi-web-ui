@@ -19,6 +19,14 @@
 >   encoded webp/jpeg/PNG gains ~0% from gzip/brotli (they are already entropy/deflate coded). The
 >   only thing that pays is base64 — gz/br recovers ~25% of its 33% inflation, i.e. exactly the harm
 >   that storing binary removes. The store keeps a variant only when it clears 3%.
+> * **2026-10-27 — review pass (`report.md`)**: `ProxyAgent.setDataReduction()` exists and the levels are
+>   re-pushed on every attach (the feature was inert without it); `/range` is redacted (the backfill was
+>   the last inline-base64 egress); the gates' idle rule + hard ceiling are driven by a per-socket 250 ms
+>   tick; the FIRST chunk of every block ships immediately (`firstBytes`) so coalescing is not felt as
+>   latency ("thinking returns too slowly"); the reducer resets on attach (no cross-session bleed); the
+>   pending steer's images are redacted; a `note` frame no longer settles a pending reply; `data/media`
+>   has an age-based GC (`PI_WEB_MEDIA_TTL_DAYS`).
+>
 > * **User-selectable levels** replaced the net tiers in the UI: images **high · medium · low · none**
 >   and streaming **paragraph · turnEnd · none** (plus `auto`), persisted in localStorage and shown with
 >   their resolved parameters; the tier table below is only what `auto` resolves to.

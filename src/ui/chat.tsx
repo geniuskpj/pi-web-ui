@@ -824,6 +824,15 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 		clearTimeout(attachNoteTimer.current);
 		attachNoteTimer.current = setTimeout(() => setAttachNote(""), 3000);
 	};
+	// hub NOTE frames (e.g. "N image(s) are no longer on the server — re-attach them to resend"):
+	// the agent forwards them, the composer chip shows them. Without this a hash-only image that the
+	// server cannot resolve would fail silently (review report.md M1, 2026-10-27).
+	useEffect(() => {
+		const a = agent as any;
+		if (!a || typeof a !== "object") return;
+		a.onNote = (m: string) => note(m);
+		return () => { try { delete a.onNote; } catch { /* frozen */ } };
+	}, [agent]);
 	const addPicked = (f: PickedFile) => {
 		if (f.kind === "image") {
 			setImages((prev) => {
@@ -1554,9 +1563,17 @@ export function Editor({
 			(agent as any).cancelSteering?.();
 			const steerImages = pendingSteer.images;
 			if (steerImages && steerImages.length) {
-				for (const im of steerImages) {
-					if (im?.type === "image" && im.data && im.mimeType) onAddImage(`stopped-${Date.now().toString(36)}`, im.data, im.mimeType);
-				}
+				// the recalled images come back through a state frame, i.e. possibly REDACTED (hash only) —
+				// hydrate them like ✎-edit recall does, or Stop would silently drop the photos
+				// (review report.md L1, 2026-10-27).
+				void (async () => {
+					try {
+						const filled = await hydrateImageParts(steerImages.filter((im: any) => im?.type === "image"), currentSessionId(agent));
+						for (const im of filled) {
+							if (im?.data && im.mimeType) onAddImage(`stopped-${Date.now().toString(36)}`, im.data, im.mimeType);
+						}
+					} catch { /* offline: the text still comes back */ }
+				})();
 			}
 			if (text) {
 				setValue((cur) => (cur.trim() ? cur.replace(/\s*$/, "") + "\n\n" + text : text)); // never clobber a live draft

@@ -81,6 +81,11 @@ export function setImageRetention(value: string): ImageRetention {
 }
 
 /** The headers a media upload must carry (retention + auth are added by the caller's helper). */
+/** The per-kind numbers the hub needs (never the resolved `kind`/`net` bookkeeping). */
+function pickStreamNumbers(p: Record<string, any>): Record<string, number | string> {
+	return { mode: p.mode, minBytes: p.minBytes, maxBytes: p.maxBytes, maxLines: p.maxLines, idleMs: p.idleMs, maxHoldMs: p.maxHoldMs, firstBytes: p.firstBytes };
+}
+
 export function mediaUploadHeaders(mimeType: string): Record<string, string> {
 	return { "Content-Type": mimeType, [MEDIA_RETENTION_HEADER]: readImageRetention() };
 }
@@ -115,9 +120,11 @@ export function pushDataReduction(agent: unknown): void {
 		imageRetention: readImageRetention(),
 		thinkingLevel: thinking.level,
 		stream: resolveDataReduction(readNetTier(), readDataSettings()).stream,
-		thinking: { mode: thinking.mode, minBytes: thinking.minBytes, maxBytes: thinking.maxBytes, maxLines: thinking.maxLines, idleMs: thinking.idleMs, maxHoldMs: thinking.maxHoldMs },
-		text: (({ mode, minBytes, maxBytes, maxLines, idleMs, maxHoldMs }) => ({ mode, minBytes, maxBytes, maxLines, idleMs, maxHoldMs }))(resolvedStreamPolicy("text")),
-		tool: (({ mode, minBytes, maxBytes, maxLines, idleMs, maxHoldMs }) => ({ mode, minBytes, maxBytes, maxLines, idleMs, maxHoldMs }))(resolvedStreamPolicy("tool")),
+		// firstBytes travels too: the immediate first frame is what keeps a coalescing policy from reading
+		// as a latency regression (2026-10-27), and it is per kind (text paints sooner than tool output).
+		thinking: pickStreamNumbers(thinking),
+		text: pickStreamNumbers(resolvedStreamPolicy("text")),
+		tool: pickStreamNumbers(resolvedStreamPolicy("tool")),
 	});
 }
 

@@ -18,7 +18,7 @@ import zlib from "node:zlib";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createMediaStore, hashOf, hydrateImageData, missingImageHashes, sniffImageMime } from "../lib/media-egress.mjs";
+import { createMediaStore, hashOf, hydrateImageData, missingImageHashes, sniffImageMime, purgeMediaOlderThan } from "../lib/media-egress.mjs";
 import { size } from "./_wire-bytes.mjs";
 
 let passed = 0, failed = 0;
@@ -194,6 +194,29 @@ const row = (name, from, to) => `    ${name.padEnd(26)} ${size(from.length).padS
 	} finally {
 		fs.rmSync(dir, { recursive: true, force: true });
 	}
+}
+
+// ── G: media GC (review report.md M3): the disk store must not grow forever ──────────────────
+{
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-media-gc-"));
+	try {
+		const store = createMediaStore({ dir });
+		const oldBlob = Buffer.concat([png, Buffer.from("old")]);
+		const freshBlob = Buffer.concat([png, Buffer.from("fresh")]);
+		const hOld = hashOf(oldBlob), hFresh = hashOf(freshBlob);
+		store.put(hOld, oldBlob, "image/png");
+		store.put(hFresh, freshBlob, "image/png");
+		const old = Date.now() / 1000 - 90 * 86400;      // age one blob by 90 days
+		fs.utimesSync(path.join(dir, hOld.slice(0, 2), hOld), old, old);
+		const swept = purgeMediaOlderThan({ dir, days: 30 });
+		check("G1 the boot sweep removes blobs older than the TTL and keeps the rest",
+			swept.removed === 1 && swept.kept === 1 && !fs.existsSync(path.join(dir, hOld.slice(0, 2), hOld)) && fs.existsSync(path.join(dir, hFresh.slice(0, 2), hFresh)),
+			`removed ${swept.removed} (${swept.bytes}B), kept ${swept.kept}`);
+		check("G2 days:0 keeps everything (the escape hatch is honest)",
+			purgeMediaOlderThan({ dir, days: 0 }).removed === 0 && fs.existsSync(path.join(dir, hFresh.slice(0, 2), hFresh)));
+		check("G3 a missing dir (or no dir) is a valid state, never a throw",
+			purgeMediaOlderThan({ dir: path.join(dir, "nope"), days: 1 }).removed === 0 && purgeMediaOlderThan({ dir: null }).removed === 0);
+	} finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
 console.log(`\n[image-compression] ${passed} passed, ${failed} failed`);

@@ -9,6 +9,8 @@ type AnyRecord = Record<string, any>;
 import { makeId } from "./id.js";
 import { getCachedChunks, putChunk, gunzip, transferPolicy, cachedRanges, intervalDiff, sweepStale, planLiveChunk, toNdjson, gzipText, verifyChunkText } from "./idb-cache.js";
 import { planCachedSplice } from "../lib/chunk-splice.mjs";
+// data-reduction levels live in localStorage (Settings → Data use); the agent is what tells the hub
+import { pushDataReduction } from "./ui/data-settings.js";
 // LIVE WRITE-THROUGH (C2): how long a quiet tail may sit in memory before it is
 // written to IDB. Every flush is one gzip of <CHUNK_INTERVAL messages.
 const LIVE_IDLE_MS = 5000;
@@ -19,6 +21,9 @@ const LIVE_DEBUG = typeof location !== "undefined" && location.search.includes("
 const BACKFILL_MSGS = 400;
 
 export class ProxyAgent {
+    /** Informational frames from the hub (e.g. "an image is no longer on the server") — the UI
+     *  surfaces them through the composer's note chip. Set by chat.tsx. */
+    onNote?: (message: string) => void;
 	/** true = the loop runs server-side (agent-hub.mjs): runs survive browser
 	 *  closes; the browser stores no API keys (getApiKey is absent by design). */
 	readonly serverSide = true;
@@ -147,6 +152,10 @@ export class ProxyAgent {
 			// retry policy lives client-side (Settings → Retry): re-push on every attach
 			// so a hub restart/reconnect picks it up
 			this.pushAutoRetrySetting();
+			// data-reduction levels (Settings → Data use) are PER CONNECTION on the hub, so they must
+			// be re-pushed on every (re)attach — otherwise a reload silently drops them and the whole
+			// feature is inert (review report.md B1, 2026-10-27).
+			pushDataReduction(this);
 			// TAIL-FIRST STATE (2026-10-24): a sparse attach delivers the last ~512KB +
 			// an envelope {fromSeq, messageCount}. CRITICAL (live crash 1f725ee): keep
 			// state.messages DENSE — exactly the loaded window, no null holes. Nulls
@@ -201,6 +210,13 @@ export class ProxyAgent {
 			// pending chip delta — queued / consumed at a turn boundary / cancelled
 			this.pendingPrompt = msg.pending ?? null;
 			this.notifyListeners({ type: "steering", pending: this.pendingPrompt });
+			return;
+		}
+		// A NOTE is informational and correlates by the request id it was triggered by — it must never
+		// settle a pending reply, or a steer's accepted/rejected answer would be swallowed and the
+		// not-accepted draft silently lost (review report.md M1, 2026-10-27).
+		if (msg.type === "note") {
+			try { this.onNote?.(String(msg.note || "")); } catch { /* listener error */ }
 			return;
 		}
 		// generic correlated reply: accepted / forked / rewritten (any frame with an
@@ -485,6 +501,15 @@ export class ProxyAgent {
 	async setAutoRetry(cfg: { enabled: boolean; attempts?: number; delayMs?: number }): Promise<any> {
 		await this.whenReady(3000);
 		return this.sendAwait({ type: "set-auto-retry", ...cfg }, 8000);
+	}
+
+	/**
+	 * Data-reduction config (Settings → Data use) → hub. Per CONNECTION on the server, so this is
+	 * pushed on attach and on every change. Values come from the same localStorage keys the settings
+	 * dialog writes (`src/ui/data-settings.ts`), never from a component's render state.
+	 */
+	setDataReduction(cfg: Record<string, unknown>): void {
+		this.sendMsg({ type: "setDataReduction", ...(cfg || {}) });
 	}
 
 	/** Push the stored auto-retry preference to the hub (called after each attach). */

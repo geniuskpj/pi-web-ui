@@ -92,7 +92,10 @@ Workspace file attach + image paste are BACK (plan.md §12–14) — see the exp
 | `PI_WEB_DEBUG` | off | verbose server logging |
 | `PI_WEB_LOG_DIR` | `<PI_WEB_DATA_DIR>/logs` | console tee target — daily `server-YYYYMMDD.log` (ISO timestamps + info/warn/error); broken dir falls back to console-only |
 | `PI_WEB_EXIT_ON_STDIN_CLOSE` | off | run the full graceful-shutdown sequence when the parent closes the server's stdin pipe (pipe-friendly Ctrl+C equivalent; used by tests — on Windows a cross-process `kill(SIGINT)` TerminateProcesses without running handlers) |
-| `PI_WEB_WS_DEFLATE` | on | `off` disables permessage-deflate on the agent/sync WebSockets (state frames are the multi-MB path — leave on unless profiling) |
+| `PI_WEB_WS_DEFLATE` | on | `off` disables permessage-deflate on ALL WebSockets (agent, sync **and terminal**) — state frames are the multi-MB path, terminal scrollback is the most compressible one; leave on unless profiling |
+| `PI_WEB_MEDIA_TTL_DAYS` | `30` | age-based GC for the image store (`data/media`): blobs older than this are removed at boot. `0` keeps everything. The bytes are content-addressed, so a device that still has the image (or a transcript with inline data) can always re-populate it |
+| `PI_WEB_MEDIA_CACHE_MB` | `64` | in-memory read cache for the image store in front of the disk |
+| `PI_WEB_DATA_REDUCTION_DEBUG` | off | `1` logs one `[data-reduction]` line per block (modes · forwarded · dropped bytes · flushes) — the way to watch stream coalescing on a scratch port |
 | `PI_WEB_TERM_COLS` / `PI_WEB_TERM_LINES` | `110` / `32` | terminal grid size (stty in the pty tier, COLUMNS/LINES env in the pipe tier) |
 | `PI_WEB_TERM_BRIDGE` | auto | `conhost` forces Windows ConPTY; `0`/`pipes` forces the pipe tier; a path uses that exe as an msys-pty-bridge; unset → auto-provision msys2 `util-linux` `script.exe` into `data/bin/script/` (sha256-pinned `util-linux-2.40.2-2` package from repo.msys2.org, 8MB size cap, extracts a 63KB exe — once). The bridge is then **proven by running it** with the shell it will drive (that shell must get `isatty(stdin)==true`); a bridge that cannot allocate a pty is refused, and the reason appears in the dock instead of a silent downgrade |
 | `PI_WEB_TERM_ORIGIN` | auto | extra `host[:port]` **names for the global Host/Origin allowlist** — every `/api/*` route and all three WS endpoints (`/ws/sync`, `/ws/agent`, `/ws/terminal`), not just the terminal. Comma-separated, scheme stripped. Matching is EXACT on `host:port`: a missing Origin port means the scheme default (http→80, https→443) and a portless Host is tried as the app port plus 80/443 — so a TLS reverse proxy needs its public form spelled out (`PI_WEB_TERM_ORIGIN=name:443`). Localhost, `os.hostname()` and every interface IP are always allowed |
@@ -126,10 +129,14 @@ images**: it was measured at ~0% (webp/jpeg/PNG are already entropy-/deflate-cod
 actually a few bytes BIGGER), and the only thing it ever paid for was base64, precisely the inflation
 that storing binary removes (`tests/image-compression.test.mjs` keeps the numbers).
 
-**Status (2026-10-25):** the stream half is DONE and **off by default** — `setDataReduction` is applied
-per connection, so no device starts coalescing until it asks
-([`docs/server.md` → "Data reduction on the agent path"](docs/server.md); debug it with
-`PORT=8899 PI_WEB_DATA_REDUCTION_DEBUG=1 npm start`). Atomic turns were DROPPED (the `turnEnd` level gives
+**Status (2026-10-27):** the stream half is DONE, **off by default**, and *reachable from the UI* — the
+levels are re-pushed by the agent on every (re)attach (`ProxyAgent.setDataReduction`), so the dropdown
+actually takes effect ([`docs/server.md` → "Data reduction on the agent path"](docs/server.md); debug it
+with `PORT=8899 PI_WEB_DATA_REDUCTION_DEBUG=1 npm start`). The FIRST chunk of every block ships
+immediately (`firstBytes`: thinking 64B / answer 32B / tool 512B) and the idle rule + visibility ceiling
+are driven by a per-socket 250 ms tick, so coalescing costs **+0.08 s to first text** (was +1.6 s) while
+still saving ~94% of the bytes. `GET …/range` (the backfill path) is redacted too, so a warm client no
+longer re-downloads inline base64 (`tests/media-egress.e2e.mjs`). Atomic turns were DROPPED (the `turnEnd` level gives
 the same one-frame result). The image storage side is DONE too (binary store, the two routes, retention
 setting). Still to wire: the composer — encode on attach, `POST` the bytes, keep `{hash, bytes}` in the
 message instead of base64 — see [`docs/client.md` → "the image pipeline"](docs/client.md); until that

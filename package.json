@@ -44,7 +44,8 @@
     "test:deflate": "node tests/ws-deflate.test.mjs",
     "test:reduce": "node tests/stream-reduce.test.mjs",
     "test:reduce-e2e": "node tests/stream-reduce.e2e.mjs",
-    "test:imgcompress": "node tests/image-compression.test.mjs"
+    "test:imgcompress": "node tests/image-compression.test.mjs",
+    "test:media-e2e": "node tests/media-egress.e2e.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "1.4.0",

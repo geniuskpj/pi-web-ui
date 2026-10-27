@@ -373,15 +373,16 @@ The browser owns the image half of the data plan (see `docs/client.md` → "the 
 pipeline"); the SERVER owns the stream half, because the deltas are pumped server-side. The pure,
 tested decisions live in `lib/thinking-flush.mjs` (`resolveStreamPolicy(kind, net, settings)`,
 `createThinkingGate`), `lib/stream-reduce.mjs` (the per-connection reducer) and
-`lib/data-reduction.mjs` (`coalesceTurn`).
+`lib/data-reduction.mjs` (`coalesceTurn` — a library helper the bench and suites use; the SHIPPED bound is the gate's own `maxBytes`, see guarantee 2).
 
 **Status: IMPLEMENTED and OFF by default** (2026-10-25). `server.mjs`'s `agentConn` dispatch handles
 `setDataReduction` and stores the config on the CONNECTION (`ws.__reducer`); the delivery boundary is
 the per-socket loop in the hub's `broadcast()` callback, which runs `reducer.transform(msg)` per socket
 and sends whatever it returns (a frame, a truncated snapshot, an ARRAY of two frames, or nothing). A
 socket that never opts in keeps `enabled === false`, so that loop stays byte-for-byte the old one.
-Pure logic: `lib/stream-reduce.mjs`; suites: `tests/stream-reduce.test.mjs` (41 checks) and
-`tests/stream-reduce.e2e.mjs` (5 checks over a real socket).
+Pure logic: `lib/stream-reduce.mjs`; suites: `tests/stream-reduce.test.mjs` (50 checks) and
+`tests/stream-reduce.e2e.mjs` (7 checks over a real socket), plus `tests/media-egress.e2e.mjs` for the
+media routes.
 
 Debug it on its own port:
 
@@ -423,14 +424,17 @@ back to `off`, never to a stronger reduction.
 1. **Always flush on error/abort** — a dying turn returns TWO frames (the held text, then the error)
    so the reasoning that was in flight is still readable and the failure is never swallowed; and
    `runtime` frames/pings keep flowing so a NAT/browser timeout cannot kill a quiet socket.
-2. **Per-connection memory bound** (`coalesceTurn`'s `capBytes`, 2MB): on overflow fall back to LIVE for
-   the rest of the turn and log it — never grow a buffer for a 5MB tool result.
+2. **Per-connection memory bound**: every gate has a byte cap (`maxBytes`, 256B-8KB by kind) and a hard
+   visibility ceiling, and REACHING the cap EMITS the buffer — there is no unbounded growth to fall back
+   from (`coalesceTurn`'s own `capBytes`/live-fallback path exists as a library helper, but the shipped
+   reducer never buffers that far).
 3. **Nothing changes for history**: coalesced frames are still the same full snapshots, so the client's
    IDB write-through, `haveTo` and the tail-first/sparse-attach model are untouched (a warm reopen stays
    0 bytes). Do not redact or reshape transcript egress here — that is the media route's job.
 4. **Frames must clear the socket's deflate threshold** (`perMessageDeflate.threshold: 1024` in the
    agent WSS): `ws` skips the compressor below it, and a 67-byte per-delta frame is the worst case. That
-   is why the shipped presets use `minBytes ≥ 1024` with a soft idle rule + a hard visibility ceiling
+   is why the thinking presets use `minBytes ≥ 1024` (the ANSWER keeps a deliberately small 128B floor,
+   so prose streams) with a soft idle rule + a hard visibility ceiling
    (`maxHoldMs`) — measured, not guessed:
 
    | stream policy | wire bytes | frames | first text |
@@ -446,8 +450,10 @@ back to `off`, never to a stronger reduction.
 
 ### Numbers the hub must not "fix"
 
-* `capBytes` 2MB per connection; text/tool frames ≥ the deflate threshold (text 256B floor is the one
-deliberate exception — prose latency beats a few hundred bytes);
+* every gate emits at its own `maxBytes` (never grows without bound); thinking/tool frames ≥ the
+  deflate threshold, the answer's 128B floor is the one deliberate exception (prose latency beats a few
+  hundred bytes); `firstBytes` (64B thinking / 32B answer / 512B tool) releases the FIRST chunk
+  immediately so a coalescing policy still paints instantly;
 * thinking lighter on `lan` (256B floor, 0.8s idle), heavier on `metered` (1KB floor, 2.5s idle, 4s ceiling);
 * an unknown `kind` is treated as `thinking` (never as a silent no-op).
 

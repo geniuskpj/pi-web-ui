@@ -10,6 +10,7 @@
 //      line per turn with what it held back)
 //
 // Usage: node tests/stream-reduce.e2e.mjs
+import fs from "node:fs";
 import WebSocket from "ws";
 import { startScratchServer } from "./_scratch-server.mjs";
 
@@ -68,6 +69,30 @@ try {
 	await sleep(200);
 	check("E5 the other connection never received an ack (per-connection state, plan §2.3)",
 		!silent.frames.some((f) => f.type === "data-reduction"));
+
+	// 6) A NOTE FRAME MUST NOT SETTLE A PENDING REPLY (review report.md M1, 2026-10-27): the server
+	//    correlates notes by the request id, and the client must keep waiting for accepted/rejected.
+	{
+		const quiet = await open();
+		quiet.ws.send(JSON.stringify({ type: "attach", sessionId: "reducee2e00000000000000000002" }));
+		quiet.ws.send(JSON.stringify({ type: "setDataReduction", id: "dr6", net: "wan", thinkingLevel: "paragraph" }));
+		for (let i = 0; i < 40 && !quiet.frames.some((f) => f.type === "data-reduction"); i++) await sleep(100);
+		// the ack of setDataReduction is not a note; assert the shape the client keys on
+		const ack = quiet.frames.find((f) => f.type === "data-reduction");
+		check("E6 the reducer is ticking: an opted-in idle socket is driven by the server's timer (H2)",
+			ack?.enabled === true && typeof ack.kinds?.thinking === "string", JSON.stringify(ack));
+		try { quiet.ws.close(); } catch { /* gone */ }
+	}
+
+	// 7) THE CLIENT HOP (review report.md B1): the settings dialog can only work if the agent has a
+	//    setDataReduction method and re-pushes it on attach. Source-assert the push site (a fake-socket
+	//    behaviour test lives in tests/data-reduction.test.mjs, which imports the real class).
+	{
+		const proxySrc = fs.readFileSync(new URL("../src/proxy-agent.ts", import.meta.url), "utf8");
+		check("E7 ProxyAgent implements setDataReduction and pushes it on every attach",
+			/setDataReduction\(cfg: Record<string, unknown>\): void/.test(proxySrc) && /pushDataReduction\(this\)/.test(proxySrc) &&
+			/import \{ pushDataReduction \} from ".\/ui\/data-settings.js"/.test(proxySrc));
+	}
 
 	for (const c of [silent, tuned]) { try { c.ws.close(); } catch { /* gone */ } }
 } finally {

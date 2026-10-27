@@ -51,6 +51,7 @@ import { createTerminalHub } from "./terminal-hub.mjs";
 import { createStreamReducer, normalizeReductionConfig, describeReduction } from "./lib/stream-reduce.mjs";
 // egress media: the hash validator for GET /api/agent/session/:id/media/:hash
 import { isMediaHash } from "./lib/data-reduction.mjs";
+import { purgeMediaOlderThan } from "./lib/media-egress.mjs";
 import { stripBoilerplate } from "./lib/hp2.mjs";
 import { netClassOf } from "./lib/net-class.mjs";
 import { planRangeWindow } from "./lib/range-window.mjs";
@@ -2024,6 +2025,9 @@ const agentHub = new AgentHub({
 	// (webp/jpeg), we keep those bytes — never the raw original, never base64 — and base64 is
 	// generated only when the LLM request is built.
 	mediaDir: path.join(DATA_DIR, "media"),
+	// Media GC at boot (review report.md M3): the disk store must not grow forever. 30 days by
+	// default, PI_WEB_MEDIA_TTL_DAYS=0 keeps everything.
+	// (the sweep itself runs right after the hub construction — see below)
 	// /compact (pi parity): the summarization LLM call runs through a THROWAWAY
 	// Agent — reuses the whole conversion/retry pipeline; no tools, thinkingLevel
 	// off. Structured checkpoint format mirrors pi's SUMMARIZATION_PROMPT.
@@ -2071,6 +2075,18 @@ const agentHub = new AgentHub({
 	defaultModelId: piDefaultModelId(),
 	onRuntimeChange: (sessionId, rt) => sendRuntime(sessionId, rt), // runtime deltas → tiny frame to ALL devices, bypasses all caches/throttles (fable5)
 });
+
+// MEDIA GC at boot (review report.md M3, 2026-10-27): the disk store had no way back down. Age-based,
+// logged, and off with PI_WEB_MEDIA_TTL_DAYS=0. The bytes are content-addressed, so a purged blob can
+// always be re-uploaded by the device that still has it ("browser" retention) or re-read from a
+// transcript that still carries inline data.
+try {
+	const ttlDays = Number(process.env.PI_WEB_MEDIA_TTL_DAYS ?? 30);
+	if (ttlDays > 0) {
+		const swept = purgeMediaOlderThan({ dir: path.join(DATA_DIR, "media"), days: ttlDays });
+		if (swept.removed) console.log(`[media] GC: removed ${swept.removed} blob(s) older than ${ttlDays}d (${(swept.bytes / 1048576).toFixed(1)}MB); kept ${swept.kept}`);
+	}
+} catch (err) { console.warn(`[media] GC failed (continuing): ${err.message}`); }
 
 const syncClients = new Set();
 import { SESSION_ID_RE } from "./session-id.mjs"; // shared with session-worker.mjs (bugs.md #14)
@@ -2291,10 +2307,14 @@ function agentConn(ws) {
 					if (currentSession) detachAgentClient(currentSession, ws);
 					currentSession = String(m.sessionId || "").slice(0, 80) || crypto.randomUUID();
 					attachAgentClient(currentSession, ws);
-					// re-seed an opted-in reducer AFTER the attach snapshot goes out (see blocker 3): the
-					// snapshot carries the full streamingMessage, so the reducer must not replay it or
-					// truncate below it. Deferred one turn of the loop, i.e. after attach's deliver().
-					if (ws.__reducer?.enabled) setTimeout(() => { try { ws.__reducer?.seed(agentHub.streamingSnapshot(currentSession)); } catch { /* gone */ } }, 0);
+					// A NEW SESSION IS A BOUNDARY: reset the per-connection reducer, or the first message_start
+					// in the new session would flush the OLD session's held text (tagged with the new id) into
+					// the chat (review report.md M2, 2026-10-27). Seeding happens right after the attach
+					// snapshot is delivered (below), synchronously enough that no event can slip in between.
+					if (ws.__reducer?.enabled) {
+						ws.__reducer.reset();
+						ws.__reducer.seed(agentHub.streamingSnapshot(currentSession));
+					}
 					agentHub.emitRuntime(currentSession); // clients count changed (fable5) — MUST go through the hub so seq advances
 					// ALWAYS ensure the hub session exists — fresh sessions have no store
 					// entry, and set-thinking/prompt assume a registered agent (2026-10-21)
@@ -2382,6 +2402,19 @@ function agentConn(ws) {
 					// (grok review 2026-10-25, blocker 3).
 					reduction.reducer = createStreamReducer(reduction.cfg, { seed: agentHub.streamingSnapshot(currentSession) });
 					ws.__reducer = reduction.reducer; // the broadcast loop reads it per socket
+					// TIME-BASED rules need a driver (review report.md H2): without a tick, held text only leaves
+					// on the next delta or the block end, so a slow provider shows "thinking…" past the promised
+					// ceiling. One interval per opted-in socket; cleared on close.
+					if (!ws.__reducerTimer && reduction.reducer.enabled) {
+						ws.__reducerTimer = setInterval(() => {
+							try {
+								const out = ws.__reducer?.tick?.(Date.now());
+								if (!out || ws.readyState !== 1) return;
+								for (const f of Array.isArray(out) ? out : [out]) ws.send(JSON.stringify({ type: "agent", sessionId: f.sessionId, ...f }));
+							} catch { /* socket gone */ }
+						}, 250);
+						ws.__reducerTimer.unref?.();
+					}
 					// RETENTION rides along with the same setting: "browser" must not write images to disk
 					agentHub.setMediaPersist(m?.imageRetention !== "browser");
 					safeSend(ws, {
@@ -2486,8 +2519,8 @@ function agentConn(ws) {
 			safeSend(ws, { type: "error", id: m.id, error: err.message });
 		}
 	});
-	ws.on("close", () => { if (currentSession) { detachAgentClient(currentSession, ws); agentHub.emitRuntime(currentSession); } });
-	ws.on("error", () => { if (currentSession) { detachAgentClient(currentSession, ws); agentHub.emitRuntime(currentSession); } });
+	ws.on("close", () => { clearInterval(ws.__reducerTimer); ws.__reducerTimer = null; if (currentSession) { detachAgentClient(currentSession, ws); agentHub.emitRuntime(currentSession); } });
+	ws.on("error", () => { clearInterval(ws.__reducerTimer); ws.__reducerTimer = null; if (currentSession) { detachAgentClient(currentSession, ws); agentHub.emitRuntime(currentSession); } });
 }
 
 function attachAgentClient(sessionId, ws) {
@@ -2673,7 +2706,12 @@ app.get("/api/agent/session/:id/range", async (c) => {
 		// that no test could see. Contract: fromSeq <= start <= end <= min(toSeq, count),
 		// and the headers below describe exactly the bytes in the slice.
 		const { start, end } = planRangeWindow({ messages: range.messages, fromSeq: range.fromSeq, toSeq: range.toSeq, messageCount: range.messageCount });
-		const slice = start >= end ? [] : range.messages.slice(start - range.fromSeq, end - range.fromSeq);
+		// EGRESS REDACTION on the BACKFILL path too (review report.md H1, 2026-10-27): this was the one
+		// egress that still shipped inline image base64 — and it is exactly the path a warm client uses
+		// to fill its prefix (fillWindow -> IDB), so the image win was not achieved end-to-end. Redacting
+		// after the window is computed keeps the seq accounting intact (ids/seqs are untouched).
+		const rawSlice = start >= end ? [] : range.messages.slice(start - range.fromSeq, end - range.fromSeq);
+		const slice = rawSlice.length ? agentHub.redactMessages(rawSlice) : rawSlice;
 		const ndjson = slice.map((m) => JSON.stringify(m)).join("\n");
 		// 204 MUST NOT carry a body (RFC 9110) — the headers alone describe the empty
 		// window, and the client keys its "nothing more to load" decision off re <= rs.

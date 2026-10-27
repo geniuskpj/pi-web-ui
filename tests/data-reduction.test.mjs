@@ -28,8 +28,10 @@ import {
 } from "../lib/media-egress.mjs";
 // the BROWSER side of the same levels: keys + localStorage plumbing (thin wrapper over the libs)
 import {
-	DATA_SETTING_KEYS, readDataSettings, resolvedImagePolicy, resolvedStreamPolicy,
+	DATA_SETTING_KEYS, readDataSettings, resolvedImagePolicy, resolvedStreamPolicy, pushDataReduction,
 } from "../src/ui/data-settings.ts";
+// the stream half of the same levels (used by the client-hop checks below)
+import { resolveStreamPolicy } from "../lib/thinking-flush.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -172,7 +174,7 @@ const msg = (text, parts = []) => ({ role: "user", content: [{ type: "text", tex
 		resolvedStreamPolicy("thinking").mode === "paragraph" && resolvedStreamPolicy("tool").mode === "lines");
 	check("L12c the browser wrapper resolves the SAME policies the pure layer does",
 		resolvedImagePolicy("metered").maxEdge === resolveDataReduction("metered", {}).maxEdge &&
-		resolvedImagePolicy("lan").minBytes === undefined && resolvedStreamPolicy("text", "wan").minBytes === 256);
+		resolvedImagePolicy("lan").minBytes === undefined && resolvedStreamPolicy("text", "wan").minBytes === 128);
 
 	// source assertions — the wiring that cannot be expressed as a pure call
 	const dialogSrc = fs.readFileSync(path.join(ROOT, "src/ui/settings.tsx"), "utf8");
@@ -191,7 +193,37 @@ const msg = (text, parts = []) => ({ role: "user", content: [{ type: "text", tex
 	check("L13e the tier is read from /api/health (the only thing the server can observe) and cached for the composer",
 		/\/api\/health/.test(dialogSrc) && /localStorage\.setItem\("pi\.netTier"/.test(dialogSrc));
 	check("L13f the hub push carries per-stream thresholds (server-side coalescing needs the numbers)",
-		/setDataReduction\?/.test(settingsSrc) && /thinking:\s*\{\s*mode/.test(settingsSrc) && /text:\s*\(\(\{ mode/.test(settingsSrc) && /tool:\s*\(\(\{ mode/.test(settingsSrc));
+		/setDataReduction\?/.test(settingsSrc) && /thinking:\s*pickStreamNumbers\(thinking\)/.test(settingsSrc) &&
+		/text:\s*pickStreamNumbers\(resolvedStreamPolicy\("text"\)\)/.test(settingsSrc) && /tool:\s*pickStreamNumbers\(resolvedStreamPolicy\("tool"\)\)/.test(settingsSrc));
+}
+
+// ── L4: THE CLIENT HOP (review report.md B1, 2026-10-27): the settings dialog was inert because
+// `agent.setDataReduction` did not exist and nothing re-pushed the levels on attach. This is the
+// BEHAVIOUR of the push (the real function, a fake agent) plus a source assertion for the method and
+// its attach call site — importing src/proxy-agent.ts in node is not possible (it imports "./id.js").
+{
+	const sent = [];
+	pushDataReduction({ setDataReduction: (cfg) => sent.push(cfg) });
+	const frame = sent[0];
+	check("L16 pushDataReduction sends ONE frame with the levels, the per-kind thresholds and the retention",
+		!!frame && frame.thinkingLevel === "paragraph" && typeof frame.thinking?.mode === "string" &&
+		typeof frame.thinking.minBytes === "number" && typeof frame.tool?.mode === "string" && typeof frame.imageRetention === "string",
+		JSON.stringify(frame && Object.keys(frame)));
+	check("L16b the per-kind numbers match the resolved policies (the hub does not have to guess)",
+		frame.thinking.mode === resolveStreamPolicy("thinking", "wan", {}).mode &&
+			frame.thinking.minBytes === resolveStreamPolicy("thinking", "wan", {}).minBytes &&
+			frame.thinking.firstBytes === resolveStreamPolicy("thinking", "wan", {}).firstBytes);
+	check("L16c it is a no-op (no throw) when the agent has no such method — old server, same code path",
+		(() => { try { pushDataReduction({}); pushDataReduction(null); return true; } catch { return false; } })());
+
+	const proxySrc = fs.readFileSync(path.join(ROOT, "src/proxy-agent.ts"), "utf8");
+	check("L16d ProxyAgent DEFINES setDataReduction (the optional call in data-settings is now answered)",
+		/setDataReduction\(cfg: Record<string, unknown>\): void/.test(proxySrc) && /import \{ pushDataReduction \} from "\.\/ui\/data-settings\.js"/.test(proxySrc));
+	check("L16e …and the ATTACH handler re-pushes it (a reload cannot silently disable the feature)",
+		/pushDataReduction\(this\);/.test(proxySrc) && /this\.pushAutoRetrySetting\(\);[\s\S]{0,400}pushDataReduction\(this\)/.test(proxySrc));
+	check("L16f the settings dialog calls a REAL method now (no optional-call blind alley for the levels)",
+		/setImageLevelState\(setImageLevel\(v\)\)/.test(fs.readFileSync(path.join(ROOT, "src/ui/settings.tsx"), "utf8")) &&
+		/pushDataReduction\(agent\)/.test(fs.readFileSync(path.join(ROOT, "src/ui/settings.tsx"), "utf8")));
 }
 
 // ─── L3: the HUB's egress cache and retention (grok review 2026-10-25, blocker 4 + should-fix)

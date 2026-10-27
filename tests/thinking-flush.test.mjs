@@ -19,7 +19,7 @@
 //
 // Usage: node tests/thinking-flush.test.mjs
 import {
-	THINKING_PRESETS, THINKING_MODES, THINKING_LEVELS, THINKING_LEVEL_MODES,
+	THINKING_PRESETS, THINKING_MODES, THINKING_LEVELS, THINKING_LEVEL_MODES, FIRST_BYTES,
 	STREAM_KINDS, STREAM_KIND_PRESETS,
 	resolveThinkingPolicy, resolveStreamPolicy, createThinkingGate, simulateThinking, simulateStream,
 	describeStreamPolicy, shortStreamParams, thinkingLevelOptions, thinkingLevelForNet,
@@ -119,7 +119,8 @@ const PARAGRAPHS = 6;
 	check("U6b each kind still gets its OWN thresholds (the answer arrives fast, tool output in bulk)",
 		(() => {
 			const t = resolveStreamPolicy("text", "wan", {}), k = resolveStreamPolicy("tool", "wan", {}), th = resolveStreamPolicy("thinking", "wan", {});
-			return t.minBytes === 256 && t.maxHoldMs === 1200 && t.idleMs === 600 &&
+			// text = the answer a reader follows word by word: small floor, small ceiling (2026-10-27)
+			return t.minBytes === 128 && t.maxHoldMs === 600 && t.idleMs === 300 &&
 				k.minBytes === 2048 && k.maxLines === 40 && k.maxBytes === 8192 && k.mode === "lines" &&
 				th.minBytes === 1024 && STREAM_KINDS.join(",") === "thinking,text,tool";
 		})(), `text ${STREAM_KIND_PRESETS.text.minBytes}B/${STREAM_KIND_PRESETS.text.maxHoldMs}ms · tool ${STREAM_KIND_PRESETS.tool.minBytes}B/${STREAM_KIND_PRESETS.tool.maxLines} lines`);
@@ -134,6 +135,27 @@ const PARAGRAPHS = 6;
 		resolveStreamPolicy("reasoning", "wan", {}).kind === "thinking" && resolveStreamPolicy("reasoning", "wan", {}).mode === "paragraph");
 
 	// "show param when it is selected"
+	// FIRST FRAME, IMMEDIATELY (the "thinking returns too slowly" report, 2026-10-27): every shipped
+	// preset releases the first chunk as soon as it holds a few words, so a coalescing policy still
+	// paints the block instantly instead of showing "thinking…" for the whole idle window.
+	check("U9 every shipped preset carries the immediate first frame (firstBytes > 0)",
+		THINKING_PRESETS.lan.firstBytes > 0 && THINKING_PRESETS.wan.firstBytes > 0 && THINKING_PRESETS.metered.firstBytes > 0 &&
+		STREAM_KIND_PRESETS.text.firstBytes > 0 && STREAM_KIND_PRESETS.tool.firstBytes > 0 && FIRST_BYTES > 0,
+		`thinking ${THINKING_PRESETS.wan.firstBytes}B · text ${STREAM_KIND_PRESETS.text.firstBytes}B · tool ${STREAM_KIND_PRESETS.tool.firstBytes}B`);
+	check("U9b the resolved policies carry it through (a client gets the fast first paint)",
+		resolveThinkingPolicy("wan", {}).firstBytes === 64 && resolveStreamPolicy("text", "wan", {}).firstBytes === 32 &&
+		resolveStreamPolicy("thinking", "wan", {}).firstBytes === 64);
+	check("U9c it can be turned off (0) — the pure gate keeps exact frame counts for threshold tests",
+		resolveThinkingPolicy("wan", { thinkingFirstBytes: 0 }).firstBytes === 0 && createThinkingGate({ mode: "paragraph", minBytes: 0, firstBytes: undefined }).snapshot().minBytes === 0);
+	check("U9d the FIRST chunk of a block is released before any threshold is met",
+		(() => {
+			const g = createThinkingGate({ mode: "paragraph", minBytes: 1024, maxLines: 1e9, maxBytes: 1e9, minIntervalMs: 1e9, idleMs: 1e9, maxHoldMs: 1e9, firstBytes: 64 });
+			const early = g.push("The answer starts here and keeps going towards the point", 1000); // 55B: still below 64
+			const second = g.push(" and continues", 1010);                                            // 68B: first frame fires
+			const next = g.push("second sentence, still inside the floor", 1020);
+			return early.emit === null && second.reason === "first" && second.emit.startsWith("The answer") && next.emit === null;
+		})(), "nothing at 55B, the whole chunk at 68B (first), then the 1KB floor applies again");
+
 	check("U7 describeStreamPolicy states the real parameters per kind and per level",
 		describeStreamPolicy(resolveStreamPolicy("thinking", "wan", {})).includes("≥1 KB/frame") &&
 		describeStreamPolicy(resolveStreamPolicy("thinking", "wan", {})).includes("2.5 s") &&
@@ -157,10 +179,11 @@ const PARAGRAPHS = 6;
 	// text deltas: prose arrives per paragraph, small floor, tight ceiling
 	const prose = "Here is what I found. ".repeat(60) + "\n\n" + "And the second paragraph. ".repeat(60) + "\n\n";
 	const textRun = simulateStream(deltaStream(prose, 25), { kind: "text", net: "wan", stepMs: 40 });
-	check("V1 the visible answer is gated by the TEXT policy (paragraph mode, 256B floor)",
+	check("V1 the visible answer is gated by the TEXT policy (paragraph mode, 128B floor)",
 		textRun.stats.policy.kind === "text" && textRun.stats.policy.mode === "paragraph" &&
-		textRun.frames.every((f) => f.bytes >= 256 || f.reason === "end") && textRun.frames.some((f) => f.bytes >= 256),
-		`${textRun.stats.frames} frames: ${textRun.stats.reasons.join(",")}`);
+		textRun.frames.every((f) => f.bytes >= 128 || f.reason === "end" || f.reason === "first") &&
+		textRun.frames.some((f) => f.bytes >= 128),
+		`${textRun.stats.frames} frames: ${textRun.stats.reasons.slice(0, 6).join(",")}`);
 	check("V1b …and its wait is bounded by the TIGHT text ceiling, not the thinking one",
 		textRun.stats.maxWaitMs <= textRun.stats.policy.maxHoldMs + 80, `max wait ${textRun.stats.maxWaitMs}ms ≤ ${textRun.stats.policy.maxHoldMs}ms`);
 	check("V1c no text is lost or reordered", textRun.frames.map((f) => f.text).join("") === prose);
@@ -173,8 +196,9 @@ const PARAGRAPHS = 6;
 	check("V2 tool output is gated by the TOOL policy: ~1 frame per 40 lines, never per delta",
 		toolRun.stats.policy.kind === "tool" && toolRun.stats.frames > 1 && toolRun.stats.frames <= 8 && toolRun.stats.frames < deltaStream(log, 25).length / 10,
 		`${toolRun.stats.frames} frames for 200 lines / ${deltaStream(log, 25).length} deltas`);
-	check("V2b the tool frames are big enough to be COMPRESSED (≥ the socket threshold)",
-		toolRun.frames.every((f) => deflateEligible(frameBytes({ type: "tool_output", text: f.text }), WS_DEFLATE)));
+	check("V2b the tool frames are big enough to be COMPRESSED (≥ the socket threshold), first paint aside",
+		toolRun.frames.filter((f) => f.reason !== "first").every((f) => deflateEligible(frameBytes({ type: "tool_output", text: f.text }), WS_DEFLATE)),
+		`first frame ${toolRun.frames[0]?.reason} (${toolRun.frames[0]?.bytes}B)`);
 	check("V2c tool output is never lost", toolRun.frames.map((f) => f.text).join("") === log);
 	check("V2d turnEnd holds the whole tool output and sends it once (the 'tool call' case)",
 		(() => { const r = simulateStream(deltaStream(log, 25), { kind: "tool", net: "wan", settings: { thinkingLevel: "turnEnd" } }); return r.stats.frames === 1 && r.frames[0].text === log; })());

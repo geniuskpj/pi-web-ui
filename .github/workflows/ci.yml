@@ -88,3 +88,4 @@ jobs:
           npm run test:imgcompress
           npm run test:reduce
           npm run test:reduce-e2e
+          npm run test:media-e2e
