@@ -787,11 +787,12 @@ button.pw-pill:active { transform: translateY(0.5px); }
 	overflow: hidden;
 	min-height: 30px; /* touch target */
 }
+/* the label is a GLYPH now (💡 = reasoning effort, user request 2026-10-28): emoji are
+   color fonts, so the muted color must not wash them out — size carries the emphasis */
 .pw-pill-label {
 	flex: none;
-	font-size: 11px;
+	font-size: 14px;
 	line-height: 1;
-	color: var(--muted-foreground, #888);
 	padding-left: 10px;
 	pointer-events: none; /* label click must reach the select (grok p6) */
 }

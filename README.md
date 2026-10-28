@@ -30,8 +30,11 @@ Browser (any device)              Node Server
   undici-hardened, abort-propagating, stall-watchdog).
 - **Sessions** persist to localStorage (LocalStorageBackend) + mirror to the server worker store
   (`data/sessions/*.jsonl`) after each turn.
-- **Provider/model config** lives on the server (`/api/pi/config` from pi's `models-store.json`)
-  and is cached client-side in localStorage (synchronous boot).
+- **Provider/model config** is built on the server (`/api/pi/config` → `lib/pi-catalog.mjs`) from the
+  pi-ai builtin catalog + pi's `models-store.json` **+ your own `.pi/models.json`** (user-added
+  compatible endpoints) + `auth.json`, and is cached client-side in localStorage (synchronous boot).
+  An OpenAI-compatible endpoint needs **no API key**: declare it in `models.json` without `apiKey` (or
+  `"apiKey": "none"`) and it runs — `Authorization: Bearer none` on the wire, which such servers ignore.
 - **API keys** stay in `.pi/auth.json` on the server; import via the 🗄️ button or Settings.
 
 ## Documentation (docs/)
@@ -60,8 +63,8 @@ claims without the raw source). Start with `architecture.md` — index + reading
 | LLM connectivity (proxy + keys) | `src/ui/proxy-stream.ts` | vendored proxy-utils + build patches: clone-before-proxy, localStorage-first settings, key resolver w/ bounded server race |
 | Session list dialog | `src/ui/session-list.tsx` | server mirror + local metadata merge, load/delete |
 | **Alive sessions dialog** | `src/ui/alive-sessions.tsx` | header activity button (count badge) → live view of running/error sessions: click-to-navigate, two-stage Kill (abort), "✓ done" grace, live/paused footer; every runtime emission advances the hub seq so deltas are never stale-dropped |
-| Settings dialog | `src/ui/settings.tsx` | model, thinking level, keys (import/add/replace), proxy, token, quota |
-| Model selector | `src/ui/model-selector.tsx` | pi-config models only (no built-in catalog) |
+| Settings dialog | `src/ui/settings.tsx` | model, thinking level, turns visible, keys (import/add/replace), proxy, token, quota |
+| Model selector | `src/ui/model-selector.tsx` | the merged catalog: builtin catalog + `models-store.json` + `.pi/models.json` (marked `· custom`) + `auth.json` providers; re-fetched on every open |
 | Settings → Import from pi config | `src/ui/settings.tsx` | providers/defaults/key re-import (moved from the header 💾 button) |
 | **Workspace file explorer** | `src/ui/file-picker.tsx` | two-pane: file list (mtime-sorted, checkboxes for multi-select) + live preview (line numbers + syntax highlighting via hljs; images; prose); opens at `ws/` by default, remembers last dir |
 | **Terminal dock (no node-pty)** | `src/ui/terminal.tsx` + `terminal-hub.mjs` | wterm (prebuilt dist vendored to `public/vendor/wterm/`, lazy-loaded) in a bottom dock; server runs `bash -i` over pipes with a generated rc (readline gives echo/prompt/history/^C as a raw VT stream) — verified by `node term-smoke.mjs` (12 checks); ring-buffer replay, live exit codes via OSC 133, drag-resize; bash tool rows get "↗ terminal" |
@@ -97,6 +100,7 @@ Workspace file attach + image paste are BACK (plan.md §12–14) — see the exp
 | `PI_WEB_MEDIA_CACHE_MB` | `64` | in-memory read cache for the image store in front of the disk |
 | `PI_WEB_DATA_REDUCTION_DEBUG` | off | `1` logs one `[data-reduction]` line per block (modes · forwarded · dropped bytes · flushes) — the way to watch stream coalescing on a scratch port |
 | `PI_WEB_TERM_COLS` / `PI_WEB_TERM_LINES` | `110` / `32` | terminal grid size (stty in the pty tier, COLUMNS/LINES env in the pipe tier) |
+| — | `3` | (*UI setting, not an env var*) turns a large session shows: Settings → Turns visible · `localStorage pi.turnWindow` |
 | `PI_WEB_TERM_BRIDGE` | auto | `conhost` forces Windows ConPTY; `0`/`pipes` forces the pipe tier; a path uses that exe as an msys-pty-bridge; unset → auto-provision msys2 `util-linux` `script.exe` into `data/bin/script/` (sha256-pinned `util-linux-2.40.2-2` package from repo.msys2.org, 8MB size cap, extracts a 63KB exe — once). The bridge is then **proven by running it** with the shell it will drive (that shell must get `isatty(stdin)==true`); a bridge that cannot allocate a pty is refused, and the reason appears in the dock instead of a silent downgrade |
 | `PI_WEB_TERM_ORIGIN` | auto | extra `host[:port]` **names for the global Host/Origin allowlist** — every `/api/*` route and all three WS endpoints (`/ws/sync`, `/ws/agent`, `/ws/terminal`), not just the terminal. Comma-separated, scheme stripped. Matching is EXACT on `host:port`: a missing Origin port means the scheme default (http→80, https→443) and a portless Host is tried as the app port plus 80/443 — so a TLS reverse proxy needs its public form spelled out (`PI_WEB_TERM_ORIGIN=name:443`). Localhost, `os.hostname()` and every interface IP are always allowed |
 | `PI_WEB_ORIGIN_GATE` | `auto` | how strictly the DNS-rebinding Host/Origin allowlist applies: `auto` = **loopback peers only** (a remote peer must present the API token — that is what lets the UI work on any domain/DDNS name with no config), `strict` = every peer (pre-2026-10-23 behaviour, only allowlisted names pass), `off` = no host check at all (**foot-gun**, warns at boot: a rebinding page can read `/api/sessions` with no token) |
@@ -200,9 +204,13 @@ Layered design — the server decides transfer sizes, the client decides display
   started. Cached chunks strictly below it survive (an edit at 950 of 976 keeps chunks 0–799;
   compaction keeps the prefix below its span start). The client validates the generation on
   every cache read and refetches on mismatch. The generation also survives server restarts.
-- **Display by user turn:** sparse (large) sessions render ONE conversational turn (from its
-  user message down); “⤒ Load earlier turns” reveals the previous turn per click — pure view
-  change when it is in memory, a range fetch when it isn't. Small chats display fully.
+- **Display by user turn:** sparse (large) sessions render the last **N conversational turns**
+  (N = Settings → Composer → *Turns visible*, `pi.turnWindow`, **default 3**; from the N-th newest
+  user message down); “⤒ Load earlier turns” reveals one more turn per click — pure view change
+  when it is in memory, a range fetch when it isn't. **Small chats display fully** (a null gate is no
+  gate — it never meant “one turn”). The button only appears when something is actually hidden. (Fixed
+  2026-10-27: the gate was hardcoded to one turn AND applied to every session, so a one-turn chat showed
+  a ⤒ button that hid nothing but its system message.)
 - **Transfer policy:** `navigator.connection` (saveData / effectiveType / type) decides — fast
   links background-warm the whole body into IDB; metered links stay manual (expand per click).
   Server fallback: `/api/health` reports `netClass: lan | remote` (peer/Host classification).

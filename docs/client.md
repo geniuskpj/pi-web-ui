@@ -1,6 +1,6 @@
 # Client — main.tsx, chat.tsx, storage, sync, connectivity
 
-> Updated 2026-10-21 · See also: [architecture.md](architecture.md) (data flows, trust model) ·
+> Updated 2026-10-27 · See also: [architecture.md](architecture.md) (data flows, trust model) ·
 [server.md](server.md) (exec bridge, /ws/sync hub) · [terminal.md](terminal.md) (command bridge consumer)
 
 Covers `src/main.tsx`, `src/ui/chat.tsx`, `src/storage.ts`, `src/local-storage-backend.js`,
@@ -70,6 +70,18 @@ Covers `src/main.tsx`, `src/ui/chat.tsx`, `src/storage.ts`, `src/local-storage-b
   re-stick and rubber-band during fast streams); re-stick near bottom (<10px).
 - 401 flow: on `agent_end` → `waitForIdle()` → inspect ONLY the last assistant message →
   `looksLikeAuthError` (401/403/invalid-key regex) → prompt → store via providerKeys.
+- **Display by user turn (2026-10-27, `lib/display-gate.mjs` + `pi.turnWindow`):** the gate hides the
+  messages BEFORE the N-th newest user turn, N = Settings → Composer → *Turns visible* (`localStorage
+  pi.turnWindow`, default 3, `turnsVisiblePref()`/`setTurnsVisible()` in `chat.tsx` — the setter
+  dispatches `pi-turn-window-changed`, ChatView re-gates live from the LAST turn). The gate is a SEQ
+  (`gateSeqOfLastTurns`), so a prefix fill cannot invalidate it; `resolveGateSeq(gate, filledFrom,
+  msgs, turns)` re-anchors only a gate that points OUTSIDE the loaded window. **A null gate stays null**
+  — small sessions (no `sparse` envelope) and full state frames render EVERYTHING. Two user-reported
+  bugs came from the opposite rule: `resolveGateSeq(null, …)` used to mean “the last user turn”, so
+  every chat was gated (a one-turn session showed a ⤒ button that hid only its system message) and the
+  gated view was hardcoded to ONE turn. ⤒ reveals one more turn per click (`prevUserSeq`, from memory
+  when loaded, `/range` when not); the button appears only when something is really hidden and reports
+  `displayFrom` (in view) and `filledFrom` (not loaded) separately. Test: `npm run test:gate`.
 - Retry (2026-10-23): the button delegates to the HUB (`agent.retry()` → `{type:"retry"}` →
   `{type:"retried"}` ack; the run streams as normal agent events). The hub drops the 429/error message
   and calls `agent.continue()`, so the failed model call is re-issued against the SAME transcript: the
@@ -91,6 +103,14 @@ Covers `src/main.tsx`, `src/ui/chat.tsx`, `src/storage.ts`, `src/local-storage-b
   attachments.
 - Usage bar: last-call context % (prefers `usage.totalTokens`, else the 4-way sum; labeled "last-call"
   because provider usage shapes differ) + session totals ↑↓$.
+
+## Model selector (`ui/model-selector.tsx`)
+
+Reads `window.__PI_PROVIDERS` (pi-import.ts, `pi.modelsCache`) — the SERVER's merged catalog
+(`lib/pi-catalog.mjs`; see [server.md](server.md) §Provider catalog), which now includes providers added
+in `.pi/models.json` and providers that only exist in `auth.json`. Every OPEN re-fetches
+`/api/pi/config` (async, `cfgTick` bumps the memo) so a hand-edited models.json is visible without a
+reload, and the group header appends `· custom` (origin `models.json`) / `· no key` (keyless provider).
 
 ## Data use: the image pipeline (2026-10-25 — model + wiring contract)
 

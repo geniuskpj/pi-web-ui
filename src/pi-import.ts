@@ -11,6 +11,10 @@ export interface PiProviderConfig {
 	name: string;
 	baseUrl: string;
 	models: AnyModel[];
+	/** where the provider came from: models.json (user-added endpoint) | models-store | builtin-catalog | auth */
+	origin?: string;
+	/** true = the endpoint needs no credential (models.json without/with apiKey "none") */
+	keyless?: boolean;
 }
 
 export interface PiConfig {
@@ -26,7 +30,7 @@ const CACHE_KEY = "pi.modelsCache";
 
 declare global {
 	interface Window {
-		__PI_PROVIDERS?: Array<{ name: string; models: AnyModel[] }>;
+		__PI_PROVIDERS?: Array<{ name: string; models: AnyModel[]; origin?: string; keyless?: boolean }>;
 	}
 }
 
@@ -39,6 +43,8 @@ export function loadCachedConfig(): PiConfig | null {
 		(window as any).__PI_PROVIDERS = cfg.providers.map((p) => ({
 			name: p.name,
 			models: p.models.map((m) => ({ ...m, provider: p.name })) as AnyModel[],
+			origin: p.origin,
+			keyless: p.keyless,
 		}));
 		return cfg;
 	} catch {
@@ -51,6 +57,8 @@ export function applyConfig(config: PiConfig) {
 	(window as any).__PI_PROVIDERS = config.providers.map((p) => ({
 		name: p.name,
 		models: p.models.map((m) => ({ ...m, provider: p.name })) as AnyModel[],
+		origin: p.origin,
+		keyless: p.keyless,
 	}));
 	try {
 		localStorage.setItem(

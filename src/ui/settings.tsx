@@ -9,7 +9,7 @@ import type { Agent } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import { useEffect, useState } from "preact/hooks";
 import { getAppStorage } from "../storage.js";
-import { enterSendsPref } from "./chat.js";
+import { enterSendsPref, turnsVisiblePref, setTurnsVisible, TURNS_VISIBLE_DEFAULT } from "./chat.js";
 import { getProxyUrlSync } from "./proxy-stream.js";
 import { retryServerAuth } from "../server-auth.js"; // re-probe after a token change (clears the banner)
 // data-reduction LEVELS (images · reasoning/answer/tool streaming). All decisions live in the
@@ -62,6 +62,8 @@ export function SettingsDialog({
 	// Enter-key behavior (mobile multi-line, sonnet-5 design): tri-state pref read
 	// from the same localStorage key the Editor consumes (pi.enterSends)
 	const [enterPref, setEnterPref] = useState<string>(() => enterSendsPref());
+	// turns visible in a large (tail-first) session — pi.turnWindow, default 3
+	const [turnWindow, setTurnWindow] = useState<number>(() => turnsVisiblePref());
 	const [quota, setQuota] = useState<{ usage: number; percent: number } | null>(null);
 	const [saved, setSaved] = useState("");
 	// thinking level is read from agent.state at render (no stale local snapshot —
@@ -359,7 +361,24 @@ export function SettingsDialog({
 								<option value="never">Always newline (send with the button)</option>
 							</select>
 						</label>
+						<label class="pw-set-row" title="How many conversational turns a LARGE (tail-first) session shows at once. Older turns stay one click away on the ⤒ Load earlier turns button at the top. Small sessions always render in full — this never changes what is stored or what the model reads.">
+							<span>Turns visible</span>
+							<select
+								class="pi-input pw-set-input"
+								value={String(turnWindow)}
+								onChange={(e) => {
+									const v = setTurnsVisible(Number((e.target as HTMLSelectElement).value));
+									setTurnWindow(v);
+									flash(v === 1 ? "Showing the last turn — older ones via ⤒" : `Showing the last ${v} turns`);
+								}}
+							>
+								{Array.from({ length: 20 }, (_, i) => i + 1).map((n) => (
+									<option value={String(n)} key={n}>{`${n}${n === TURNS_VISIBLE_DEFAULT ? " (default)" : ""}`}</option>
+								))}
+							</select>
+						</label>
 						<div class="pw-hint">Long-press one of YOUR messages to edit it on touch screens. Ctrl/Cmd+Enter always sends, in every mode.</div>
+						<div class="pw-hint">Large sessions open on the last <b>{turnWindow}</b> turn{turnWindow === 1 ? "" : "s"}; ⤒ Load earlier turns reveals one more turn per click (from memory when it is loaded, from the server when it is not). Small sessions are never gated.</div>
 					</section>
 
 					<section class="pw-set-section">

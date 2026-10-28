@@ -1,6 +1,6 @@
 # server.mjs — Server internals
 
-> Updated 2026-10-21 · See also: [architecture.md](architecture.md) (module map, trust model) ·
+> Updated 2026-10-27 · See also: [architecture.md](architecture.md) (module map, trust model) ·
 [client.md](client.md) (browser caller) · [terminal.md](terminal.md) (terminal WS security)
 
 Covers `server.mjs`, `agent-hub.mjs`, `session-worker.mjs`, `session-id.mjs`.
@@ -66,10 +66,10 @@ See [architecture.md](architecture.md) for the module map and trust-boundary sum
 |---|---|---|
 | `GET /api/health` | none | `{ok, bootId, buildId, piDir}` — buildId parsed from the hashed bundle filename |
 | `GET /api/version` | blanket | same ids |
-| `GET /api/pi/config` | blanket | re-reads `.pi/models-store.json` + `settings.json` → providers with models, defaults |
+| `GET /api/pi/config` | blanket | REBUILDS the provider catalog (`lib/pi-catalog.mjs` — see below) → providers with models (`origin`, `keyless`) + defaults |
 | `GET /api/pi/system` | blanket | system-prompt resolution (below) |
-| `GET /api/pi/keys` | **always token** (2026-10-21) | **returns ALL provider keys from `.pi/auth.json`** — strongest secrets oracle; no client call path uses it |
-| `POST /api/pi/key` | blanket + env-TOKEN check | `{provider}` → that provider's key |
+| `GET /api/pi/keys` | **always token** (2026-10-21) | **returns ALL resolved provider keys** (auth.json + models.json + keyless placeholders) — strongest secrets oracle; no client call path uses it |
+| `POST /api/pi/key` | blanket + env-TOKEN check | `{provider}` → `{provider, key, keyless?}`; **404 only when nothing resolves** — a models.json provider that needs no credential answers `{key:"none", keyless:true}` so the browser never prompts for one |
 | `GET /api/sessions` | blanket | worker `list` (metadata only), 1s-cached (`listCached`) |
 | `POST /api/sessions` | blanket | returns a fresh `crypto.randomUUID()` (creates nothing) |
 | `GET /api/exec/tools` | blanket (+env-TOKEN if set) | tool defs minus `execute`; `stream:true` for bash |
@@ -83,6 +83,45 @@ See [architecture.md](architecture.md) for the module map and trust-boundary sum
 | `WS /ws/sync`, `WS /ws/agent` | token for non-loopback at upgrade | hubs below |
 | `WS /ws/terminal` | token for non-loopback + hub Origin allowlist | see [terminal.md](terminal.md) |
 | `POST /api/agent/*`, `GET /api/agent/session/:id`, `GET /api/agent/events` (SSE) | blanket | server-side agent path |
+
+## Provider catalog (`lib/pi-catalog.mjs`, 2026-10-27)
+
+**User reports this fixes:** *“model selector should show user added provider's model”* and *“let
+openai compatible api/provider accept apiKey none”*.
+
+One pure module builds `piModelsStore` (= `name -> {name, baseUrl, api, models, apiKey, keyless,
+origin}`) from four sources; it feeds BOTH the picker (`clientProviders()` → `/api/pi/config`) and the
+hub (`_getModel` walks `.models`) and is rebuilt by `refreshModelsStore()` on every `/api/pi/config`,
+so **editing `.pi/models.json` lands in the picker without a server restart** (the refresh builds a new
+map and swaps it into the hub in ONE assignment — `hubRef.modelsStore = next` — so a run that resolves
+its model mid-refresh never sees a half-built catalog).
+
+| Source | Role |
+|---|---|
+| pi-ai builtin catalog (`getBuiltinModels`) | metadata baseline for every provider the user touches |
+| `.pi/models-store.json` | pi's own discovery CACHE (wins per model id) |
+| **`.pi/models.json`** | the user's file (`{providers:{name:{baseUrl,api,apiKey,models,modelOverrides}}}`) — the documented way to add a compatible endpoint; wins per model id, adds providers |
+| `.pi/auth.json` | providers the user merely logged into (catalog models fill in) |
+
+- **Per model id, never per provider list**: a user entry replaces the same id; the store's other models
+  survive. A provider whose models are empty everywhere is dropped (it was the “provider with an empty
+  list” bug — e.g. a store entry for `google` with zero cached models, which now shows the 24 builtin
+  ones). Provider `baseUrl` is pushed down onto models that lack one (pi does the same).
+- **`models.json` is parsed TOLERANTLY** (`readJsonTolerant`): `//` + `/* */` comments and trailing
+  commas are stripped before a second parse attempt (a real hand-edited file had both; a hard failure
+  would take the whole catalog down). A warning names the file.
+- **Credentials**: `auth.json` > `models.json` `apiKey` (literal, or `$NAME`/`${NAME}` env
+  interpolation) > keyless placeholder. `apiKey: "none"` / `""` / `"null"` / an **absent** key on a
+  models.json provider = *this endpoint needs no credential*: `resolvedKeys()` returns the placeholder
+  `none`, which reaches the wire as `Authorization: Bearer none` — the local llama.cpp / vLLM / Ollama /
+  header-auth-proxy case. pi-ai's `getClientApiKey` throws `No API key for provider: X` on an empty key,
+  which is exactly what made such a provider unusable (`tests/pi-catalog-keyless.e2e.mjs` pins both the
+  working path and the contrast).
+- **A provider NOT declared in models.json never gets the placeholder** and a `!command` key is never
+  treated as keyless — a missing real credential must stay a loud `No API key for provider` instead of a
+  silent anonymous request.
+- **Never leaked**: `clientProviders()` strips `apiKey`/`api_key` from every model record and never
+  serializes the provider-level key (server-side only). Tests: `npm run test:catalog`, `npm run test:keyless`.
 
 ## System-prompt resolution (`/api/pi/system`)
 

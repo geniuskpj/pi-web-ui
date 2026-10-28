@@ -1,6 +1,6 @@
 # pi-web-ui — Architecture
 
-> Updated 2026-10-21 · Index + reading order: [docs/README.md](README.md)
+> Updated 2026-10-27 · Index + reading order: [docs/README.md](README.md)
 
 Docs index: **architecture.md** (this file) · [server.md](server.md) · [terminal.md](terminal.md) · [client.md](client.md)
 
@@ -75,7 +75,9 @@ refresh, `?session=` restore.
 1. **Chat turn (default, SERVER-side loop, 2026-10-21)**: Editor send → `ProxyAgent.prompt()` → WS
    `/ws/agent` `{prompt, content, images}` → `agent-hub.mjs` runs the Agent **in Node**: tools
    (read/write/edit/bash + pi extensions) execute IN-PROCESS (same objects as the exec bridge), API
-   keys come from `.pi/auth.json`, system prompt = `WEB_SYSTEM.md`/`SYSTEM.md` precedence. EVERY event
+   keys come from `.pi/auth.json` (then a provider's own `apiKey` in `.pi/models.json`; a models.json
+   provider with none resolves to the keyless placeholder — see [server.md](server.md) §Provider
+   catalog), system prompt = `WEB_SYSTEM.md`/`SYSTEM.md` precedence. EVERY event
    (message_update, tool_execution_update partials, agent_end) is broadcast to ALL attached devices —
    send from the PC, watch live from the phone, close the phone and the run keeps going.
    `?local=1` → legacy browser loop (`streamFn` via `/api/proxy` when the provider lacks CORS).

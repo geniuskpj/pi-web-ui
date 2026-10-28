@@ -31,7 +31,7 @@ import type { SystemNotificationMessage } from "../llm.js";
 import { getAppStorage } from "../storage.js";
 import { looksLikeAuthError, createApiKeyResolver } from "./proxy-stream.js";
 import { copyText } from "../id.js";
-import { gateIndex, gateSeqOfLastUser, prevUserSeq, resolveGateSeq } from "../../lib/display-gate.mjs";
+import { gateIndex, gateSeqOfLastTurns, prevUserSeq, resolveGateSeq } from "../../lib/display-gate.mjs";
 import { FilePickerDialog, type PickedFile } from "./file-picker.js";
 import { TerminalPanel, termBus } from "./terminal.js";
 import { renderMarkdown } from "./markdown.js";
@@ -570,8 +570,10 @@ function EffortPill({ agent }: { agent: Agent }) {
 		setTick((t) => t + 1);
 	};
 	return (
-		<label class="pw-pill pw-pill-select">
-			<span class="pw-pill-label" aria-hidden="true">effort</span>
+		<label class="pw-pill pw-pill-select" title="Reasoning effort">
+			{/* user request 2026-10-28: the lamp instead of the word "effort" — the select
+			    keeps its aria-label, the label keeps a tooltip for what the glyph means */}
+			<span class="pw-pill-label" aria-hidden="true">💡</span>
 			<select
 				class="pw-pill-select-el"
 				value={level}
@@ -680,26 +682,60 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 	const stick = useRef(true);
 	const lastTop = useRef(0);
 	// DISPLAY BY USER TURN (user request 2026-10-24, tail-first sessions only):
-	// the view shows ONE conversational turn (from its user message down); the
-	// button reveals the previous turn — a pure VIEW change when the turn is
-	// already in memory, a /range fetch when it isn't. null = show everything
-	// (small sessions / full state frames — never gated). Only sparse (large)
-	// sessions get the gated view.
-	// SEQ SPACE (review 2026-10-25 #4): the gate is the SEQ of the last user turn,
+	// the view shows the last N conversational turns (from the first user message
+	// of that window down); the button reveals the previous turn — a pure VIEW
+	// change when the turn is already in memory, a /range fetch when it isn't.
+	// null = show everything (small sessions / full state frames — never gated).
+	// Only sparse (large) sessions get the gated view.
+	// N = `pi.turnWindow` (Settings → Composer → Turns visible, default 3; user request 2026-10-27 —
+	// it was hardcoded to ONE turn and, worse, applied to EVERY session: a null
+	// gate was resolved to "the last user turn", which gated small chats too and
+	// put the ⤒ button at the first message of a one-turn session).
+	// SEQ SPACE (review 2026-10-25 #4): the gate is the SEQ of a user turn,
 	// never an array index — fillWindow prepends older messages (and mutates the
 	// sparse envelope in place, so the "new envelope" trigger never fires again) and
 	// a fully-warm reopen attaches an EMPTY window where no index exists at all.
 	// Before this, the warm path rendered the whole filled window instead of one turn.
 	const [displayFromSeq, setDisplayFromSeq] = useState<number | null>(null);
 	const sparseSeen = useRef<any>(null);
-	// SYNC: a NEW sparse envelope (attach) gates the view to the LAST user turn;
+	// PROVISIONAL GATE: a sparse attach can carry an EMPTY window (the fully-warm
+	// reopen: the client fills the body from IDB afterwards). The only truthful gate
+	// at that instant is "the window starts at fromSeq" — which is NOT a user choice
+	// and must be re-anchored the moment the fill arrives, or the whole filled window
+	// renders (the very bug review #4 fixed). A gate computed on real messages is
+	// kept verbatim (it points at a user turn the user can see).
+	const gateProvisional = useRef(false);
+	const filledSeqRef = useRef(0);
+	const messagesRef = useRef<any[]>([]);
+	const [turnWindow, setTurnWindow] = useState<number>(() => turnsVisiblePref());
+	// settings change → live re-gate (the gate is recomputed from the LAST turn, so
+	// the user sees the effect immediately, even mid-conversation). Refs, not the
+	// render values: this listener outlives the render it was created in.
+	useEffect(() => {
+		const onPref = () => {
+			const n = turnsVisiblePref();
+			setTurnWindow(n);
+			if (sparseSeen.current) setDisplayFromSeq(gateSeqOfLastTurns(messagesRef.current, filledSeqRef.current, n));
+		};
+		window.addEventListener("pi-turn-window-changed", onPref);
+		return () => window.removeEventListener("pi-turn-window-changed", onPref);
+	}, []);
+	// SYNC: a NEW sparse envelope (attach) gates the view to the last N turns;
 	// full state frames / small chats (no sparse) clear the gate.
 	useEffect(() => {
 		const sp = (state as any).sparse;
 		if (sp && sp !== sparseSeen.current) {
 			sparseSeen.current = sp;
-			setDisplayFromSeq(gateSeqOfLastUser(state.messages, Number(sp.filledFrom ?? sp.fromSeq) || 0));
-		} else if (!sp && sparseSeen.current) { sparseSeen.current = null; setDisplayFromSeq(null); }
+			const base = Number(sp.filledFrom ?? sp.fromSeq) || 0;
+			gateProvisional.current = state.messages.length === 0;
+			setDisplayFromSeq(gateSeqOfLastTurns(state.messages, base, turnWindow));
+		} else if (!sp && sparseSeen.current) { sparseSeen.current = null; gateProvisional.current = false; setDisplayFromSeq(null); }
+		// the fill landed (IDB prefix or the attach's own window) → re-anchor the
+		// provisional gate to the last N turns of what is now loaded
+		if (gateProvisional.current && state.messages.length > 0) {
+			gateProvisional.current = false;
+			setDisplayFromSeq(gateSeqOfLastTurns(state.messages, Number((state as any).sparse?.filledFrom ?? (state as any).sparse?.fromSeq) || 0, turnWindow));
+		}
 	});
 	/** ⤒ reveal the PREVIOUS user turn: pure view change when it is already in
 	 *  memory (instant); a /range fetch (user-turn aligned server-side) when it
@@ -1046,11 +1082,20 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 	// derived PER RENDER from the gate seq (see the gate comment above) — the seq
 	// survives every prefix fill, the index never did
 	const filledSeq = Number((state as any).sparse?.filledFrom ?? (state as any).sparse?.fromSeq) || 0;
+	filledSeqRef.current = filledSeq;
+	messagesRef.current = state.messages;
 	// resolveGateSeq re-anchors the fallback an empty-window attach had to use (see
-	// lib/display-gate.mjs) — that is what makes a fully-warm reopen show ONE turn
-	// instead of the whole filled window.
-	const gateSeq = resolveGateSeq(displayFromSeq, filledSeq, state.messages);
+	// lib/display-gate.mjs) — that is what makes a fully-warm reopen show the last
+	// N turns instead of the whole filled window. A null gate stays null: small
+	// chats are never gated.
+	const gateSeq = resolveGateSeq(displayFromSeq, filledSeq, state.messages, turnWindow);
 	const displayFrom = gateIndex(gateSeq, filledSeq, state.messages.length);
+	// hidden = messages the loaded window is holding back; earlier = messages the
+	// server still has (not fetched yet) — the button is truthful about both.
+	const hiddenMsgs = (displayFrom || 0) + filledSeq;
+	// debuggable from the console (like __PI_PROVIDERS/__app): what the display gate
+	// decided this render — `__piGate.turnWindow` is the settings value in effect
+	(window as any).__piGate = { gateSeq, displayFrom, filledSeq, len: state.messages.length, turnWindow, provisional: gateProvisional.current };
 	const displayFromRef = useRef<number | null>(null);
 	displayFromRef.current = displayFrom;
 	// compact progress: server truth (state.compacting) drives the banner so ALL
@@ -1153,14 +1198,17 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 				   <button type="button" class="pw-continuation-open" onClick={() => { setContinuation(null); window.dispatchEvent(new CustomEvent("pi-open-session", { detail: continuation.id })); }}>open it</button>
 				  </div>
 				 )}
-					{(displayFrom != null && (displayFrom > 0 || ((state as any).sparse?.filledFrom ?? 0) > 0)) && (
+					{hiddenMsgs > 0 && (
 					<div class="pw-expand">
 						<button
 							type="button"
 							class="pw-expand-btn"
+							title={displayFrom && filledSeq ? "reveals the previous turn — in memory when it is loaded, fetched from the server when it is not" : filledSeq ? "fetches the previous turn from the server" : "reveals the previous turn from memory"}
 							onClick={() => { void expandTurns(); }}
 						>
-							⤒ Load earlier turns{gateSeq ? ` (${gateSeq} msgs hidden)` : ""}
+							⤒ Load earlier turns
+							{displayFrom || 0 ? ` · ${displayFrom} in view hidden` : ""}
+							{filledSeq > 0 ? ` · ${filledSeq} not loaded` : ""}
 						</button>
 					</div>
 					)}
@@ -1312,6 +1360,25 @@ export const enterSendsPref = (): EnterSendsPref => {
 	} catch { /* private mode */ }
 	return "auto";
 };
+// TURNS VISIBLE (user request 2026-10-27): how many conversational turns a
+// sparse (large, tail-first) session shows before "⤒ Load earlier turns" has to
+// be used. Default 3. Only the sparse view is gated — small sessions always
+// render in full, so this is a VIEW preference, never a data change.
+export const TURNS_VISIBLE_DEFAULT = 3;
+export const turnsVisiblePref = (): number => {
+	try {
+		const v = Number(localStorage.getItem("pi.turnWindow"));
+		if (Number.isFinite(v) && v >= 1) return Math.min(20, Math.floor(v));
+	} catch { /* private mode */ }
+	return TURNS_VISIBLE_DEFAULT;
+};
+export const setTurnsVisible = (n: number): number => {
+	const v = Math.max(1, Math.min(20, Math.floor(Number(n) || TURNS_VISIBLE_DEFAULT)));
+	try { localStorage.setItem("pi.turnWindow", String(v)); } catch { /* quota */ }
+	window.dispatchEvent(new CustomEvent("pi-turn-window-changed", { detail: v }));
+	return v;
+};
+
 const computeEnterSends = (pref: EnterSendsPref) => {
 	if (pref === "always") return true;
 	if (pref === "never") return false;

@@ -43,7 +43,8 @@ import { Agent } from "@earendil-works/pi-agent-core";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 // pi-ai 1.4.0 builtin catalog — the no-.pi fallback for the model list (5.6KB
 // aggregation module; the per-provider model data loads alongside it)
-import { getBuiltinProviders, getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
+import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
+import { buildProviderCatalog, clientProviders, resolvedKeys } from "./lib/pi-catalog.mjs";
 import { AgentHub } from "./agent-hub.mjs";
 import { createTerminalHub } from "./terminal-hub.mjs";
 // per-connection stream reduction (plan §2.3): OFF unless the client opts in with
@@ -115,47 +116,66 @@ function readJsonSafe(file) {
 	catch { return null; }
 }
 
+/** JSONC-LITE read for the files a USER hand-edits. `models.json` is documented as a
+ *  user-authored file, so a trailing comma or a // comment must not take the whole
+ *  provider catalog down (a real file in the wild had both). */
+function readJsonTolerant(file) {
+	let raw = null;
+	try { raw = fs.readFileSync(path.join(PI_DIR, file), "utf8"); } catch { return null; }
+	try { return JSON.parse(raw); } catch { /* try JSONC-lite */ }
+	try {
+		const stripped = raw
+			.replace(/\/\*[\s\S]*?\*\//g, "")                       // block comments
+			.replace(/(^|[^:"'\\])\/\/[^\n\r]*/g, "$1")            // line comments (not the // in https://)
+			.replace(/,\s*([}\]])/g, "$1");                         // trailing commas
+		const parsed = JSON.parse(stripped);
+		console.warn(`[pi-web] ${file} needed a tolerant parse (comments/trailing commas) — pi itself may reject it`);
+		return parsed;
+	} catch (err) {
+		console.error(`[pi-web] ${file} is not parsable JSON:`, err?.message || err);
+		return null;
+	}
+}
+
+/** pi-ai builtin catalog lookup (never throws — one broken provider must not kill the list). */
+function builtinModelsOf(name) {
+	try { return getBuiltinModels(name) || []; } catch { return []; }
+}
+
+/** The merged catalog (lib/pi-catalog.mjs): builtin catalog ∪ models-store.json ∪
+ *  `.pi/models.json` (user-added providers/models) ∪ auth.json (a provider you logged
+ *  into). Rebuilt on every `piModelsStore` refresh and on every /api/pi/config call, so
+ *  editing models.json shows up in the picker WITHOUT a server restart. */
+function buildCatalog() {
+	return buildProviderCatalog({
+		store: readJsonSafe("models-store.json") || {},
+		modelsJson: readJsonTolerant("models.json") || {},
+		auth: readJsonSafe("auth.json") || {},
+		builtinModels: builtinModelsOf,
+		env: process.env,
+	});
+}
+
 function piConfig() {
-	const store = readJsonSafe("models-store.json") || {};
 	const settings = readJsonSafe("settings.json") || {};
-	const providers = [];
-	for (const [name, entry] of Object.entries(store)) {
-		const models = Array.isArray(entry?.models) ? entry.models : [];
-		if (models.length === 0) continue;
-		providers.push({ name, baseUrl: models.find((m) => m.baseUrl)?.baseUrl || "", models });
-	}
-	// CATALOG FALLBACK (user request 2026-10-24): a deploy without .pi (no
-	// models-store.json, or one with no providers) used to boot with ZERO models —
-	// an empty picker that could never chat. pi-ai 1.4.0 ships a maintained builtin
-	// catalog (providers/all — 42 providers, records in exactly the models-store
-	// shape), so seed from it. Options considered: (2) REST GET {baseUrl}/models
-	// discovery — needs a key + network and returns bare ids without metadata
-	// (context window, reasoning flags) — rejected; (3) a backup-model-store.json
-	// in the repo — static, goes stale, duplicates upstream data — rejected. The
-	// builtin catalog is upstream-maintained, offline and key-free. Store entries
-	// ALWAYS win when present: they may carry custom ids/baseUrls the catalog lacks.
-	let catalogFallback = false;
-	if (providers.length === 0) {
-		try {
-			for (const name of getBuiltinProviders()) {
-				const models = getBuiltinModels(name);
-				if (models.length === 0) continue;
-				providers.push({ name, baseUrl: models.find((m) => m.baseUrl)?.baseUrl || "", models });
-			}
-			catalogFallback = providers.length > 0;
-		} catch (err) {
-			console.error("[pi-web] builtin model catalog unavailable:", err?.message || err);
-		}
-	}
+	const providers = clientProviders(piModelsStore);
+	const origins = [...new Set(providers.map((p) => p.origin))];
 	return {
 		providers,
-		modelSource: providers.length === 0 ? "none" : catalogFallback ? "builtin-catalog" : "models-store",
+		modelSource: providers.length === 0 ? "none" : origins.length === 1 ? origins[0] : origins.join("+"),
 		defaults: {
 			provider: settings.default_provider || settings.defaultProvider || undefined,
 			model: settings.default_model || settings.defaultModel || undefined,
 			thinkingLevel: settings.defaultThinkingLevel || undefined,
 		},
 	};
+}
+
+/** Provider credential for a server-side run (auth.json wins, then models.json, then the
+ *  keyless placeholder) — the SAME map the hub and the summarizer use, so what the picker
+ *  offers is what actually resolves. */
+function providerKeyMap() {
+	return resolvedKeys(piModelsStore, readJsonSafe("auth.json") || {});
 }
 
 // --- auth: auto-generated token for non-loopback access ----------------------
@@ -1505,20 +1525,19 @@ app.get("/api/pi/keys", (c) => {
 	if (!tokenMatches(c.env?.incoming)) {
 		return c.json({ error: "unauthorized — /api/pi/keys needs x-pi-web-token (see data/auth-token.txt)" }, 401);
 	}
-	const auth = readJsonSafe("auth.json") || {};
-	const out = {};
-	for (const [p, e] of Object.entries(auth)) { const k = typeof e === "string" ? e : e?.key; if (k) out[p] = k; }
-	return c.json({ keys: out });
+	return c.json({ keys: providerKeyMap() });
 });
 app.post("/api/pi/key", async (c) => {
 	if (TOKEN) { const t = c.req.header("x-pi-web-token"); if (t !== TOKEN) return c.json({ error: "unauthorized" }, 401); }
 	const body = await c.req.json().catch(() => ({}));
 	const provider = String(body?.provider || "");
 	if (!provider) return c.json({ error: "provider required" }, 400);
-	const auth = readJsonSafe("auth.json");
-	const key = typeof auth?.[provider] === "string" ? auth[provider] : auth?.[provider]?.key;
+	// auth.json → .pi/models.json → keyless placeholder. A provider declared in
+	// models.json with `apiKey: "none"` (or none at all) resolves here too, so the
+	// in-browser path never prompts for a credential the endpoint does not need.
+	const key = providerKeyMap()[provider];
 	if (!key) return c.json({ error: `no key for "${provider}"` }, 404);
-	return c.json({ provider, key });
+	return c.json({ provider, key, keyless: piModelsStore[provider]?.keyless || undefined });
 });
 app.get("/api/debug/state", (c) => {
 	const origin = c.req.header("origin");
@@ -1932,27 +1951,23 @@ function storeOp(op, payload = {}) {
 }
 
 // --- agent hub (server-side agents) -------------------------------------------
+// piModelsStore = name -> {name, baseUrl, api, models, apiKey, keyless, origin}. It is
+// BOTH the picker's source (clientProviders → /api/pi/config) and the HUB's resolver
+// (`_getModel` walks .models), built by lib/pi-catalog.mjs from the builtin catalog +
+// models-store.json + .pi/models.json + auth.json (see buildCatalog above). The hub
+// holds this object BY REFERENCE, so refreshModelsStore() reaches it and the server
+// picks up an edited models.json without a restart.
 let piModelsStore = {};
-// CATALOG FALLBACK for the HUB too: _getModel iterates modelsStore[provider].models,
-// so a missing .pi would leave even the /api/pi/config fallback powerless (the picker
-// would list models the hub refuses to run). Same precedence: store entries win.
-function builtinModelsStore() {
-	try {
-		const out = {};
-		for (const name of getBuiltinProviders()) {
-			const models = getBuiltinModels(name);
-			if (models.length === 0) continue;
-			out[name] = { name, models };
-		}
-		return out;
-	} catch (err) {
-		console.error("[pi-web] builtin model catalog unavailable:", err?.message || err);
-		return {};
-	}
-}
+// the hub holds the catalog by reference (`agentHub.modelsStore`); a refresh swaps
+// the object ATOMICALLY (one assignment) so a run that reads it mid-refresh can never
+// see a half-built map (refreshModelsStore also runs on every GET /api/pi/config).
+let hubRef = null;
 function refreshModelsStore() {
-	try { const j = readJsonSafe("models-store.json"); if (j && typeof j === "object" && Object.keys(j).length > 0) piModelsStore = j; } catch {}
-	if (Object.keys(piModelsStore).length === 0) piModelsStore = builtinModelsStore();
+	const next = buildCatalog().providers;
+	piModelsStore = next;
+	if (hubRef) hubRef.modelsStore = next;
+	dlog("[pi] catalog:", Object.entries(next).map(([n, p]) => `${n}(${p.models.length}${p.keyless ? ",keyless" : ""})`).join(" "));
+	return next;
 }
 refreshModelsStore();
 
@@ -1986,7 +2001,7 @@ const DR_DEBUG = process.env.PI_WEB_DATA_REDUCTION_DEBUG === "1";
 
 const agentHub = new AgentHub({
 	modelsStore: piModelsStore,
-	getAuth: () => readJsonSafe("auth.json") || {},
+	getAuth: () => providerKeyMap(),
 	persist: async (id, jsonl) => { await storeOp("put", { id, jsonl }); broadcastSessions().catch(() => {}); },
 	// THE delivery boundary: the only place in the app that is per-CONNECTION, which is why stream
 	// reduction (plan §2.3) lives here. A socket that never opted in keeps `__reducer.enabled ===
@@ -2041,7 +2056,7 @@ const agentHub = new AgentHub({
 				messages: [{ role: "user", content: [{ type: "text", text: buildSummarizationPrompt(serialized, previousSummary) }] }],
 				tools: [],
 			},
-			getApiKey: async (p) => { const auth = readJsonSafe("auth.json") || {}; const e = auth[p]; return typeof e === "string" ? e : e?.key; },
+			getApiKey: async (p) => providerKeyMap()[p] || undefined,
 		});
 		if (signal) { try { signal.addEventListener("abort", () => summaryAgent.abort(), { once: true }); } catch { /* noop */ } }
 		await summaryAgent.prompt("Produce the structured summary now.");
@@ -2075,6 +2090,7 @@ const agentHub = new AgentHub({
 	defaultModelId: piDefaultModelId(),
 	onRuntimeChange: (sessionId, rt) => sendRuntime(sessionId, rt), // runtime deltas → tiny frame to ALL devices, bypasses all caches/throttles (fable5)
 });
+hubRef = agentHub; // catalog refreshes (GET /api/pi/config) swap the map in place here
 
 // MEDIA GC at boot (review report.md M3, 2026-10-27): the disk store had no way back down. Age-based,
 // logged, and off with PI_WEB_MEDIA_TTL_DAYS=0. The bytes are content-addressed, so a purged blob can
