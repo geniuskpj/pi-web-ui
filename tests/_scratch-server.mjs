@@ -12,7 +12,9 @@ import { fileURLToPath } from "node:url";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(HERE, "..");
 
-export async function startScratchServer({ port = 9100 + Math.floor(Math.random() * 500), workspaceDir, piDir } = {}) {
+/** `env` adds/overrides server env vars for this instance (e.g. { PI_WEB_WS_DEFLATE: "off" }
+ *  in tests/ws-deflate.test.mjs) — everything else stays the shared hermetic baseline. */
+export async function startScratchServer({ port = 9100 + Math.floor(Math.random() * 500), workspaceDir, piDir, env = {} } = {}) {
 	const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-test-"));
 	const wsDir = workspaceDir || fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-ws-"));
 	const proc = spawn(process.execPath, [path.join(ROOT, "server.mjs")], {
@@ -24,6 +26,7 @@ export async function startScratchServer({ port = 9100 + Math.floor(Math.random(
 			PI_WS: wsDir,
 			...(piDir ? { PI_DIR: piDir } : {}),
 			PI_WEB_TERM_BRIDGE: "pipes", // no pty provisioning from tests
+			...env,
 		},
 		stdio: ["ignore", "pipe", "pipe"],
 	});

@@ -36,6 +36,15 @@ native Node package; pipes remain the fallback if `script` is absent.
 2. Preserve the ONLCR translation and process-group cleanup for Linux children.
 3. Verify the smoke test confirms `test -t 0` inside Bash when `script` exists,
    and continues to cover the Windows bridge's PTY behavior separately.
+## Alternative considered (not used): node-pty backend
+1. Add `node-pty` as an **optionalDependency** (native build; `--no-optional`
+   installs must keep the server bootable — dynamic `import()` behind try/catch,
+   fall back to the pipes tier with a loud log, mirroring today's tier fallback).
+2. Map backend events: `onData` → stripWs path unchanged; `resize(cols, rows)` →
+   SIGWINCH via `pty.resize`; exit codes → the same recovery logic.
+3. Client contract check: the emulator is platform-neutral (vendor-wterm); verify
+   the ONLCR row in term-smoke gains a Linux expectation (`\n`-only output must
+   NOT staircase — the pty's ONLCR handles it, same as msys).
 
 ## Phase 3 — Exec bridge + paths
 1. `builtinTools` bash: `BASH_PATH` per-OS (`/bin/bash`), `shell: true` semantics
@@ -59,6 +68,25 @@ native Node package; pipes remain the fallback if `script` is absent.
 - macOS as a *supported* target (the pipes path may work but is untested).
 - Replacing the msys bridge on Windows (it works; winpty's ConPTY/headless
   limitations are documented in `terminal-hub.mjs`).
+## Alternative node-pty rollout proposal (not implemented)
+1. term-smoke gains a Linux row (ubuntu runner has bash + can `apt-get` util-linux
+   `script` — or use node-pty): add `if (process.platform === 'win32')` gates in
+   reverse (skip only the Windows bridge rows).
+2. CI matrix: run term-smoke on ubuntu with the node-pty backend; keep windows
+   rows on the bridge.
+3. Regression suite: `tests/term-platform.test.mjs` — backend selection, shell
+   discovery, kill semantics (per-platform rows).
+
+## Phase 5 — Docs + rollout
+1. README: "Runs on Windows (winpty bridge) and Linux (node-pty)" + the optional
+   dependency note (`apt install build-essential python3` if no prebuilt binary).
+2. Rollout order: Phase 1 (pure refactor, green on Windows) → Phase 2 behind
+   `PI_WEB_TERM_BACKEND=node-pty` opt-in → default-on for Linux after a week.
+
+## Non-goals
+- macOS as a *supported* target (it rides the node-pty backend but is untested).
+- Replacing the msys bridge on Windows (it works; node-pty-on-Windows reintroduces
+  the ConPTY/headless problems documented at terminal-hub.mjs:19-26).
 
 ## Test checklist (each phase must keep green)
 `npm run typecheck` · `npm test` (term-smoke, Windows) · new

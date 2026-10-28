@@ -1,6 +1,6 @@
 # Client — main.tsx, chat.tsx, storage, sync, connectivity
 
-> Updated 2026-10-21 · See also: [architecture.md](architecture.md) (data flows, trust model) ·
+> Updated 2026-10-27 · See also: [architecture.md](architecture.md) (data flows, trust model) ·
 [server.md](server.md) (exec bridge, /ws/sync hub) · [terminal.md](terminal.md) (command bridge consumer)
 
 Covers `src/main.tsx`, `src/ui/chat.tsx`, `src/storage.ts`, `src/local-storage-backend.js`,
@@ -70,6 +70,18 @@ Covers `src/main.tsx`, `src/ui/chat.tsx`, `src/storage.ts`, `src/local-storage-b
   re-stick and rubber-band during fast streams); re-stick near bottom (<10px).
 - 401 flow: on `agent_end` → `waitForIdle()` → inspect ONLY the last assistant message →
   `looksLikeAuthError` (401/403/invalid-key regex) → prompt → store via providerKeys.
+- **Display by user turn (2026-10-27, `lib/display-gate.mjs` + `pi.turnWindow`):** the gate hides the
+  messages BEFORE the N-th newest user turn, N = Settings → Composer → *Turns visible* (`localStorage
+  pi.turnWindow`, default 3, `turnsVisiblePref()`/`setTurnsVisible()` in `chat.tsx` — the setter
+  dispatches `pi-turn-window-changed`, ChatView re-gates live from the LAST turn). The gate is a SEQ
+  (`gateSeqOfLastTurns`), so a prefix fill cannot invalidate it; `resolveGateSeq(gate, filledFrom,
+  msgs, turns)` re-anchors only a gate that points OUTSIDE the loaded window. **A null gate stays null**
+  — small sessions (no `sparse` envelope) and full state frames render EVERYTHING. Two user-reported
+  bugs came from the opposite rule: `resolveGateSeq(null, …)` used to mean “the last user turn”, so
+  every chat was gated (a one-turn session showed a ⤒ button that hid only its system message) and the
+  gated view was hardcoded to ONE turn. ⤒ reveals one more turn per click (`prevUserSeq`, from memory
+  when loaded, `/range` when not); the button appears only when something is really hidden and reports
+  `displayFrom` (in view) and `filledFrom` (not loaded) separately. Test: `npm run test:gate`.
 - Retry (2026-10-23): the button delegates to the HUB (`agent.retry()` → `{type:"retry"}` →
   `{type:"retried"}` ack; the run streams as normal agent events). The hub drops the 429/error message
   and calls `agent.continue()`, so the failed model call is re-issued against the SAME transcript: the
@@ -91,6 +103,129 @@ Covers `src/main.tsx`, `src/ui/chat.tsx`, `src/storage.ts`, `src/local-storage-b
   attachments.
 - Usage bar: last-call context % (prefers `usage.totalTokens`, else the 4-way sum; labeled "last-call"
   because provider usage shapes differ) + session totals ↑↓$.
+
+## Model selector (`ui/model-selector.tsx`)
+
+Reads `window.__PI_PROVIDERS` (pi-import.ts, `pi.modelsCache`) — the SERVER's merged catalog
+(`lib/pi-catalog.mjs`; see [server.md](server.md) §Provider catalog), which now includes providers added
+in `.pi/models.json` and providers that only exist in `auth.json`. Every OPEN re-fetches
+`/api/pi/config` (async, `cfgTick` bumps the memo) so a hand-edited models.json is visible without a
+reload, and the group header appends `· custom` (origin `models.json`) / `· no key` (keyless provider).
+
+## Data use: the image pipeline (2026-10-25 — model + wiring contract)
+
+**THE MODEL (user design, 2026-10-25):** the browser ENCODES every image (resize + webp/jpeg); only
+the encoded bytes are ever stored, as **binary** — never the raw original, never base64. The server
+keeps those bytes in the content-addressed media store (`data/media/<hash[0..1]>/<hash>`, disk-backed
+so a restart keeps them) and produces **base64 only when the LLM request is built**
+(`hydrateImageData`, at the one place a provider is called). Fetching a preview needs no decoding in JS:
+`<img src="/api/agent/session/:id/media/:hash">` and the browser decompresses any `Content-Encoding`.
+
+Two routes carry it: **`POST /api/agent/session/:id/media`** (body = the encoded image, `Content-Type`
+= its mime → `{hash, mimeType, bytes, encodings}`) and **`GET …/media/:hash`** (binary out; br/gz only
+when a stored variant pays — measured 0% for image formats, see
+`tests/image-compression.test.mjs`). The transcript then carries `{type:"image", mimeType, hash, bytes}`
+and a warm attach costs hashes instead of megabytes.
+
+**Retention (Settings → Data use → *Image storage*, `pi.imageRetention`):** *server* is the DEFAULT — the
+encoded bytes are persisted in the disk store, so any device can render them and a retry/fork/re-run
+still reaches them. *browser* keeps the bytes on the device: the upload then carries
+`x-pi-media-retention: browser`, the server stores them **in memory only** (`persist: false`) and forgets
+them on restart, and the browser is the source of truth (it must re-upload when the server needs an old
+image again). Both modes are one header apart, so switching later costs nothing.
+
+**No gz/br for images** (user decision 2026-10-25): measured ~0% on webp/jpeg/PNG (a brotli pass is even a
+few bytes bigger), so neither the store nor the media route compresses anything — one artefact, the
+encoded binary. The JSON/NDJSON paths keep their generic >2KB gzip gate, which is what pays when a legacy
+session still carries base64.
+
+### The client hop (LIVE since 2026-10-27)
+
+`ProxyAgent.setDataReduction(cfg)` exists, and the ATTACH handler re-pushes the stored levels on every
+(re)attach (next to `pushAutoRetrySetting`), because the hub's config is PER CONNECTION — a reload used to
+drop it and the whole feature read as "the setting does nothing" (report.md B1). Hub `note` frames now
+reach the composer chip through `agent.onNote`, and they no longer settle a pending prompt/steer reply
+(M1). The recalled images of ✎-edit AND Stop are hydrated before they go back into the composer (L1).
+
+**Latency (2026-10-27):** the visible cost of coalescing is the FIRST chunk, not the total. Every preset
+therefore carries `firstBytes` (thinking 64B, answer 32B, tool 512B): the first chunk of a block is
+released immediately (like live streaming), everything after it is coalesced, and the idle rule + the
+hard ceiling are driven by a per-socket 250ms tick on the server (`stream-reduce.mjs` `tick()`), so a
+slow provider can no longer leave held text invisible past the ceiling (report.md H2). Measured: the
+first text of a reasoning block now arrives +0.08s after the live baseline (was +1.6s), with the worst
+chunk still bounded at 1.6s.
+
+### What is still to wire (`src/ui/chat.tsx`)
+
+Settings → **Data use** stores two LEVELS and prints their resolved parameters:
+`pi.imageLevel` (`auto` · `high` · `medium` · `low` · `none`) and `pi.thinkingLevel`
+(`auto` · `paragraph` · `turnEnd` · `none`), plus advanced overrides (`pi.imageMaxEdge`,
+`pi.imageMinEdge`, `pi.imageMaxBytes`, `pi.imageQuality`, `pi.textLevel`, `pi.toolLevel`). All keys live in
+`src/ui/data-settings.ts` (the `pi.autoRetry` pattern: read on render, written on change, pushed to the
+hub through the optional `agent.setDataReduction()`).
+
+Every DECISION is pure and tested (`lib/data-reduction.mjs` → `resolveDataReduction()` /
+`planImageTransform()` / `planResizeTarget()`; `lib/thinking-flush.mjs` → `resolveThinkingPolicy()` /
+`resolveStreamPolicy()`; pinned by `tests/data-reduction.test.mjs` and `tests/thinking-flush.test.mjs`).
+The IMAGE half is enforced in the composer — **not wired yet**, and this is the contract for it.
+
+### Where the bytes are born (`src/ui/chat.tsx`)
+
+| step | code (names are the anchors — line numbers drift) | today | after wiring |
+|---|---|---|---|
+| file/folder picker | `addPicked(f)` — `GET /api/ws/file?path=…` returns `{kind:"image", base64, mimeType}` (8MB cap, token always required; `src/ui/file-picker.tsx` fetches it) | pushes `{name, data, mimeType, preview}` (base64) into `images` | `base64 → Blob → encodeForModel()` → `POST …/media` → push `{hash, mimeType, bytes, previewUrl}` |
+| clipboard paste | `onAddImage(name, data, mimeType)` (Editor paste handler, data URL) | same shape | decode the data URL to a Blob → the same path |
+| steer/stop recall | `onAddImage(...)` from the recalled `pendingPrompt.images` | inline base64 re-attached | hash parts → `media.ts` hydration (`hydrateImageParts`) |
+| restored message attachments | `onRestoreAttachments(files, imgs)` (edit/regenerate an old turn) | inline base64 from the transcript | hydration only — **never re-encode** |
+| chip render | `<img src={im.preview}>` | `preview` = full `data:` URL (a second copy of the base64 in memory) | `URL.createObjectURL(encodedBlob)` (revoked on remove/clear) or the media URL |
+| pre-send guard | `imageBytes > 12MB → note(...)` | sums `data.length * 0.75` | the encoded size returned by the POST — should never fire |
+| send | `images.map((im) => ({ type: "image", data, mimeType }))` → `agent.prompt(text, imgs)` | base64 in the frame | `{type:"image", mimeType, hash, bytes}` — no base64 up, none in the session file |
+
+The composer still sends inline base64 today; the server redacts it on egress (attach/`/range`/history)
+and stores the bytes. Wiring the composer is the step that removes the LAST base64 from the upload path.
+
+### The one function to add (`src/image-encode.ts`)
+
+```ts
+// pure decision (tested) + browser bytes (not testable in CI)
+export async function encodeForModel(file: Blob & { name?: string }, policy = resolvedImagePolicy()) {
+  const plan = planImageTransform({ mimeType: file.type, bytes: file.size, width: 0, height: 0 }, policy);
+  if (plan.action === "passthrough") return { blob: file, mimeType: file.type, note: plan.reason, resized: false };
+  // ✔ downscale AT DECODE: 12MP is never fully materialized (the low-end-iOS OOM trap)
+  const bmp = await createImageBitmap(file, {
+    imageOrientation: "from-image",                       // EXIF is applied for us
+    resizeWidth: plan.target.width, resizeHeight: plan.target.height, resizeQuality: "high",
+  }).catch(() => null);
+  if (!bmp) return { blob: file, mimeType: file.type, note: "couldn't recompress — sending original", resized: false };
+  const canvas = typeof OffscreenCanvas === "function"
+    ? new OffscreenCanvas(bmp.width, bmp.height)
+    : Object.assign(document.createElement("canvas"), { width: bmp.width, height: bmp.height });
+  canvas.getContext("2d").drawImage(bmp, 0, 0); bmp.close?.();   // one scale factor, both axes
+  const blob = await toBlobWebpThenJpeg(canvas, plan.quality);    // OffscreenCanvas.convertToBlob | canvas.toBlob
+  if (!blob || blob.size >= file.size) return { blob: file, mimeType: file.type, note: null, resized: false };
+  return { blob, mimeType: blob.type, note: `${plan.reason} → ${plan.target.width}×${plan.target.height}`, resized: true };
+}
+```
+
+Then `blob → base64` (FileReader/`arrayBuffer()`) **once**, and the four add/restore call sites above pass
+through it.
+
+Notes worth keeping:
+
+1. **Never re-encode an attachment that came from a transcript** (restore, steer recall, stop recall): the
+   model already saw those exact bytes; a retry must resend the same image, not a re-compressed one.
+2. **The 4-image cap is applied after the plan** (`MAX_IMAGE_ATTACH`): a file that passes through
+   (HEIC/exotic) still counts as one, but a file the plan drops must not consume a slot.
+3. `imageLevel: "none"` means **do not decode at all** — zero cost, original bytes (the escape hatch).
+4. Passthrough is **never silent**: `note(plan.reason)` puts it in the composer's attach note
+   (HEIC on Chrome, SVG/GIF, tool screenshots, undecodable).
+5. EXIF: `createImageBitmap` returns *oriented* dimensions, so pass the bitmap's dims + `orientation: 1`
+   to `planImageTransform`; if you plan from metadata read before decoding, pass the raw dims + the EXIF
+   orientation (the pure layer swaps the axes for 5–8).
+6. Alpha: WebP keeps it, JPEG flattens onto white — that is why JPEG is only the runtime fallback
+   (Safari / old Chrome return a non-webp blob).
+7. Encode **on add**, not on send (≤4 images, bounded work; the send stays instant) and revoke the object
+   URL on remove/clear so the preview cannot leak memory.
 
 ## Storage (`storage.ts` + `local-storage-backend.js`)
 

@@ -7,8 +7,23 @@
 type Listener = (event: any) => void;
 type AnyRecord = Record<string, any>;
 import { makeId } from "./id.js";
+import { getCachedChunks, putChunk, gunzip, transferPolicy, cachedRanges, intervalDiff, sweepStale, planLiveChunk, toNdjson, gzipText, verifyChunkText } from "./idb-cache.js";
+import { planCachedSplice } from "../lib/chunk-splice.mjs";
+// data-reduction levels live in localStorage (Settings → Data use); the agent is what tells the hub
+import { pushDataReduction } from "./ui/data-settings.js";
+// LIVE WRITE-THROUGH (C2): how long a quiet tail may sit in memory before it is
+// written to IDB. Every flush is one gzip of <CHUNK_INTERVAL messages.
+const LIVE_IDLE_MS = 5000;
+const LIVE_DEBUG = typeof location !== "undefined" && location.search.includes("live-cache-debug");
+// BACKFILL step in MESSAGES (filledFrom is a seq, not bytes): generous ask —
+// the server clamps the response to 1MB serialized (~140 msgs on the 7.3MB
+// session) and reports the actual window in X-Range-* headers.
+const BACKFILL_MSGS = 400;
 
 export class ProxyAgent {
+    /** Informational frames from the hub (e.g. "an image is no longer on the server") — the UI
+     *  surfaces them through the composer's note chip. Set by chat.tsx. */
+    onNote?: (message: string) => void;
 	/** true = the loop runs server-side (agent-hub.mjs): runs survive browser
 	 *  closes; the browser stores no API keys (getApiKey is absent by design). */
 	readonly serverSide = true;
@@ -42,6 +57,16 @@ export class ProxyAgent {
 	constructor(sessionId: string, initialModel?: any) {
 		this.sessionId = sessionId || makeId(); // randomUUID is secure-context-only
 		if (initialModel) this.state.model = initialModel;
+		// IDB GC (v2): generations are never erased on rewrite — they are collected
+		// here, by date: a tab coming back to the foreground is the natural moment
+		// (page reload is the other one, via the attach sweep below).
+		if (typeof window !== "undefined") {
+			window.addEventListener("visibilitychange", () => {
+				if (!document.hidden) void sweepStale();
+				else this.liveFlush("hidden"); // C2: best-effort tail write on the way out
+			});
+			window.addEventListener("pagehide", () => this.liveFlush("hidden"));
+		}
 	}
 
 	connect() {
@@ -76,9 +101,16 @@ export class ProxyAgent {
 				if (gen !== this.generation || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 				// attach carries the client's chosen model/effort so a FRESH server
 				// session runs what the UI shows (grok r3: model desync)
-				this.sendMsg({ type: "attach", sessionId: this.sessionId, modelId: this.state.model?.id, thinkingLevel: this.state.thinkingLevel });
-				const cbs = this.readyCallbacks.splice(0);
-				cbs.forEach((cb) => cb(this.attached));
+				// C4: tell the server how far our IDB cache reaches so it does not re-send
+				// those messages (the prefix is filled from the cache right after the snapshot).
+				void (async () => {
+					const sid = this.sessionId;
+					const haveTo = await this.cachedCoverTo();
+					if (gen !== this.generation || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+					this.sendMsg({ type: "attach", sessionId: sid, modelId: this.state.model?.id, thinkingLevel: this.state.thinkingLevel, tailFirst: true, haveTo });
+					const cbs = this.readyCallbacks.splice(0);
+					cbs.forEach((cb) => cb(this.attached));
+				})();
 			}, 50);
 		};
 		sock.onmessage = (e) => {
@@ -120,7 +152,42 @@ export class ProxyAgent {
 			// retry policy lives client-side (Settings → Retry): re-push on every attach
 			// so a hub restart/reconnect picks it up
 			this.pushAutoRetrySetting();
-			this.state.messages = [...(msg.messages || [])];
+			// data-reduction levels (Settings → Data use) are PER CONNECTION on the hub, so they must
+			// be re-pushed on every (re)attach — otherwise a reload silently drops them and the whole
+			// feature is inert (review report.md B1, 2026-10-27).
+			pushDataReduction(this);
+			// TAIL-FIRST STATE (2026-10-24): a sparse attach delivers the last ~512KB +
+			// an envelope {fromSeq, messageCount}. CRITICAL (live crash 1f725ee): keep
+			// state.messages DENSE — exactly the loaded window, no null holes. Nulls
+			// leaked into chat.tsx iterators ([agent] listener TypeError m.role) — this
+			// app assumes a dense message array in a dozen places. The window position
+			// lives in state.sparse (filledFrom); editCommit indices get translated by
+			// +fromSeq at the single call site (saveEdit). Backfill PREPENDS older wins.
+			const sparse = (msg as any).sparse as { fromSeq: number; messageCount: number; rewriteSeq: number } | undefined;
+			if (sparse && Array.isArray(msg.messages)) {
+				// C2: the buffer from the previous window belongs to the same generation,
+				// so write it before the window is replaced; then seed with THIS attach
+				// tail (the bytes every open would otherwise re-download).
+				this.liveFlush("hidden");
+				// C4: the server may have skipped [fromSeq, sentFrom) because we reported it
+				// cached — so the DENSE window we actually hold starts at sentFrom, and the
+				// envelope's fromSeq is where the full window would have started.
+				const sentFrom = Number((sparse as any).sentFrom ?? sparse.fromSeq);
+				this.state.messages = [...(msg.messages || [])];
+				(this.state as any).sparse = { ...sparse, filledFrom: sentFrom };
+				// v2 GC: attaching at generation N proves every older generation of this
+				// session is stale — collect those past the grace period (never a wipe).
+				void sweepStale({ sessionId: this.sessionId });
+				this.liveSeed(sentFrom, msg.messages || [], Number((sparse as any).rewriteSeq ?? 0));
+				// Fill the skipped prefix: IDB first (it is why we skipped), /range on a miss
+				// (fillWindow does both, and refuses to splice across a rewrite/switch).
+				if (sentFrom > sparse.fromSeq) void this.fillWindow(sparse.fromSeq, sentFrom);
+				void this.scheduleBackfill(sparse);
+			} else {
+				this.liveFlush("hidden");
+				this.state.messages = [...(msg.messages || [])];
+				(this.state as any).sparse = null;
+			}
 			this.state.model = msg.model;
 			this.state.thinkingLevel = msg.thinkingLevel || "high";
 			this.state.isStreaming = !!msg.isStreaming;
@@ -143,6 +210,13 @@ export class ProxyAgent {
 			// pending chip delta — queued / consumed at a turn boundary / cancelled
 			this.pendingPrompt = msg.pending ?? null;
 			this.notifyListeners({ type: "steering", pending: this.pendingPrompt });
+			return;
+		}
+		// A NOTE is informational and correlates by the request id it was triggered by — it must never
+		// settle a pending reply, or a steer's accepted/rejected answer would be swallowed and the
+		// not-accepted draft silently lost (review report.md M1, 2026-10-27).
+		if (msg.type === "note") {
+			try { this.onNote?.(String(msg.note || "")); } catch { /* listener error */ }
 			return;
 		}
 		// generic correlated reply: accepted / forked / rewritten (any frame with an
@@ -177,6 +251,7 @@ export class ProxyAgent {
 			case "message_end":
 				this.state.streamingMessage = undefined;
 				this.state.messages.push(ev.message);
+				this.liveCapture(ev.message); // C2: buffer the tail for IDB (no request)
 				break;
 			case "tool_execution_start": {
 				const p = new Set(this.state.pendingToolCalls); p.add(ev.toolCallId); this.state.pendingToolCalls = p; break;
@@ -188,9 +263,98 @@ export class ProxyAgent {
 				if (ev.message?.role === "assistant" && ev.message?.errorMessage) this.state.errorMessage = ev.message.errorMessage;
 				break;
 			case "agent_start": this.state.isStreaming = true; this.state.errorMessage = undefined; break;
-			case "agent_end": this.state.isStreaming = false; this.state.streamingMessage = undefined; break;
+			case "agent_end":
+				this.state.isStreaming = false;
+				this.state.streamingMessage = undefined;
+				this.liveFlush("agent_end"); // C2: the run is over — write the open tail
+				break;
 		}
 		this.notifyListeners(ev);
+	}
+
+	// ── LIVE WRITE-THROUGH (C2, 2026-10-24) ───────────────────────────────────
+	// The tail the user is reading is exactly what every open re-downloads, so it
+	// is written into IDB as the conversation grows — no request needed (user
+	// requirement). Complete ALIGNED windows (CHUNK_INTERVAL messages, a pure
+	// function of the seq) are written once; the trailing remnant is the "open
+	// tail", written under its own fromSeq and rewritten in place as it grows.
+	// Nothing here touches the render: the sparse window, filledFrom, the display
+	// gate and the edit-index translation are unchanged.
+	private liveBuf: { fromSeq: number; messages: any[] } | null = null;
+	private liveGen = -1;
+	private liveTimer: ReturnType<typeof setTimeout> | null = null;
+
+	/** seq of the message just appended to the dense window (filledFrom + index —
+	 *  invariant under prepends, so an expand never shifts it). */
+	private liveWindowStart(): number | null {
+		const sp = (this.state as any).sparse as { fromSeq?: number; filledFrom?: number } | null | undefined;
+		if (!sp) return null; // a full-body session is not what this cache is for
+		return Number(sp.filledFrom ?? sp.fromSeq ?? 0) + this.state.messages.length - 1;
+	}
+
+	/** Seed the buffer (the attach tail, or a fresh generation). */
+	private liveSeed(fromSeq: number, messages: any[], gen: number): void {
+		this.liveBuf = { fromSeq, messages: [...messages] };
+		this.liveGen = gen;
+		this.liveDrain();
+		this.liveScheduleIdle();
+	}
+
+	/** A live message_end just landed in state.messages. */
+	private liveCapture(message: any): void {
+		const sp = (this.state as any).sparse as { rewriteSeq?: number } | null | undefined;
+		if (!sp) return;
+		const gen = Number(sp.rewriteSeq ?? 0);
+		const seq = this.liveWindowStart();
+		if (seq === null) return;
+		if (!this.liveBuf || this.liveGen !== gen) { this.liveBuf = { fromSeq: seq, messages: [] }; this.liveGen = gen; }
+		this.liveBuf.messages.push(message);
+		this.liveDrain();
+		this.liveScheduleIdle();
+	}
+
+	private liveScheduleIdle(): void {
+		if (typeof window === "undefined") return;
+		if (this.liveTimer) clearTimeout(this.liveTimer);
+		this.liveTimer = setTimeout(() => void this.liveFlush("idle"), LIVE_IDLE_MS);
+	}
+
+	/** Write every COMPLETE aligned window in the buffer; keep the remnant. */
+	private liveDrain(): void {
+		while (this.liveBuf) {
+			const plan = planLiveChunk(this.liveBuf.fromSeq, this.liveBuf.messages.length);
+			if (!plan.write || plan.consumed <= 0) return;
+			const msgs = this.liveBuf.messages.slice(0, plan.consumed);
+			this.liveWrite(this.liveGen, plan.write.fromSeq, plan.write.toSeq, msgs, "aligned");
+			this.liveBuf.messages = this.liveBuf.messages.slice(plan.consumed);
+			this.liveBuf.fromSeq = plan.nextFromSeq ?? plan.write.toSeq;
+			if (this.liveBuf.messages.length === 0) { this.liveBuf = null; return; }
+		}
+	}
+
+	/** Flush the open tail: idle debounce, run end, tab hidden / page hide. */
+	private liveFlush(reason: "idle" | "agent_end" | "hidden"): void {
+		if (this.liveTimer) { clearTimeout(this.liveTimer); this.liveTimer = null; }
+		const buf = this.liveBuf;
+		this.liveBuf = null;
+		if (!buf || buf.messages.length === 0) return;
+		this.liveWrite(this.liveGen, buf.fromSeq, buf.fromSeq + buf.messages.length, buf.messages, reason);
+	}
+
+	/** Integrity-check, gzip, store — fire and forget: the cache may never slow
+	 *  the conversation down, and a failed write is just a future refetch. */
+	private liveWrite(gen: number, fromSeq: number, toSeq: number, messages: any[], reason: string): void {
+		const sessionId = this.sessionId;
+		const text = toNdjson(messages);
+		const verdict = verifyChunkText(text, fromSeq, toSeq);
+		if (!verdict.ok) { console.warn("[live-cache] refusing to store a chunk that fails its own check:", verdict.reason); return; }
+		void gzipText(text)
+			.then((blob) => {
+				if (!blob || this.sessionId !== sessionId) return; // switched away mid-gzip
+				if (LIVE_DEBUG) console.debug(`[live-cache] ${reason} [${fromSeq},${toSeq}) ${messages.length} msgs -> ${blob.size}B`);
+				return putChunk(sessionId, fromSeq, toSeq, gen, toSeq, blob);
+			})
+			.catch(() => { /* cache is best-effort */ });
 	}
 
 	private notifyListeners(event: AnyRecord) {
@@ -339,11 +503,189 @@ export class ProxyAgent {
 		return this.sendAwait({ type: "set-auto-retry", ...cfg }, 8000);
 	}
 
+	/**
+	 * Data-reduction config (Settings → Data use) → hub. Per CONNECTION on the server, so this is
+	 * pushed on attach and on every change. Values come from the same localStorage keys the settings
+	 * dialog writes (`src/ui/data-settings.ts`), never from a component's render state.
+	 */
+	setDataReduction(cfg: Record<string, unknown>): void {
+		this.sendMsg({ type: "setDataReduction", ...(cfg || {}) });
+	}
+
 	/** Push the stored auto-retry preference to the hub (called after each attach). */
 	private pushAutoRetrySetting(): void {
-		let enabled = true;
-		try { enabled = localStorage.getItem("pi.autoRetry") !== "0"; } catch { /* private mode */ }
-		this.sendMsg({ type: "set-auto-retry", enabled });
+		let enabled = true, attempts = 3, delayMs = 3000;
+		try {
+			enabled = localStorage.getItem("pi.autoRetry") !== "0";
+			attempts = Math.max(0, Math.min(10, Number(localStorage.getItem("pi.autoRetryAttempts")) || 3));
+			delayMs = Math.max(1000, Math.min(60000, Number(localStorage.getItem("pi.autoRetryDelayMs")) || 3000));
+		} catch { /* private mode */ }
+		this.sendMsg({ type: "set-auto-retry", enabled, attempts, delayMs });
+	}
+
+	/** CANCEL the pending auto-retry of the attached session (auto-retry UI
+	 *  2026-10-24): the hub clears the timer + runtime marker; the broadcast
+	 *  runtime frame (retry gone) is the real ack for every device. */
+	async cancelRetry(): Promise<any> {
+		await this.whenReady(3000);
+		return this.sendAwait({ type: "cancel-retry" }, 8000);
+	}
+
+	// --- TAIL-FIRST BACKFILL (transfer plan 2026-10-24) -------------------------
+	private backfillRunning = false;
+
+	private async netClass(): Promise<string> {
+		try { const r = await fetch("/api/health", { signal: AbortSignal.timeout(3000) }); const j = await r.json(); return String(j.netClass || "remote"); } catch { return "remote"; }
+	}
+
+	/** Policy-gated background IDB warming (wired/wifi → cache the whole body;
+	 *  metered → manual expand only). CRITICAL (user report: "loading all of chat
+	 *  at once"): warming touches IDB ONLY — it must NEVER prepend into
+	 *  state.messages. The render stays tail-only; the expand button grows it. */
+	/** C4: how far this device's IDB cache reaches for the session (0 = nothing cached).
+	 *  Sent with the attach so the server skips re-sending it; a stale/evicted claim only
+	 *  costs one /range fetch in fillWindow, never a wrong window. */
+	private async cachedCoverTo(): Promise<number> {
+		try {
+			const ranges = await cachedRanges(this.sessionId);
+			return ranges.reduce((max, r) => Math.max(max, r.toSeq || 0), 0);
+		} catch { return 0; }
+	}
+
+	private async scheduleBackfill(sparse: { fromSeq: number; messageCount: number; rewriteSeq: number }): Promise<void> {
+		if (this.backfillRunning) return;
+		this.backfillRunning = true;
+		try {
+			const net = await this.netClass();
+			const policy = await transferPolicy(net);
+			if (policy !== "fast") return; // metered: expand stays manual (button)
+			// warm [0, filledFrom) into IDB — the render array is untouched
+			let guard = 40; // hard cap: 40 × 1MB
+			while (guard-- > 0) {
+				const sp = (this.state as any).sparse;
+				if (!sp) return; // session switched / full state frame arrived
+				const filled = sp.filledFrom as number;
+				const covered = await cachedRanges(this.sessionId, sp.rewriteSeq);
+				const holes = intervalDiff(0, filled, covered);
+				if (holes.length === 0) return; // fully warm
+				const h = holes[0]; // oldest hole first; server clamps to 1MB per response
+				const res = await fetch(`/api/agent/session/${encodeURIComponent(this.sessionId)}/range?fromSeq=${h.fromSeq}&toSeq=${h.toSeq}`, { signal: AbortSignal.timeout(15000) });
+				if (!res.ok && res.status !== 204) return;
+				const buf = await res.arrayBuffer();
+				const rs = Number(res.headers.get("x-range-from-seq") || h.fromSeq);
+				const re = Number(res.headers.get("x-range-to-seq") || h.toSeq);
+				const count = Number(res.headers.get("x-session-message-count") || 0);
+				const rsq = Number(res.headers.get("x-session-mutate-epoch") || 0);
+				if (re <= rs) return; // empty — nothing more to warm
+				try { await putChunk(this.sessionId, rs, re, rsq, count, new Blob([buf], { type: "application/gzip" })); } catch { return; }
+			}
+		} catch { /* best-effort — the tail is already rendered */ }
+		finally { this.backfillRunning = false; }
+	}
+
+	/** EXPAND (banner button): grow the RENDER by one server-clamped step above
+	 *  the loaded window — IDB first (instant after warming), network for misses.
+	 *  SINGLE-FLIGHT (grok review 01a16a54 #7): double-clicks must not prepend
+	 *  the same window twice. */
+	async expandEarlier(): Promise<boolean> {
+		if (this.backfillRunning) return false;
+		this.backfillRunning = true;
+		try { return await this.expandInner(); } finally { this.backfillRunning = false; }
+	}
+
+	private async expandInner(): Promise<boolean> {
+		const sparse = (this.state as any).sparse as { fromSeq: number; messageCount: number; rewriteSeq: number } | undefined;
+		if (!sparse) return false;
+		const filled = (this.state as any).sparse.filledFrom as number;
+		const from = Math.max(0, filled - BACKFILL_MSGS);
+		return this.fillWindow(from, filled);
+	}
+
+	/** Fill [from,to): IDB cache first, then /range for the miss-set. The server
+	 *  may return a SMALLER window than asked (1MB serialized cap) — X-Range-From/
+	 *  To-Seq are authoritative and filledFrom advances to the returned top.
+	 *  EPOCH GUARD (grok review 01a16a54 #6): a response from an older rewrite
+	 *  generation invalidates the cache (server-specified rewrittenFrom — chunks
+	 *  below it survive) and refuses to splice stale messages. */
+	private async fillWindow(from: number, to: number): Promise<boolean> {
+		const requestedTo = to;
+		const sessionIdAtStart = this.sessionId;
+		try {
+			let msgs: any[] = [];
+			const sparseAtStart = (this.state as any).sparse as { rewriteSeq: number } | undefined;
+			const genExpected = sparseAtStart?.rewriteSeq;
+			// no known generation ⇒ no cache read: a chunk from another generation must
+			// never be spliced into this transcript (worst case: one /range fetch).
+			const cached = genExpected === undefined ? [] : await getCachedChunks(this.sessionId, from, to, genExpected);
+			let fullyCached = false;
+			if (cached.length > 0) {
+				fullyCached = true;
+				// SPLICE HONESTY (review 2026-10-25, reviewer2 P1): getCachedChunks returns
+				// chunks WHOLE (they must tile [from,to) or it returns [] — no holes), and a
+				// chunk may start BELOW the requested `from` and — for chunks written before
+				// the server-side bound fix — end ABOVE `to`. Prepending those as-is while
+				// recording the REQUESTED from as filledFrom shifted every index under the
+				// splice (edits land on the wrong turn; the top duplicates what the dense
+				// window already holds). So: trim at `to` and adopt the LOWEST chunk start
+				// as the window's real start — "more than asked for" is fine (it is real,
+				// contiguous content and the display gate is seq-based), "less" never is.
+				const plan = planCachedSplice(cached, from, to);
+				from = plan.fromSeq;
+				msgs = plan.messages;
+			}
+			if (!fullyCached) {
+				const res = await fetch(`/api/agent/session/${encodeURIComponent(this.sessionId)}/range?fromSeq=${from}&toSeq=${to}`, { signal: AbortSignal.timeout(15000) });
+				if (!res.ok && res.status !== 204) { console.warn("[backfill] range fetch failed:", res.status); return false; }
+				const buf = await res.arrayBuffer();
+				const rs = Number(res.headers.get("x-range-from-seq") || from);
+				const re = Number(res.headers.get("x-range-to-seq") || to);
+				const count = Number(res.headers.get("x-session-message-count") || 0);
+				const rsq = Number(res.headers.get("x-session-mutate-epoch") || 0);
+				const rwr = Number(res.headers.get("x-rewritten-from") || Number.MAX_SAFE_INTEGER);
+				const sparse = (this.state as any).sparse as { rewriteSeq: number } | undefined;
+				if (sparse && rsq !== sparse.rewriteSeq) {
+					// STALE GENERATION (grok #6): the transcript was rewritten since our
+					// attach. v2: nothing to erase — chunks are keyed by rewriteSeq, so the
+					// old generation is already unreachable; the GC collects it by date.
+					// The splice is still refused: stale messages must never render.
+					console.warn("[backfill] stale epoch (saw", sparse.rewriteSeq, "server", rsq, ") — old generation left to the GC");
+					void sweepStale({ sessionId: this.sessionId });
+					return false;
+				}
+				// EMPTY WINDOW (review 2026-10-25 #1): re <= rs means "nothing more to load"
+				// — the old code carried on and set filledFrom = rs (ABOVE the dense window),
+				// which desynced the array from its seq and made expandEarlier() report
+				// success forever while doing nothing (the dead ⤒ button, again).
+				if (re <= rs) return false;
+				const text = await gunzip(new Blob([buf], { type: "application/gzip" }));
+				if (text == null) { console.warn("[backfill] gunzip failed"); return false; }
+				// VERIFY BEFORE STORE (review #5): live writes already pass verifyChunkText
+				// first; a fetched window did not, so a short/mislabeled body (exactly what
+				// the server-side bound bug produced) got cached and re-dropped on every read.
+				// A bad body is now a logged miss that also fails the expand, not a silent
+				// half-window in the transcript.
+				const verdict = verifyChunkText(text, rs, re);
+				if (!verdict.ok) { console.warn("[backfill] range body rejected —", verdict.reason); return false; }
+				msgs = text.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+				// cache write-through: the SAME raw gzip bytes into IDB (decompress on read)
+				try { await putChunk(this.sessionId, rs, re, rsq, count, new Blob([buf], { type: "application/gzip" }), rwr); } catch { /* cache is best-effort */ }
+				from = rs; // SERVER-AUTHORITATIVE window (may be smaller than requested)
+				to = re;
+			}
+			// splice: PREPEND the older window to the dense array; filledFrom advances
+			// to the top of the RETURNED window. Race check against the REQUESTED top
+			// AND the session (a switch must not mix windows into the wrong session).
+			const sp = (this.state as any).sparse;
+			if (!sp || sp.filledFrom !== requestedTo || this.sessionId !== sessionIdAtStart) { console.warn("[backfill] raced a rewrite/switch — window dropped"); return false; }
+			this.state.messages = [...msgs, ...this.state.messages];
+			// `from` is the seq of msgs[0] — the requested from only when the cache was
+			// not wider than the request (see SPLICE HONESTY above).
+			sp.filledFrom = from;
+			sp.fromSeq = from; // LOCKSTEP (grok #2): the edit translation uses fromSeq —
+			// a frozen value would point edits at the wrong turn after any expand
+			this.notifyListeners({ type: "state-snapshot" });
+			return true;
+		} catch (err: any) { console.warn("[backfill] fillWindow failed:", err?.message || err); return false; }
 	}
 
 	cancelSteering(): void {

@@ -293,6 +293,9 @@ function bridgeOverride() {
 	const v = String(process.env.PI_WEB_TERM_BRIDGE || "").trim();
 	if (!v) return "auto";
 	if (v === "0" || v.toLowerCase() === "pipes") return "pipes";
+	// force Windows ConPTY (`conhost.exe --headless`) — the fallback that needs no
+	// download and no msys pty
+	if (v.toLowerCase() === "conhost") return "conhost";
 	return fs.existsSync(v) ? path.resolve(v) : "invalid";
 }
 
@@ -310,6 +313,106 @@ function bridgeUsable(p) {
 	} catch {
 		return false;
 	}
+}
+
+// INTEGRITY vs CAPABILITY (user report 2026-10-25): bridgeUsable() only proves the
+// file is a PE image of a sane size. It says nothing about whether that image can
+// allocate a pty in THIS environment — and msys2's script.exe binds the msys
+// runtime that ships with Git for Windows, which is a different build. When it
+// cannot (observed: "script: failed to create pseudo-terminal: No such file or
+// directory"), the pty tier fell back to pipes and the user-visible symptom was
+// "nano is not working / script.exe is gone" with nothing in the UI explaining it.
+// So run the candidate once, with the SHELL IT WILL DRIVE, and remember the
+// verdict (plus the bridge's own stderr, which is the actual diagnosis).
+//
+// -e/--return makes script propagate the child's exit status, so with a bash path
+// this checks the WHOLE property: bash must see isatty(stdin) === true.
+const bridgeVerdicts = new Map(); // key → { exe, bash, ok, reason } (kind-aware)
+let bridgeVerdict = null; // last verdict (kept for tests that compare identity)
+
+/** Windows' own ConPTY server. It owns a REAL console for the child (which is what
+ *  msys bash needs to report isatty) while OUR stdio stay plain pipes, so it needs
+ *  no console in the server process and no download. Available since Win10 1809. */
+function conhostPath() {
+	return path.join(process.env.SystemRoot || "C:\\Windows", "System32", "conhost.exe");
+}
+
+/** Does `conhost --headless <bash> -c "test -t 0"` give that shell a real tty?
+ *  MARKER-based on purpose: conhost does NOT propagate the child's exit status
+ *  (verified: `bash -c "exit 7"` comes back 0), so $? cannot be trusted here. */
+export function conhostProbe(bashPath) {
+	const exe = conhostPath();
+	const key = `conhost|${exe}|${bashPath || ""}`;
+	const cached = bridgeVerdicts.get(key);
+	if (cached) return cached;
+	let ok = false, reason = null;
+	if (!bashPath) reason = "no bash to drive";
+	else if (!fs.existsSync(exe)) reason = "conhost.exe not present";
+	else {
+		try {
+			const marker = `PI_PTY_OK_${process.pid}`;
+			const r = spawnSync(exe, ["--headless", bashPath, "-c", `test -t 0 && echo ${marker}`], { stdio: "pipe", timeout: 8000, windowsHide: true, encoding: "utf8" });
+			ok = String(r.stdout || "").includes(marker);
+			if (!ok) reason = (String(r.stderr || "").trim() || String(r.stdout || "").replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").trim() || `exit ${r.status}`).slice(0, 300);
+		} catch (err) {
+			reason = String(err?.message || err).slice(0, 300);
+		}
+	}
+	const verdict = { key, kind: "conhost", exe, bash: bashPath || null, ok, reason };
+	bridgeVerdicts.set(key, verdict);
+	bridgeVerdict = verdict;
+	return verdict;
+}
+// exported for tests/term-pty.test.mjs: the probe is the fix, so it must be pinned
+// (it is what stops a present-but-incapable bridge from being adopted silently)
+export function bridgeProbe(exe, bashPath) {
+	const key = `script|${exe}|${bashPath || ""}`;
+	const cachedV = bridgeVerdicts.get(key);
+	if (cachedV) return cachedV;
+	const fwd = (p) => String(p).replace(/\\/g, "/");
+	const cmdLine = bashPath ? `"${fwd(bashPath)}" -c "test -t 0"` : "exit 0";
+	let ok = false, reason = null;
+	try {
+		const r = spawnSync(exe, ["-q", "-f", "-e", "-c", cmdLine, "/dev/null"], { stdio: "pipe", timeout: 5000, windowsHide: true, encoding: "utf8" });
+		ok = r.status === 0;
+		if (!ok) reason = (String(r.stderr || "").trim() || `exit ${r.status}`).slice(0, 300);
+	} catch (err) {
+		reason = String(err?.message || err).slice(0, 300);
+	}
+	const verdict = { key, kind: "script", exe, bash: bashPath || null, ok, reason };
+	bridgeVerdicts.set(key, verdict);
+	bridgeVerdict = verdict;
+	return verdict;
+}
+
+/** Find a bridge that can actually create a pty for THIS shell — every candidate is
+ *  PROVEN, never assumed (see bridgeProbe/conhostProbe). Two kinds:
+ *    1. "script"   — msys2 util-linux script.exe (a real msys pty; the original design)
+ *    2. "conhost"  — Windows ConPTY (`conhost.exe --headless`): a real console for the
+ *                    child, no console needed in the server, no download, no native
+ *                    module. This is the route that works when the msys runtime cannot
+ *                    allocate a pty at all (user report 2026-10-25: "nano is not
+ *                    working" — script.exe's pty creation fails in that Git install,
+ *                    while ConPTY is unaffected).
+ *  The failed candidates' reasons are logged and, when NOTHING works, become the note
+ *  the dock shows. */
+function pickBridge(dataDir, bashPath, debug = () => {}) {
+	const seen = new Set();
+	const notes = [];
+	const cands = [scriptBridgePath(dataDir), bashPath ? path.join(path.dirname(bashPath), SCRIPT_EXE_NAME) : null]
+		.filter((p) => p && !seen.has(p) && seen.add(p) && bridgeUsable(p));
+	for (const c of cands) {
+		const v = bridgeProbe(c, bashPath);
+		if (v.ok) return { kind: "script", exe: c, label: `${SCRIPT_EXE_NAME} (msys pty)`, note: null, notes };
+		notes.push(`${SCRIPT_EXE_NAME}: ${v.reason}`);
+	}
+	if (bashPath && fs.existsSync(conhostPath())) {
+		const c = conhostProbe(bashPath);
+		if (c.ok) return { kind: "conhost", exe: c.exe, label: "conhost --headless (ConPTY)", note: null, notes };
+		notes.push(`conhost --headless: ${c.reason}`);
+	}
+	for (const n of notes) debug("[term] bridge rejected —", n);
+	return { kind: null, exe: null, label: null, note: notes.join(" | ") || null, notes };
 }
 
 function provisionScriptBridge(dataDir, debug) {
@@ -356,6 +459,9 @@ function provisionScriptBridge(dataDir, debug) {
 				if (r.status !== 0) throw new Error(`tar exited ${r.status}: ${String(r.stderr || "").slice(0, 200)}`);
 				const extracted = path.join(tmpDir, SCRIPT_EXE_NAME);
 				if (!bridgeUsable(extracted)) throw new Error("script.exe missing or invalid after extraction");
+				// do not ADOPT a bridge that cannot allocate a pty (see bridgeProbe)
+				const probe = bridgeProbe(extracted, null);
+				if (!probe.ok) throw new Error(`pinned bridge cannot create a pty: ${probe.reason}`);
 				fs.renameSync(extracted, exe); // atomic publish
 				debug("[term] provisioned msys pty bridge:", exe);
 				return exe;
@@ -394,8 +500,23 @@ export function createTerminalHub({
 	const loopbackOf = typeof isLoopback === "function" ? isLoopback : () => false;
 
 	// dedicated WSS: the shared 25MB maxPayload would let one oversized frame
-	// allocate 25MB per socket; terminal frames are tiny
-	const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_INPUT + 64 * 1024 });
+	// allocate 25MB per socket; terminal frames are tiny.
+	//
+	// permessage-deflate (2026-10-25, plan item 2): terminal output is the most compressible
+	// traffic in the app (prompt echo, `ls`, build logs) and the client is often a phone on a
+	// metered link — 60-80% off a scrollback, lossless, zero client code (the browser decodes
+	// Content-Extension natively). Same shape as the agent socket in server.mjs: env kill switch
+	// + a threshold so tiny keystroke echoes stay uncompressed. A browser CANNOT switch the
+	// extension off, so there is deliberately no client toggle — the opt-outs are
+	// PI_WEB_WS_DEFLATE=off (server) and declining the extension (non-browser clients).
+	const wss = new WebSocketServer({
+		noServer: true,
+		maxPayload: MAX_INPUT + 64 * 1024,
+		perMessageDeflate: process.env.PI_WEB_WS_DEFLATE === "off" ? false : {
+			threshold: 1024,
+			zlibDeflateOptions: { level: 6 },
+		},
+	});
 	wss.on("connection", (ws, req) => conn(ws, req));
 
 	const sessions = new Map(); // id → session
@@ -533,7 +654,14 @@ export function createTerminalHub({
 	function stateFrame(sess) {
 		return {
 			t: "state",
-			s: { phase: sess.phase, tier: sess.tier, exit: sess.exit, error: sess.error ? stripWs(sess.error) : null, pid: sess.pid },
+			s: {
+				phase: sess.phase, tier: sess.tier, exit: sess.exit, error: sess.error ? stripWs(sess.error) : null, pid: sess.pid,
+				// which bridge is giving the shell its tty (null in the pipe tier) …
+				bridge: sess.bridge ? stripWs(sess.bridge) : null,
+				// … and, when the pipe tier is in use because of a BRIDGE problem, why:
+				// "terminal is in pipes mode" is not a diagnosis.
+				bridgeNote: sess.bridgeNote ? stripWs(sess.bridgeNote) : null,
+			},
 		};
 	}
 
@@ -673,7 +801,8 @@ export function createTerminalHub({
 		// never exits non-zero on its own otherwise
 		if (sess.tier === "pty" && !sess.fallbackTried && !sess.resetting && code !== 0 && elapsed < PTY_FALLBACK_MS) {
 			sess.fallbackTried = true;
-			debug("[term] pty backend died instantly — falling back to pipes");
+			sess.bridgeNote = sess.bridgeNote || `the pty bridge (${sess.bridge || "pty"}) died immediately — pipe tier active (nano/vim need a real pty)`;
+			debug("[term] pty bridge died instantly — falling back to pipe tier");
 			beginSpawn(sess, "pipes");
 			// banner WITHOUT the phase flip: the noise filter must stay armed
 			// until the new pipe-shell actually produces output
@@ -711,6 +840,8 @@ export function createTerminalHub({
 		const env = shellEnv(agentDir, gitRootFromBash(bashPath), sess.wantCols || TERM_COLS, sess.wantRows || TERM_LINES, workspaceDir);
 		// bridge decision at spawn time — provisioning may complete between spawns
 		let bridge = null;
+		let bridgeKind = null;
+		let bridgeLabel = null;
 		if (process.platform === "win32") {
 			const override = bridgeOverride();
 			if (override === "pipes") bridge = null;
@@ -721,11 +852,25 @@ export function createTerminalHub({
 				sess.error = `PI_WEB_TERM_BRIDGE points to a missing file: ${String(process.env.PI_WEB_TERM_BRIDGE).trim()}`;
 				broadcast(sess, stateFrame(sess));
 				return;
+			} else if (override === "conhost") {
+				const c = conhostProbe(bashPath);
+				if (c.ok) { bridge = c.exe; bridgeKind = "conhost"; bridgeLabel = "conhost --headless (ConPTY)"; }
+				else sess.bridgeNote = `conhost --headless cannot create a pty here — ${c.reason}`;
 			} else if (override !== "auto") {
 				bridge = override;
+				bridgeKind = "script";
+				bridgeLabel = "PI_WEB_TERM_BRIDGE";
 			} else {
-				bridge = bridgeUsable(scriptBridgePath(dataDir)) ? scriptBridgePath(dataDir) : null;
-				if (!bridge) void ensureBridge(); // keep provisioning in the background
+				// CAPABILITY, not just integrity: pickBridge runs each candidate once and
+				// keeps the reason when none works, so the client can SAY why nano/vim are
+				// unavailable instead of silently serving the pipe tier.
+				const picked = pickBridge(dataDir, bashPath, debug);
+				bridge = picked.exe;
+				bridgeKind = picked.kind;
+				bridgeLabel = picked.label;
+				if (picked.kind) debug(`[term] pty bridge: ${picked.label}`, picked.notes.length ? `(rejected: ${picked.notes.join("; ")})` : "");
+				if (!bridge && picked.note) sess.bridgeNote = picked.note;
+				if (!bridgeUsable(scriptBridgePath(dataDir))) void ensureBridge(); // keep provisioning in the background
 			}
 		}
 		// sh -c injection guard (grok P1-7): the -c command string is parsed by sh —
@@ -742,6 +887,23 @@ export function createTerminalHub({
 					env,
 					stdio: ["pipe", "pipe", "pipe"],
 					detached: true,
+				});
+			} else if (tier === "pty" && bridge && bridgeKind === "conhost") {
+				// conhost IS the pty provider: it owns a real console for bash (isatty,
+				// stty, nano/vim, ONLCR, ^C) and forwards it as VT over our pipes. No
+				// shell wrapper is involved, so there is no -c command string to quote
+				// (nor a sh-injection surface). The grid is fixed at spawn — same
+				// limitation the script bridge has (see the resize note below), and
+				// conhost can at least take the size that script.exe cannot.
+				const rc = ensureRcFile();
+				const args = ["--headless", "--width", String(sess.wantCols || TERM_COLS), "--height", String(sess.wantRows || TERM_LINES), bashPath, "--noprofile"];
+				if (rc) args.push("--rcfile", rc);
+				args.push("-i");
+				proc = spawn(bridge, args, {
+					cwd: workspaceDir,
+					env,
+					stdio: ["pipe", "pipe", "pipe"],
+					windowsHide: true,
 				});
 			} else if (process.platform === "win32" && tier === "pty" && bridge && !shUnsafe(bashPath) && !(rcFile && shUnsafe(rcFile))) {
 				// msys pty bridge (msys2 util-linux script): a REAL /dev/ptyN for
@@ -788,6 +950,7 @@ export function createTerminalHub({
 		sess.proc = proc;
 		sess.pid = proc.pid ?? null;
 		sess.tier = tier;
+		sess.bridge = tier === "pty" ? bridgeLabel || bridge || null : sess.bridge || null;
 		sess.phase = "starting";
 		sess.exit = null;
 		sess.error = null;

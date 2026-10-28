@@ -1,6 +1,6 @@
 # server.mjs — Server internals
 
-> Updated 2026-10-21 · See also: [architecture.md](architecture.md) (module map, trust model) ·
+> Updated 2026-10-27 · See also: [architecture.md](architecture.md) (module map, trust model) ·
 [client.md](client.md) (browser caller) · [terminal.md](terminal.md) (terminal WS security)
 
 Covers `server.mjs`, `agent-hub.mjs`, `session-worker.mjs`, `session-id.mjs`.
@@ -66,10 +66,10 @@ See [architecture.md](architecture.md) for the module map and trust-boundary sum
 |---|---|---|
 | `GET /api/health` | none | `{ok, bootId, buildId, piDir}` — buildId parsed from the hashed bundle filename |
 | `GET /api/version` | blanket | same ids |
-| `GET /api/pi/config` | blanket | re-reads `.pi/models-store.json` + `settings.json` → providers with models, defaults; refreshes the live server-agent model store in place |
+| `GET /api/pi/config` | blanket | REBUILDS the provider catalog (`lib/pi-catalog.mjs` — see below) → providers with models (`origin`, `keyless`) + defaults |
 | `GET /api/pi/system` | blanket | system-prompt resolution (below) |
-| `GET /api/pi/keys` | **always token** (2026-10-21) | **returns ALL provider keys from `.pi/auth.json` and `data/provider-keys.json`** — strongest secrets oracle; no client call path uses it |
-| `POST /api/pi/key` | blanket + env-TOKEN check | `{provider}` → that provider's key from `.pi/auth.json` or the private web key store |
+| `GET /api/pi/keys` | **always token** (2026-10-21) | **returns ALL resolved provider keys** (auth.json + models.json + keyless placeholders) — strongest secrets oracle; no client call path uses it |
+| `POST /api/pi/key` | blanket + env-TOKEN check | `{provider}` → `{provider, key, keyless?}`; **404 only when nothing resolves** — a models.json provider that needs no credential answers `{key:"none", keyless:true}` so the browser never prompts for one |
 | `PUT /api/pi/key` | blanket | `{provider, key}` → save a key for server-side agents in `data/provider-keys.json` (mode 0600); `.pi/auth.json` is not modified |
 | `GET /api/sessions` | blanket | worker `list` (metadata only), 1s-cached (`listCached`) |
 | `POST /api/sessions` | blanket | returns a fresh `crypto.randomUUID()` (creates nothing) |
@@ -85,19 +85,66 @@ See [architecture.md](architecture.md) for the module map and trust-boundary sum
 | `WS /ws/terminal` | token for non-loopback + hub Origin allowlist | see [terminal.md](terminal.md) |
 | `POST /api/agent/*`, `GET /api/agent/session/:id`, `GET /api/agent/events` (SSE) | blanket | server-side agent path |
 
-Custom provider models (including NVIDIA's OpenAI-compatible endpoint) come from
-`.pi/models-store.json`. pi-ai's `getModels(provider)` returns its generated built-in catalog; it
-does not discover custom providers such as `nvidia`. When `/api/pi/config` refreshes that file, it
-updates the existing `AgentHub.modelsStore` object in place so already-running server agents can
-resolve newly-added models as well as the browser picker.
+## Provider catalog (`lib/pi-catalog.mjs`, 2026-10-27)
+
+**User reports this fixes:** *“model selector should show user added provider's model”* and *“let
+openai compatible api/provider accept apiKey none”*.
+
+One pure module builds `piModelsStore` (= `name -> {name, baseUrl, api, models, apiKey, keyless,
+origin}`) from four sources; it feeds BOTH the picker (`clientProviders()` → `/api/pi/config`) and the
+hub (`_getModel` walks `.models`) and is rebuilt by `refreshModelsStore()` on every `/api/pi/config`,
+so **editing `.pi/models.json` lands in the picker without a server restart** (the refresh builds a new
+map and swaps it into the hub in ONE assignment — `hubRef.modelsStore = next` — so a run that resolves
+its model mid-refresh never sees a half-built catalog).
+
+| Source | Role |
+|---|---|
+| pi-ai builtin catalog (`getBuiltinModels`) | metadata baseline for every provider the user touches |
+| `.pi/models-store.json` | pi's own discovery CACHE (wins per model id) |
+| **`.pi/models.json`** | the user's file (`{providers:{name:{baseUrl,api,apiKey,models,modelOverrides}}}`) — the documented way to add a compatible endpoint; wins per model id, adds providers |
+| `.pi/auth.json` | providers the user merely logged into (catalog models fill in) |
+
+- **Per model id, never per provider list**: a user entry replaces the same id; the store's other models
+  survive. A provider whose models are empty everywhere is dropped (it was the “provider with an empty
+  list” bug — e.g. a store entry for `google` with zero cached models, which now shows the 24 builtin
+  ones). Provider `baseUrl` is pushed down onto models that lack one (pi does the same).
+- **`models.json` is parsed TOLERANTLY** (`readJsonTolerant`): `//` + `/* */` comments and trailing
+  commas are stripped before a second parse attempt (a real hand-edited file had both; a hard failure
+  would take the whole catalog down). A warning names the file.
+- **Credentials**: `auth.json` > `models.json` `apiKey` (literal, or `$NAME`/`${NAME}` env
+  interpolation) > keyless placeholder. `apiKey: "none"` / `""` / `"null"` / an **absent** key on a
+  models.json provider = *this endpoint needs no credential*: `resolvedKeys()` returns the placeholder
+  `none`, which reaches the wire as `Authorization: Bearer none` — the local llama.cpp / vLLM / Ollama /
+  header-auth-proxy case. pi-ai's `getClientApiKey` throws `No API key for provider: X` on an empty key,
+  which is exactly what made such a provider unusable (`tests/pi-catalog-keyless.e2e.mjs` pins both the
+  working path and the contrast).
+- **A provider NOT declared in models.json never gets the placeholder** and a `!command` key is never
+  treated as keyless — a missing real credential must stay a loud `No API key for provider` instead of a
+  silent anonymous request.
+- **Never leaked**: `clientProviders()` strips `apiKey`/`api_key` from every model record and never
+  serializes the provider-level key (server-side only). Tests: `npm run test:catalog`, `npm run test:keyless`.
+
+Keys entered in Settings are stored separately in `data/provider-keys.json` with mode `0600`.
+They override the matching `.pi/auth.json` entry for server-side agent calls, without modifying
+the user's pi auth file.
 
 ## System-prompt resolution (`/api/pi/system`)
 
 Mirrors pi's resource loader: `projectNeedsTrust()` (`.pi` symlink or any of settings.json/mcp.json/
 extensions/skills/prompts/themes/SYSTEM.md/APPEND_SYSTEM.md present) gates project files;
 `isProjectTrusted()` walks UP from the project dir through `.pi/trust.json` entries (fail-closed on
-unreadable). Precedence: `WEB_SYSTEM.md` (agent dir; web-UI-only filename, no trust gate) > project
-`.pi/SYSTEM.md` (trusted) > global `agentDir/SYSTEM.md`; `APPEND_SYSTEM.md` appends. The server
+unreadable). Precedence lives in ONE place — `lib/system-prompt.mjs`, used by both the hub and
+`/api/pi/system` — so the two cannot drift: `WEB_SYSTEM.md` (agent dir; web-UI-only filename, no trust
+gate) > project `.pi/SYSTEM.md` (trusted) > global `agentDir/SYSTEM.md`. **`APPEND_SYSTEM.md` is NOT
+read by the web path** (2026-10-25): it is pi's file, the two paths should not overlap, and the
+operator's standing instructions were merged into `.pi/WEB_SYSTEM.md` so the web prompt is one
+self-contained file. `/api/pi/system` therefore lists only the prompt-file candidates above, and
+`effective.text` carries the resolved prompt verbatim (the client uses it instead of re-deriving).
+**When no prompt file exists at all** the resolver returns a prompt COMPOSED IN CODE (pi-style tagged
+sections: `preamble`/`tools`/`rules`/`docs`/`cwd`) instead of `undefined` — before 2026-10-25 a
+deployment with a missing `pi_dir` ran the agent with no system prompt at all (pi-agent-core has no
+built-in preamble, and the hub only passes `systemPrompt` when it is truthy). `/api/pi/system` reports
+which case applies via `effective.source` (`file` | `builtin`). Test: `npm run test:sysprompt`. The server
 computes `wins` flags so the client cannot drift. Content cap 1MB/file. `projectDir` = `PI_WS` or the
 parent of `PI_DIR` (assumes `.pi` is a direct child of the workspace root — worktrees need `PI_WS`).
 
@@ -154,6 +201,14 @@ inside the mutation queue.
    read_file-formatted excerpt near a possible anchor.
 6. Write-back restores BOM + original CRLF; `details` carries jsdiff context diff, unified patch,
    `firstChangedLine`, `matchForm`. No-op (identical content) is an error.
+
+**attach + hydration (2026-10-24)**: `/ws/agent` `{type:"attach"}` and `AgentHub.attach()` HYDRATE first —
+`attach()` awaits `_ensureEntry()` before it builds the state snapshot, so a session whose entry was
+created by an earlier attach/prompt/raced store read can never ship an empty window. `entry.hydrated`
+is the flag: `getSession(id, {messages})` sets it (the caller asserts the transcript), `_ensureEntry()`
+sets it after a successful store load, and a store miss sets it WITHOUT retrying per call. Hydration only
+fills an entry that has no non-system messages — a live transcript is never overwritten — and a store
+*error* leaves the flag false so a later call retries. Regression suite: `npm run test:hydration`.
 
 **bash**: spawn `BASH_PATH -c <cmd>` (verified constant path; `PI_WEB_BASH_SHELL` override), cwd =
 WORKSPACE_DIR, env = `getShellEnv()` (prepends PI bin, Bash, and Node paths; Windows also prepends
@@ -348,8 +403,8 @@ toolResult.toolCallId, so after a restart the rehydrated history produced `role:
 without `tool_call_id` and nvidia NIM 400'd every prompt, permanently; error/stopReason/usage now
 survive restarts too). `getSession` runs restored messages through `normalizeRestoredMessages()` —
 re-links orphan toolResults to the preceding assistant's toolCall blocks in order, strips still-
-unmatched toolCalls, drops unmatchable orphans (idempotent; one-time bulk repair:
-`node tests/repair-mirror-toolcalls.mjs`). `attach()` =
+unmatched toolCalls, drops unmatchable orphans (idempotent; the one-time bulk repair script was
+removed once it had been run everywhere, 2026-10-25). `attach()` =
 subscribe-first: buffers events via a per-session `entry.buffer` hook while snapshotting (2026-10-21 —
 the old global broadcast swap was not reentrant), then delivers snapshot + buffered (dedup by seq).
 `prompt()` queues ONE follow-up while streaming (depth 2+ rejected). Eviction: idle >30min (flush
@@ -357,6 +412,96 @@ first) or LRU beyond HOT_AGENT_CAP+5 — non-streaming sessions only, so a live 
 `flushAll()` exists for bulk flush; the shutdown path uses `shutdown()` (abort live runs + immediate
 persist per session) — wired to SIGINT/SIGTERM/SIGBREAK/stdin-close in server.mjs since 2026-10-21.
 `onEvents()` backs the SSE endpoint via the per-session subscriber Set (no swapping).
+
+## Data reduction on the agent path (`setDataReduction`, 2026-10-25 — contract)
+
+The browser owns the image half of the data plan (see `docs/client.md` → "the composer's image
+pipeline"); the SERVER owns the stream half, because the deltas are pumped server-side. The pure,
+tested decisions live in `lib/thinking-flush.mjs` (`resolveStreamPolicy(kind, net, settings)`,
+`createThinkingGate`), `lib/stream-reduce.mjs` (the per-connection reducer) and
+`lib/data-reduction.mjs` (`coalesceTurn` — a library helper the bench and suites use; the SHIPPED bound is the gate's own `maxBytes`, see guarantee 2).
+
+**Status: IMPLEMENTED and OFF by default** (2026-10-25). `server.mjs`'s `agentConn` dispatch handles
+`setDataReduction` and stores the config on the CONNECTION (`ws.__reducer`); the delivery boundary is
+the per-socket loop in the hub's `broadcast()` callback, which runs `reducer.transform(msg)` per socket
+and sends whatever it returns (a frame, a truncated snapshot, an ARRAY of two frames, or nothing). A
+socket that never opts in keeps `enabled === false`, so that loop stays byte-for-byte the old one.
+Pure logic: `lib/stream-reduce.mjs`; suites: `tests/stream-reduce.test.mjs` (50 checks) and
+`tests/stream-reduce.e2e.mjs` (7 checks over a real socket), plus `tests/media-egress.e2e.mjs` for the
+media routes.
+
+Debug it on its own port:
+
+```
+PORT=8899 PI_WEB_DATA_REDUCTION_DEBUG=1 npm start      # then open http://localhost:8899
+# Settings → Data use → Reasoning & stream: Paragraph / Turn end / None
+# one [data-reduction] line per block: modes · forwarded · dropped (bytes) · flushes
+```
+
+### The frame (per connection, like `set-auto-retry`)
+
+```jsonc
+c→s { type: "setDataReduction", id, net: "wan", imageLevel: "medium", thinkingLevel: "paragraph",
+      thinking: { mode, minBytes, maxBytes, maxLines, idleMs, maxHoldMs },
+      text:     { … }, tool: { … } }
+s→c { type: "data-reduction", id, ok: true, enabled, streamMode, kinds: { thinking, text, tool } }
+```
+
+`src/ui/data-settings.ts` sends exactly this through the optional `agent.setDataReduction()` call
+(Settings → Data use); a connection that never sends it stays LIVE, and an unrecognised mode falls
+back to `off`, never to a stronger reduction.
+
+### What the reducer does (`lib/stream-reduce.mjs`, one instance per connecting socket)
+
+* per kind (`thinking` | `text` | `tool`) keep ONE `createThinkingGate(policy)` per streaming block,
+  rebuilt at `message_start` and dropped at `message_end` / `turn_end` / `agent_end`;
+* a coalesced frame is a **TRUNCATED SNAPSHOT**, never a delta: the client renders
+  `state.streamingMessage = ev.message`, so the frame must carry exactly what has been delivered
+  (`truncateStreamSnapshot`); a `toolCall` part inside the snapshot is never hidden;
+* `mode: "off"` (level `none`) = today's behaviour: forward every delta, no state;
+* `mode: "end"` (level `turnEnd`) = forward nothing until the block ends; the complete text arrives with
+  `message_end`, which is history and is ALWAYS forwarded;
+* `tool_execution_update` is thinned to one frame per `idleMs` (the client renders tool output from the
+  RESULT message, so these are liveness hints) and dropped entirely in `end` mode;
+* `message_end` / tool results / `runtime` / `retry` / version frames pass through unchanged.
+
+### Guarantees (non-negotiable)
+
+1. **Always flush on error/abort** — a dying turn returns TWO frames (the held text, then the error)
+   so the reasoning that was in flight is still readable and the failure is never swallowed; and
+   `runtime` frames/pings keep flowing so a NAT/browser timeout cannot kill a quiet socket.
+2. **Per-connection memory bound**: every gate has a byte cap (`maxBytes`, 256B-8KB by kind) and a hard
+   visibility ceiling, and REACHING the cap EMITS the buffer — there is no unbounded growth to fall back
+   from (`coalesceTurn`'s own `capBytes`/live-fallback path exists as a library helper, but the shipped
+   reducer never buffers that far).
+3. **Nothing changes for history**: coalesced frames are still the same full snapshots, so the client's
+   IDB write-through, `haveTo` and the tail-first/sparse-attach model are untouched (a warm reopen stays
+   0 bytes). Do not redact or reshape transcript egress here — that is the media route's job.
+4. **Frames must clear the socket's deflate threshold** (`perMessageDeflate.threshold: 1024` in the
+   agent WSS): `ws` skips the compressor below it, and a 67-byte per-delta frame is the worst case. That
+   is why the thinking presets use `minBytes ≥ 1024` (the ANSWER keeps a deliberately small 128B floor,
+   so prose streams) with a soft idle rule + a hard visibility ceiling
+   (`maxHoldMs`) — measured, not guessed:
+
+   | stream policy | wire bytes | frames | first text |
+   |---|---|---|---|
+   | live (level `none`) | 23.2 KB | 346 | 0 ms |
+   | `paragraph` (level `paragraph`, wan) | 1.4 KB | 9 | +1.6 s |
+   | turn end (level `turnEnd`) | 0.2 KB | 1 | +13.8 s |
+
+   (`npm run bench:data` prints the full table: images, streams, tool output, resize budget.)
+5. **Steering while buffering**: a steer that arrives mid-block must still be accepted (it is injected
+   after the current thinking/tool call completes). Hide nothing, drop nothing — the buffered text is
+   flushed first.
+
+### Numbers the hub must not "fix"
+
+* every gate emits at its own `maxBytes` (never grows without bound); thinking/tool frames ≥ the
+  deflate threshold, the answer's 128B floor is the one deliberate exception (prose latency beats a few
+  hundred bytes); `firstBytes` (64B thinking / 32B answer / 512B tool) releases the FIRST chunk
+  immediately so a coalescing policy still paints instantly;
+* thinking lighter on `lan` (256B floor, 0.8s idle), heavier on `metered` (1KB floor, 2.5s idle, 4s ceiling);
+* an unknown `kind` is treated as `thinking` (never as a silent no-op).
 
 ## Logging + graceful shutdown (2026-10-21)
 

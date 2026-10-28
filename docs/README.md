@@ -2,7 +2,7 @@
 
 > Updated 2026-10-21. These are REFERENCE docs: they describe the code as it is (function names,
 > invariants, caps, failure modes) and double as the review substrate for model-based code review.
-> Latest documentation review: [`../doc-report.md`](../doc-report.md).
+> Companion files: [`../bugs.md`](../bugs.md) (open items), [`lessons.md`](lessons.md) (contracts/patterns/decisions), [`features.md`](features.md) (per-feature write-ups).
 
 ## Reading order
 
@@ -13,8 +13,12 @@
    storage, session sync, key/proxy resolution, markdown/XSS.
 3. **[server.md](server.md)** — the server side: auth, endpoints, tools, exec bridge, LLM proxy,
    session worker store, WS hubs.
-4. **[terminal.md](terminal.md)** — the terminal dock end-to-end (hub + client): tiers, provisioning,
-   protocol, lifecycle, security.
+4. **[terminal.md](terminal.md)** — the terminal dock end-to-end (hub + client): tiers (msys pty /
+   ConPTY / pipes), bridge capability probing, provisioning, protocol, lifecycle, security.
+5. **[features.md](features.md)** — per-feature implementation notes (versions, retry/auto-retry,
+   compact, fetch tool, cdp-open, terminal dock, bundling, extensions + tools).
+6. **[lessons.md](lessons.md)** — vendored-code contracts to re-check on upstream bumps, debugging
+   patterns, standing architecture decisions, incident lessons.
 
 ## Read this if you are changing…
 
@@ -26,6 +30,8 @@
 | `build.mjs`, `vendor-wterm.mjs`, bundling | `architecture.md` (module map) + `.gitignore` (what's generated vs vendored) | — |
 | Sessions format / sync bugs | `server.md` (worker store, `/ws/sync` hub) + `client.md` (session-sync, save lifecycle) | `architecture.md` (data flows 2–3) |
 | Security posture | `architecture.md` (trust boundaries + known quirks) + `server.md` (auth) | `terminal.md` (Origin allowlist — the reference implementation) |
+| The terminal's pty/bridge behaviour | `terminal.md` (§Bridge kinds, §Bridge CAPABILITY) | `lessons.md` (`script.exe` capability vs integrity) |
+| Releasing/landing, historical fixes | `../bugs.md` (open) + git history | `lessons.md`, `features.md` |
 
 ## Conventions
 

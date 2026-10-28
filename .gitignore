@@ -74,3 +74,7 @@ edit-vs-splice.md
 review-index.md
 session-sharing-report.md
 tmp-*.patch
+
+# tmp decompression bench (untracked test harness, delete after the survey)
+public/tmp-bench/
+public/tmp-decomp-bench.html

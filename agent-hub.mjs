@@ -7,6 +7,9 @@
 //   - every connected device (laptop/phone) is a viewer/controller via /ws/agent
 // Clients can disconnect at any time — long jobs keep running server-side.
 import { Agent } from "@earendil-works/pi-agent-core";
+import { alignDown } from "./lib/chunk-window.mjs";
+// egress redaction (plan §2.2b): inline base64 → content hash + the /media route
+import { createMediaStore, redactImageData, hydrateImageData } from "./lib/media-egress.mjs";
 // pi-ai 1.4.0: AgentOptions.streamFn is REQUIRED — the compat subpath exports the
 // generic streamSimple dispatcher (routes on model.api) and auto-registers the
 // builtin api providers on import
@@ -119,7 +122,7 @@ const serializeConversation = (messages) => {
 };
 
 export class AgentHub {
-	constructor({ modelsStore, getAuth, persist, broadcast, getTools, getSystemPrompt, defaultModelId, onRuntimeChange, loadMessages, summarize, backupMirror, versions }) {
+	constructor({ modelsStore, getAuth, persist, broadcast, getTools, getSystemPrompt, defaultModelId, onRuntimeChange, loadMessages, summarize, backupMirror, versions, mediaDir }) {
 		this.modelsStore = modelsStore;
 		this.getAuth = getAuth;
 		this.persist = persist; // async (id, data, metadata) — worker store (atomic)
@@ -133,6 +136,16 @@ export class AgentHub {
 		// simple meta (vid/turn/firstId/count) so versions are restorable
 		this.versions = versions || null;
 		this.broadcast = broadcast; // (sessionId, msg) — send to attached clients
+		// MEDIA STORE (user design 2026-10-25): the image is kept as BINARY — never base64, never the raw
+		// original (the browser already resized/encoded it). base64 is produced only when the LLM request
+		// is built (`hydrateImageData`). `dir` makes it survive a restart, which is what "keep the session
+		// image on the server" means; the in-memory LRU in front of it is just a read cache.
+		this.media = createMediaStore({
+			maxBytes: Math.max(8, Number(process.env.PI_WEB_MEDIA_CACHE_MB) || 64) * 1024 * 1024,
+			dir: mediaDir || null,
+		});
+		this._redactedMsg = new WeakMap(); // message object → its redacted twin (once per object)
+		this.mediaPersist = true;          // retention: "server" (default) = persist to disk
 		// server-side toolset (2026-10-21): the SAME builtin+extension tools the exec
 		// bridge exposes — executed IN THIS PROCESS by the server-side agent loop, so
 		// a run survives browser closes and every device sees live progress
@@ -167,14 +180,18 @@ export class AgentHub {
 		return undefined;
 	}
 
-	getSession(sessionId, { modelId, thinkingLevel, title, messages } = {}) {
+	getSession(sessionId, { modelId, thinkingLevel, title, messages, rewriteSeq, rewrittenFrom } = {}) {
 		this.discarded.delete(sessionId); // explicit re-open undeletes
 		let entry = this.sessions.get(sessionId);
 		if (!entry) {
 			const model = this._getModel(modelId) || this._defaultModel();
 			if (!model) throw new Error("no models available");
 			const level = thinkingLevel || "high";
-			const systemPrompt = this.getSystemPrompt(); // undefined → pi's built-in chat default
+			// the server resolves this (lib/system-prompt.mjs): a prompt FILE when one is
+			// configured, otherwise a built-in prompt composed in code — so this is never
+			// undefined in practice, and the `systemPrompt ? … : …` belt-and-braces stays
+			// for embedders that pass no resolver at all.
+			const systemPrompt = this.getSystemPrompt();
 			const agent = new Agent({
 				streamFn: streamSimple, // pi-ai 1.4.0: streamFn required (compat generic dispatcher)
 				initialState: {
@@ -194,6 +211,12 @@ export class AgentHub {
 			};
 			entry = {
 				agent,
+				// HYDRATION FLAG (2026-10-24): an entry created BEFORE the transcript is
+				// loaded must not look hydrated — a fresh entry legitimately carries one
+				// message (the materialized system prompt), so "messages.length > 0" is
+				// NOT a usable proxy. The caller-supplied `messages` argument is the
+				// authoritative signal: when it is present the caller HAS the transcript.
+				hydrated: messages !== undefined,
 				model,
 				thinkingLevel: level,
 				seq: 0, // monotonic event sequence for attach dedup
@@ -208,6 +231,13 @@ export class AgentHub {
 				userPersisted: false,
 				followUpCount: 0,
 				mutateEpoch: 0, // bumped by rewriteSession — invalidates prompts queued pre-truncate
+				// TAIL-FIRST CACHE (2026-10-24): persisted rewrite generation + the seq
+				// where the last rewrite started. seqs < rewrittenFrom are identity-stable
+				// across epochs (this product never rewrites a prefix in place), so client
+				// IDB chunks strictly below rewrittenFrom survive edits/restores/retries.
+				// MAX_SAFE_INTEGER = no rewrite yet ("everything stable") — Math.min-safe.
+				rewriteSeq: rewriteSeq || 0,
+				rewrittenFrom: rewrittenFrom ?? Number.MAX_SAFE_INTEGER,
 				pendingPrompt: null, // steering UI payload {text, images, queuedAt} while held
 				pendingPromptMessage: null, // the exact AgentMessage — consumed on message_end
 			};
@@ -281,7 +311,7 @@ export class AgentHub {
 					// on every user action (prompt/steer/abort/edit/retry), so it only ever
 					// chains consecutive failures of the same turn.
 					if (failed) this._maybeScheduleAutoRetry(entry, sessionId, lastA);
-					else { entry.retryAttempts = 0; entry.retryNote = null; }
+					else { entry.retryAttempts = 0; entry.retryNote = null; entry.retryGivenUp = false; entry.retryPending = null; }
 				}
 				const payload = { type: "agent-event", sessionId, seq: entry.seq, event };
 				// liveness heartbeat for the zombie self-heal (grok Q1): multi-turn runs
@@ -320,7 +350,13 @@ export class AgentHub {
 	 *  2026-10-21: per-session entry.buffer hook — the old implementation swapped
 	 *  the GLOBAL this.broadcast, which was not reentrant when two attaches
 	 *  interleaved (one restore clobbered the other's interception). */
-	attach(sessionId, deliver) {
+	async attach(sessionId, deliver, { tailFirst = false, haveTo = 0 } = {}) {
+		// HYDRATE FIRST (2026-10-24): the attach used to build its snapshot from
+		// whatever entry existed — so a session whose entry was created before the
+		// transcript loaded (a raced store read, a prompt, an earlier attach) shipped
+		// an empty window for the life of the process. Awaiting the load here makes
+		// the snapshot correct no matter which path created the entry.
+		await this._ensureEntry(sessionId);
 		const entry = this.getSession(sessionId);
 		const queue = (entry.buffer = []); // emit path buffers while non-null
 		const state = {
@@ -332,8 +368,40 @@ export class AgentHub {
 			seq: entry.seq,
 			pendingPrompt: entry.pendingPrompt ?? null,
 		};
+		// TAIL-FIRST ATTACH (2026-10-24): a capable client (tailFirst) gets the last
+		// ~512KB of serialized messages instead of the whole 2-7.3MB transcript; the
+		// sparse envelope tells it where the window sits (index = seq) so it can
+		// backfill older messages via /range into IDB. Small sessions: full attach.
+		if (tailFirst) {
+			const msgs = entry.agent.state.messages;
+			const count = msgs.length;
+			let bytes = 0, from = count;
+			while (from > 0 && (bytes < 1024 * 1024 || from === count)) { // TAIL_BYTES = 1MB (user: 512KB felt too short)
+				from--;
+				try { bytes += JSON.stringify(msgs[from]).length; } catch { bytes += 256; }
+			}
+			// C4: snap the window start to a chunk boundary (the same helper /range uses) so a
+			// live-written chunk and this window share a key — but never snap all the way to 0,
+			// which would turn a huge-message tail into a full attach (the byte-derived start
+			// stays in that edge case, leaving at most one partial chunk at the seam).
+			const snapped = alignDown(from);
+			if (snapped > 0) from = snapped;
+			if (from > 0 && bytes > 768 * 1024) { // only worth it when the tail is meaningfully smaller
+				// C4 "don't re-send what the client has": haveTo is the end of the client's cached
+				// coverage. The claim snaps DOWN, so the wire may carry up to 63 messages the
+				// client already has (harmless — mergeRanges replaces them) rather than forcing
+				// it to fetch a partial chunk. A claim below the window start sends everything.
+				const claim = Math.max(0, Math.min(Number(haveTo) || 0, count));
+				// A claim that REACHES the session end means the client holds the whole window,
+				// including the trailing partial chunk — send nothing at all (the ideal return
+				// visit: zero bytes). Anything less snaps down (see above).
+				const sentFrom = claim >= count ? count : Math.max(from, alignDown(claim));
+				state.messages = msgs.slice(sentFrom);
+				state.sparse = { fromSeq: from, messageCount: count, sentFrom, rewriteSeq: entry.rewriteSeq || 0, rewrittenFrom: entry.rewrittenFrom || 0 };
+			}
+		}
 		entry.buffer = null; // stop buffering BEFORE delivering (synchronous — no interleave)
-		deliver({ type: "state", sessionId, ...state });
+		deliver({ type: "state", sessionId, ...state, rewriteSeq: entry.rewriteSeq || 0, rewrittenFrom: entry.rewrittenFrom || 0 });
 		for (const msg of queue) deliver(msg);
 		return entry;
 	}
@@ -485,11 +553,42 @@ export class AgentHub {
 			attempts: Math.max(0, Math.min(10, Number(cfg.attempts ?? this.autoRetry?.attempts ?? 3) || 3)),
 			delayMs: Math.max(0, Math.min(60000, Number(cfg.delayMs ?? this.autoRetry?.delayMs ?? 3000) || 3000)),
 		};
+		// A1 (reviewer1 #3, user report "cannot cancel auto-retry"): disabling must
+		// also cancel ALREADY-SCHEDULED timers — the old code left entry.retryTimers
+		// running and the callbacks never re-checked `enabled`, so a disable during a
+		// 30 s Retry-After wait still fired. Cancel every session's pending retry.
+		if (!this.autoRetry.enabled) {
+			for (const [sid, e] of this.sessions) {
+				if (!e.retryPending && !e.retryTimer) continue;
+				this._cancelAutoRetry(e);
+				e.retryNote = null;
+				e.retryGivenUp = false;
+				this.emitRuntime(sid);
+			}
+		}
 		return { ...this.autoRetry };
 	}
 
+	/** Clear a session's pending auto-retry (timer + runtime marker + epoch bump).
+	 *  Pure state clear — callers own retryNote cleanup + emitRuntime. The epoch
+	 *  bump makes any timer callback that somehow still fires a no-op. */
 	_cancelAutoRetry(entry) {
 		if (entry?.retryTimer) { clearTimeout(entry.retryTimer); entry.retryTimer = null; }
+		if (entry?.retryPending) { entry.retryPending = null; entry.retryEpoch = (entry.retryEpoch || 0) + 1; }
+	}
+
+	/** CANCEL the pending auto-retry of one session (new WS "cancel-retry", UI
+	 *  Cancel button): cancels THIS pending retry only — auto-retry stays enabled
+		*  for future failures, and the failed turn stays as-is (plain error + Retry). */
+	cancelPendingRetry(sessionId) {
+		const entry = this.sessions.get(sessionId);
+		if (!entry) return { ok: false, reason: "no live session" };
+		const had = !!entry.retryPending || !!entry.retryTimer;
+		this._cancelAutoRetry(entry);
+		entry.retryNote = null;
+		entry.retryGivenUp = false;
+		this.emitRuntime(sessionId);
+		return { ok: true, cancelled: had };
 	}
 
 	/** Schedule ONE more attempt when a run died of a retryable error. Chained
@@ -502,21 +601,47 @@ export class AgentHub {
 		if (this.discarded.has(sessionId)) return;
 		if ((entry.retryAttempts || 0) >= cfg.attempts) {
 			entry.retryNote = `auto-retry gave up after ${cfg.attempts} attempt(s) — press Retry to try again`;
+			entry.retryGivenUp = true;
+			entry.retryPending = null;
 			this.emitRuntime(sessionId);
 			return;
 		}
-		entry.retryAttempts = (entry.retryAttempts || 0) + 1;
 		// Honour a provider-specified wait when the error carries one ("retry after 30",
 		// "retry-after: 30") — bounded to 30 s — and add a little jitter so N sessions that
 		// hit the same rate limit do not retry in lockstep (grok review 2026-10-23).
+		const nextAttempt = (entry.retryAttempts || 0) + 1;
 		const ra = /retry[- ]?after[^0-9]{0,6}(\d{1,3})/i.exec(String(failedMessage?.errorMessage || ""));
 		const waitMs = Math.max(cfg.delayMs, ra ? Math.min(30000, Number(ra[1]) * 1000) : 0) + Math.floor(Math.random() * 250);
-		entry.retryNote = `retrying (${entry.retryAttempts}/${cfg.attempts})…`;
-		this.emitRuntime(sessionId);
+		entry.retryNote = `retrying (${nextAttempt}/${cfg.attempts})…`;
+		entry.retryGivenUp = false;
 		this._cancelAutoRetry(entry);
+		const epoch = (entry.retryEpoch = (entry.retryEpoch || 0) + 1);
+		// RUNTIME EXPOSURE (auto-retry UI 2026-10-24): the pending retry ships on the
+		// runtime frame — every device renders the same server-driven countdown;
+		// retryAt (epoch ms) lets clients tick locally without server pushes.
+		entry.retryPending = { attempt: nextAttempt, attempts: cfg.attempts, retryAt: Date.now() + waitMs, delayMs: waitMs, epoch };
+		this.emitRuntime(sessionId);
 		entry.retryTimer = setTimeout(() => {
 			entry.retryTimer = null;
-			this.retry(sessionId, { reason: "auto" }).catch((err) => console.error(`[hub] auto-retry failed for ${sessionId}:`, err?.message || err));
+			// FIRE-TIME GUARDS (A2): enabled may have been flipped off, the session
+			// discarded or compaction started AFTER scheduling — re-check live, and an
+			// epoch mismatch means cancel/disable superseded this timer.
+			if (!this.autoRetry?.enabled || this.discarded.has(sessionId) || entry.compacting || entry.retryPending?.epoch !== epoch) {
+				entry.retryPending = null;
+				entry.retryNote = null;
+				this.emitRuntime(sessionId);
+				return; // NO attempt burned
+			}
+			entry.retryPending = null;
+			this.emitRuntime(sessionId);
+			// The attempt counter commits HERE, synchronously at dispatch (A2): the
+			// fire-time guards above already cleared refused cases (disabled/discarded/
+			// compacting), so a burn here is a real dispatch. Committing in .then()
+			// instead would lag behind the NEXT failure's agent_end (retry's promise
+			// resolves at run end) and the cap check would under-count → over-run.
+			entry.retryAttempts = nextAttempt;
+			this.retry(sessionId, { reason: "auto" })
+				.catch((err) => console.error(`[hub] auto-retry failed for ${sessionId}:`, err?.message || err));
 		}, waitMs);
 		if (typeof entry.retryTimer?.unref === "function") entry.retryTimer.unref();
 	}
@@ -533,24 +658,52 @@ export class AgentHub {
 			if (!last) break;
 			const failedAssistant = last.role === "assistant" && (last.stopReason === "error" || last.stopReason === "aborted");
 			const orphanResult = last.role === "toolResult" && !msgs.slice(0, -1).some((m) => m.role === "assistant" && Array.isArray(m.content) && m.content.some((p) => p.type === "toolCall" && p.id === last.toolCallId));
-			if (!failedAssistant && !orphanResult) break;
+			// DEAD-END assistant (user report 2026-10-24): stopReason "toolUse" whose
+			// toolCall was already stripped (hydration/prompt repair) — pi cannot
+			// continue() from an assistant tail, so leaving it in place forces the
+			// RESEND fallback (full wipe to the user turn). Pop it so retry
+			// continues from the user turn instead. A HEALTHY assistant (stopReason
+			// "stop"/"aborted" with text, or toolUse that still has calls) never
+			// matches — retry must not regenerate healthy turns.
+			const deadEndAssistant = last.role === "assistant" && last.stopReason === "toolUse" && Array.isArray(last.content) && !last.content.some((p) => p.type === "toolCall");
+			if (!failedAssistant && !orphanResult && !deadEndAssistant) break;
 			msgs.pop();
 			dropped++;
 		}
 		if (dropped) {
-			// a stream that died mid-tool-call leaves toolCalls with no toolResult —
-			// invalid for the Anthropic/OpenAI tool protocol (the same repair
-			// prompt() performs before a run)
+			// REPAIR v2 (user report 2026-10-24: "toolcall and assistant turn removed
+			// after clicking retry after 429"): a run that died mid-tool-round leaves
+			// an assistant message whose toolCall never got a toolResult. The old
+			// repair STRIPPED the dangling call — leaving the transcript ending on an
+			// ASSISTANT message; retry()'s canContinue check (user/toolResult only)
+			// then fell into the RESEND fallback, which truncates the whole turn back
+			// to the user message. Thinking + tool round wiped. Now: keep the
+			// assistant message and SYNTHESIZE an interrupted toolResult per dangling
+			// call (pi's createToolResultMessage shape, isError) — the transcript
+			// stays protocol-valid AND continue()-able: the model sees the
+			// interrupted result and re-plans, i.e. exactly "retry from the toolcall
+			// after removing the 429 message".
+			const trIds = new Set(msgs.filter((x) => x.role === "toolResult").map((x) => x.toolCallId));
 			for (let i = msgs.length - 1; i >= 0; i--) {
 				const m = msgs[i];
 				if (m.role !== "assistant") continue;
-				if (!Array.isArray(m.content)) break;
-				const trIds = new Set(msgs.filter((x) => x.role === "toolResult").map((x) => x.toolCallId));
-				const filtered = m.content.filter((p) => p.type !== "toolCall" || trIds.has(p.id));
-				if (filtered.length !== m.content.length) msgs[i] = { ...m, content: filtered.length > 0 ? filtered : [{ type: "text", text: "(tool call interrupted by error)" }] };
-				break;
+				if (Array.isArray(m.content)) {
+					const dangling = m.content.filter((p) => p.type === "toolCall" && !trIds.has(p.id));
+					for (const tc of dangling) {
+						msgs.push({
+							role: "toolResult",
+							toolCallId: tc.id,
+							toolName: tc.name,
+							content: [{ type: "text", text: "(tool call interrupted by error — recovered by retry)" }],
+							isError: true,
+							timestamp: Date.now(),
+						});
+					}
+				}
+				break; // only the LAST assistant can dangle — earlier rounds are paired, else the run would have failed there
 			}
 			entry.mutateEpoch = (entry.mutateEpoch || 0) + 1;
+			this._bumpRewrite(entry, msgs.length); // tail-first cache: rewrite point = post-drop length
 		}
 		return dropped;
 	}
@@ -568,7 +721,7 @@ export class AgentHub {
 		if (!entry) return { ok: false, reason: "no live session" };
 		if (entry.compacting) return { ok: false, reason: "compaction in progress — try again shortly" };
 		if (entry.agent.state.isStreaming) return { ok: false, reason: "a run is already streaming" };
-		if (reason !== "auto") { this._cancelAutoRetry(entry); entry.retryAttempts = 0; entry.retryNote = null; }
+		if (reason !== "auto") { this._cancelAutoRetry(entry); entry.retryAttempts = 0; entry.retryNote = null; entry.retryGivenUp = false; }
 		const dropped = this._dropFailedTail(entry);
 		// refuse when nothing failed — retry must never regenerate a healthy turn
 		if (dropped === 0) return { ok: false, reason: "nothing to retry (the transcript does not end in a failed turn)" };
@@ -691,6 +844,105 @@ export class AgentHub {
 
 	/** Snapshot for attaching clients (cold sessions). Mid-run attachers get the
 	 *  in-flight streamingMessage + pending tool calls too (grok r3 Q1). */
+	/**
+	 * EGRESS redaction (plan §2.2b, 2026-10-25): every frame that leaves the process replaces inline
+	 * image base64 with {hash, bytes} + an address on the media route. The session FILE and the model
+	 * input keep the bytes — only what travels loses them. Content-addressed, so it is idempotent;
+	 * the WeakMap makes it once per message object (a live turn re-sends whole state frames, and
+	 * re-redacting the same object must not re-decode 8 photos).
+	 */
+	redactMessages(messages) {
+		if (!Array.isArray(messages) || !messages.length) return messages;
+		// CACHE PER MESSAGE OBJECT, never per array (grok review 2026-10-25, blocker 4):
+		// `state.messages` is one long-lived array that the agent PUSHES into — caching the container
+		// would freeze the transcript at its first-redacted length and hide every later turn.
+		this._redactedMsg ||= new WeakMap();
+		let changed = false;
+		const out = messages.map((m) => {
+			if (!Array.isArray(m?.content)) return m;
+			const hit = this._redactedMsg.get(m);
+			// a CACHED twin still counts as "changed" for THIS call, or a transcript that was redacted
+			// once would be returned as the ORIGINAL array (with the inline base64 back) on every later
+			// egress — the leak this whole file exists to prevent (caught by L14 in the suite).
+			if (hit) { changed ||= hit !== m; return hit; }
+			const redacted = redactImageData([m], { store: this.media, persist: this.mediaPersist }).messages[0];
+			if (redacted !== m) this._redactedMsg.set(m, redacted);
+			changed ||= redacted !== m;
+			return redacted;
+		});
+		return changed ? out : messages;
+	}
+
+	/** RETENTION (Settings → Data use → Image storage): false = keep bytes in memory only. */
+	setMediaPersist(persist) {
+		this.mediaPersist = persist !== false;
+		return this.mediaPersist;
+	}
+
+	/** One egress FRAME (state or agent-event) with every inline image replaced by its hash. */
+	redactFrame(msg) {
+		if (!msg || typeof msg !== "object") return msg;
+		const out = { ...msg };
+		let changed = false;
+
+		if (Array.isArray(msg.messages)) {
+			const messages = this.redactMessages(msg.messages);
+			// the in-flight snapshot is its own message object → the same per-message cache applies
+			const streaming = msg.streamingMessage ? this.redactMessages([msg.streamingMessage])[0] : msg.streamingMessage;
+			if (messages !== msg.messages) { out.messages = messages; changed = true; }
+			if (streaming !== msg.streamingMessage) { out.streamingMessage = streaming ?? null; changed = true; }
+		}
+
+		// A pending STEER holds its images exactly as the client sent them, and it rides on STATE frames:
+		// redact those too, or every state/steering frame re-sends the full base64
+		// (review report.md L2, 2026-10-27).
+		const pendingImages = msg.pendingPrompt?.images;
+		const redactedImages = this.redactPromptImages(pendingImages);
+		if (redactedImages !== pendingImages) { out.pendingPrompt = { ...msg.pendingPrompt, images: redactedImages }; changed = true; }
+
+		const event = msg.event;
+		if (event?.message && Array.isArray(event.message.content)) {
+			const message = this.redactMessages([event.message])[0];
+			if (message !== event.message) { out.event = { ...event, message }; changed = true; }
+		}
+
+		return changed ? out : msg;
+	}
+
+	/** Redact a bare ImageContent[] (the shape `pendingPrompt.images` uses). */
+	redactPromptImages(images) {
+		if (!Array.isArray(images) || !images.length) return images;
+		const wrapped = images.map((im) => ({ role: "user", content: [im] }));
+		const out = this.redactMessages(wrapped);
+		return out === wrapped ? images : out.map((m) => m.content[0]);
+	}
+
+	/** The bytes behind a hash (for GET /api/agent/session/:id/media/:hash). */
+	getMedia(hash) {
+		return this.media.get(hash);
+	}
+
+	/**
+	 * The in-flight assistant snapshot of a session, if any — the reducer SEEDS itself with it, because
+	 * attach/GET deliver it in full and a fresh reducer starting at 0 would truncate the client
+	 * backwards (grok review 2026-10-25, blocker 3).
+	 */
+	streamingSnapshot(sessionId) {
+		return this.sessions.get(sessionId)?.agent?.state?.streamingMessage ?? null;
+	}
+
+	/**
+	 * Store a client-encoded image (POST …/media) and return its content address.
+	 * `persist: false` = the "browser keeps its images" retention mode: memory only.
+	 */
+	putMedia(bytes, mimeType = "application/octet-stream", { persist = true } = {}) {
+		const buf = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+		if (!buf.length) return null;
+		const hash = crypto.createHash("sha256").update(buf).digest("hex");
+		const entry = this.media.put(hash, buf, mimeType, { persist });
+		return { hash, bytes: buf.length, persisted: !!entry?.persisted };
+	}
+
 	getState(sessionId) {
 		const entry = this.sessions.get(sessionId);
 		if (!entry) {
@@ -700,11 +952,15 @@ export class AgentHub {
 		const state = entry.agent.state;
 		const payload = {
 			exists: true,
-			messages: state.messages,
+			messages: this.redactMessages(state.messages),
 			model: state.model,
 			thinkingLevel: state.thinkingLevel,
 			isStreaming: state.isStreaming,
-			streamingMessage: state.streamingMessage ?? null,
+			// tail-first cache: rewrite generation + seq floor (client IDB invalidation)
+			rewriteSeq: entry.rewriteSeq || 0,
+			rewrittenFrom: entry.rewrittenFrom || 0,
+			// the in-flight snapshot can hold images too (a user message with photos while it streams)
+			streamingMessage: state.streamingMessage ? this.redactMessages([state.streamingMessage])[0] : null,
 			pendingToolCalls: state.pendingToolCalls instanceof Set ? [...state.pendingToolCalls] : [],
 			compacting: !!entry.compacting, // all devices show the progress banner
 			pendingPrompt: entry.pendingPrompt ?? null,
@@ -732,7 +988,7 @@ export class AgentHub {
 	 *  messages for existing entries, so fill it in place here, normalized). */
 	async _ensureEntry(sessionId) {
 		let entry = this.sessions.get(sessionId);
-		if (entry && entry.agent.state.messages.length > 0) return entry;
+		if (entry?.hydrated) return entry;
 		if (this.loadMessages) {
 			try {
 				const stored = await this.loadMessages(sessionId);
@@ -744,16 +1000,63 @@ export class AgentHub {
 							title: stored.metadata?.title,
 							messages: stored.messages,
 						});
-					} else {
+					} else if (entry.agent.state.messages.filter((m) => m.role !== "system").length === 0) {
+						// An entry with NO real messages is safe to fill — that is the
+						// poisoned case (created by an attach/prompt that raced the store).
+						// One with messages is a LIVE transcript: never overwrite it.
 						entry.agent.state.messages = normalizeRestoredMessages(stored.messages);
+						entry.hydrated = true;
 						if (stored.metadata?.modelId) { const m = this._getModel(stored.metadata.modelId); if (m) entry.agent.state.model = m; }
 						if (stored.metadata?.thinkingLevel) entry.agent.state.thinkingLevel = stored.metadata.thinkingLevel;
 						if (stored.metadata?.title) entry.title = stored.metadata.title;
+					} else {
+						entry.hydrated = true; // live transcript wins; nothing to load
 					}
+				} else {
+					// the store has nothing (a genuinely new session): create it if needed and
+					// mark it, so every later attach does not re-query the store for nothing
+					entry = this.getSession(sessionId);
+					entry.hydrated = true;
 				}
-			} catch { /* store miss → the caller's guards handle it */ }
+			} catch { /* store miss → leave the flag alone so a later call retries */ }
+		} else if (entry) {
+			entry.hydrated = true;
 		}
 		return entry;
+	}
+
+	/** Rewrite-generation tracking (tail-first client cache, 2026-10-24): bumped
+	 *  on EVERY transcript rewrite (edit/restore/retry-drop/compact). rewrittenFrom
+	 *  = the seq where the rewrite started — the client may keep cached chunks
+	 *  strictly below it (monotonic min: a later EARLIER rewrite shrinks it; a
+	 *  later LATER one keeps the smaller — conservative and safe). */
+	_bumpRewrite(entry, from) {
+		entry.rewriteSeq = (entry.rewriteSeq || 0) + 1;
+		entry.rewrittenFrom = Math.min(entry.rewrittenFrom ?? from, from);
+		return { rewriteSeq: entry.rewriteSeq, rewrittenFrom: entry.rewrittenFrom };
+	}
+
+	/** Range slice of the CURRENT transcript — the authority for the client's
+	 *  tail-first cache (the live entry IS the truth; the mirror may lag). Seqs
+	 *  are 0-based message indices; the returned window may be shorter than
+	 *  requested (clamped to [0, messageCount)). */
+	getRange(sessionId, { fromSeq = 0, toSeq = Infinity } = {}) {
+		const entry = this.sessions.get(sessionId);
+		if (!entry) return null;
+		const msgs = entry.agent.state.messages;
+		const count = msgs.length;
+		const from = Math.max(0, Math.min(Number(fromSeq) || 0, count));
+		const toRaw = Number(toSeq);
+		const to = Math.max(from, Math.min(!toRaw || toRaw === Infinity ? count : Math.floor(toRaw), count));
+		return {
+			sessionId,
+			fromSeq: from,
+			toSeq: to,
+			messageCount: count,
+			rewriteSeq: entry.rewriteSeq || 0,
+			rewrittenFrom: entry.rewrittenFrom || 0,
+			messages: msgs.slice(from, to),
+		};
 	}
 
 	/** Mirror metadata builder (shared by _writeSession and empty forks). */
@@ -785,6 +1088,9 @@ export class AgentHub {
 			messageCount: state.messages.length,
 		};
 		if (entry.forkedFrom) metadata.forkedFrom = entry.forkedFrom; // lineage (pi header: parentSession)
+		// tail-first cache: the client's IDB chunks are keyed on this generation
+		metadata.rewriteSeq = entry.rewriteSeq || 0;
+		metadata.rewrittenFrom = entry.rewrittenFrom ?? Number.MAX_SAFE_INTEGER;
 		if (!entry.createdAt) entry.createdAt = now;
 		return metadata;
 	}
@@ -857,6 +1163,7 @@ export class AgentHub {
 			} catch { /* best-effort — the edit proceeds without a version */ }
 		}
 		entry.agent.state.messages = msgs.slice(0, n);
+		this._bumpRewrite(entry, n); // tail-first cache: chunks below n survive
 		entry.mutateEpoch = (entry.mutateEpoch || 0) + 1;
 		entry.pendingPrompt = null;
 		entry.pendingPromptMessage = null;
@@ -910,6 +1217,7 @@ export class AgentHub {
 			} catch { /* best-effort */ }
 		}
 		entry.agent.state.messages = msgs.slice(0, i);
+		this._bumpRewrite(entry, i); // tail-first cache: chunks below i survive
 		entry.mutateEpoch = (entry.mutateEpoch || 0) + 1;
 		entry.pendingPrompt = null; entry.pendingPromptMessage = null; entry.followUpCount = 0; entry.runtime.pendingPrompts = 0;
 		this.emitRuntime(sessionId); this.emitSteering(sessionId);
@@ -948,6 +1256,10 @@ export class AgentHub {
 		if (!rec || !Array.isArray(rec.messages)) throw new Error(`version ${vid} not found`);
 		const active = entry.agent.state.messages;
 		const base = Math.max(0, Math.min(Number(rec.turn) || 0, active.length));
+		// NO-OP restore (user report 2026-10-24): clicking "switch to" on the
+		// version that already matches the live tail changed nothing but still
+		// bumped the epoch + re-persisted. Detect and return early.
+		if (JSON.stringify(active.slice(base)) === JSON.stringify(rec.messages)) return { ok: true, noop: true, restored: vid };
 		if (active.length > base) {
 			try {
 				await this.versions.append(sessionId, {
@@ -960,6 +1272,7 @@ export class AgentHub {
 			} catch { /* best-effort */ }
 		}
 		entry.agent.state.messages = [...active.slice(0, base), ...JSON.parse(JSON.stringify(rec.messages))];
+		this._bumpRewrite(entry, base); // tail-first cache: chunks below base survive
 		entry.mutateEpoch = (entry.mutateEpoch || 0) + 1;
 		entry.pendingPrompt = null;
 		entry.pendingPromptMessage = null;
@@ -1016,6 +1329,10 @@ export class AgentHub {
 			const keptMsgs = msgs.slice(cut).map((m) => { const c = { ...m }; if (Array.isArray(c.content)) c.content = JSON.parse(JSON.stringify(c.content)); return c; });
 			entry.agent.state.messages = [summaryMsg, ...keptMsgs];
 			entry.mutateEpoch = (entry.mutateEpoch || 0) + 1;
+			// tail-first cache: the summary is INSERTED at index `from` — seqs [0, from)
+			// keep their lines (identity-stable), everything from `from` on is renumbered.
+			// Chunks below `from` survive; chunks overlapping the span are invalidated.
+			this._bumpRewrite(entry, from);
 			entry.pendingPrompt = null; entry.pendingPromptMessage = null; entry.followUpCount = 0; entry.runtime.pendingPrompts = 0;
 			this.emitRuntime(sessionId); this.emitSteering(sessionId);
 			await this.persistSession(sessionId, true);
@@ -1057,7 +1374,19 @@ export class AgentHub {
 			try { this.emitRuntime(sessionId); } catch { /* sink must not break reads */ }
 			console.log(`[hub] runtime zombie settled: ${sessionId} (last stop=${lastA?.stopReason || "none"} — no agent_end ever fired)`);
 		}
-		return { ...entry.runtime, sessionId, seq: entry.seq };
+		return { ...entry.runtime, sessionId, seq: entry.seq, ...this._retryRuntimeView(entry) };
+	}
+
+	/** The retry slice of the runtime frame (auto-retry UI 2026-10-24): pending
+	 *  countdown (server-driven, client ticks from retryAt) or the give-up note.
+	 *  Absent otherwise — presence is the signal, no boolean soup. */
+	_retryRuntimeView(entry) {
+		if (entry.retryPending) {
+			const p = entry.retryPending;
+			return { retry: { state: "scheduled", attempt: p.attempt, attempts: p.attempts, retryAt: p.retryAt, delayMs: p.delayMs, epoch: p.epoch } };
+		}
+		if (entry.retryGivenUp && entry.retryNote) return { retry: { state: "given-up", note: entry.retryNote } };
+		return {};
 	}
 
 	/** Authoritative force-settle: used by abort()/Kill — the terminal event may

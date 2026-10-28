@@ -9,8 +9,7 @@ name: CI
 # stub-assertion proof), so the bundle is independent of how npm resolved them.
 #
 # Real-LLM suites (test:agent, test:steer, test:killstop) are deliberately NOT
-# run here: they need provider keys and minutes of wall time. Windows CI is
-# temporarily disabled while its build is broken on this branch.
+# run here: they need provider keys and minutes of wall time.
 
 on:
   push:
@@ -31,8 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # os: [ubuntu-latest, windows-latest]
-        os: [ubuntu-latest]
+        os: [ubuntu-latest, windows-latest]
         node-version: ["22", "24"]
     steps:
       - uses: actions/checkout@v4
@@ -59,6 +57,11 @@ jobs:
 
       # Hermetic, node-only suites (no provider keys, no pty/bash, scratch
       # servers on random ports with a temp data dir where needed).
+      # NOTE (review 2026-10-25): the tail-first/IDB branch shipped test:range,
+      # test:idb and test:hydration — none of which were wired here, so the suites
+      # that cover its new machinery never ran in CI. Both reviewers then found
+      # bounds bugs in that machinery within a day. They are hermetic (pure
+      # functions + the hub with the faux provider), so they run on both runners.
       - name: "Tests (store, runtime, ssrf, zombie, versions)"
         run: |
           npm run test:store
@@ -66,8 +69,28 @@ jobs:
           npm run test:ssrf
           npm run test:zombie
           npm run test:versions
+      - name: "Tests (tail-first / IDB cache, ranges, sparse hydration, view gate)"
+        run: |
+          npm run test:range
+          npm run test:idb
+          npm run test:hydration
+          npm run test:gate
+          npm run test:pty
+          npm run test:toolcall
+          npm run test:sysprompt
       - name: "Tests (security gates — token + origin/Host allowlist)"
         run: npm run test:security
+
+      # Data-transfer policy and deflate tests are hermetic and run on both runners.
+      - name: "Tests (data reduction, thinking flush, WS deflate)"
+        run: |
+          npm run test:data
+          npm run test:thinking
+          npm run test:deflate
+          npm run test:imgcompress
+          npm run test:reduce
+          npm run test:reduce-e2e
+          npm run test:media-e2e
 
       - name: "Tests (terminal platform + WebSocket smoke)"
         run: |
@@ -103,6 +126,7 @@ jobs:
           cp -R lib/. release-package/lib/
           cp -R public/. release-package/public/
           cp -R stubs/. release-package/stubs/
+          cp -R node_modules release-package/node_modules
           tar -czf pi-web-ui.tar.gz -C release-package .
 
       - name: Upload archive to GitHub Release

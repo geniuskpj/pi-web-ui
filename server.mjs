@@ -45,11 +45,21 @@ import { streamSimple } from "@earendil-works/pi-ai/compat";
 // pi-ai 1.4.0 builtin catalog — the no-.pi fallback for the model list (5.6KB
 // aggregation module; the per-provider model data loads alongside it)
 import { getBuiltinProviders, getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
+import { buildProviderCatalog, clientProviders, resolvedKeys } from "./lib/pi-catalog.mjs";
 import { AgentHub } from "./agent-hub.mjs";
 import { createTerminalHub } from "./terminal-hub.mjs";
 import { defaultBashPath } from "./terminal-backends.mjs";
 import { killProcessTree } from "./process-tree.mjs";
+// per-connection stream reduction (plan §2.3): OFF unless the client opts in with
+// {type:"setDataReduction"}. Pure module → tests/stream-reduce.test.mjs.
+import { createStreamReducer, normalizeReductionConfig, describeReduction } from "./lib/stream-reduce.mjs";
+// egress media: the hash validator for GET /api/agent/session/:id/media/:hash
+import { isMediaHash } from "./lib/data-reduction.mjs";
+import { purgeMediaOlderThan } from "./lib/media-egress.mjs";
 import { stripBoilerplate } from "./lib/hp2.mjs";
+import { netClassOf } from "./lib/net-class.mjs";
+import { planRangeWindow } from "./lib/range-window.mjs";
+import { resolveSystemPrompt } from "./lib/system-prompt.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, "public");
@@ -122,9 +132,6 @@ function readWebProviderKeys() {
 		throw err;
 	}
 }
-function getProviderAuth() {
-	return Object.assign(Object.create(null), readJsonSafe("auth.json") || {}, readWebProviderKeys());
-}
 function saveWebProviderKey(provider, key) {
 	const keys = readWebProviderKeys();
 	Object.defineProperty(keys, provider, { value: { type: "api", key }, enumerable: true, configurable: true, writable: true });
@@ -140,47 +147,75 @@ function saveWebProviderKey(provider, key) {
 	}
 }
 
-function piConfig() {
-	const store = readJsonSafe("models-store.json") || {};
-	const settings = readJsonSafe("settings.json") || {};
-	const providers = [];
-	for (const [name, entry] of Object.entries(store)) {
-		const models = Array.isArray(entry?.models) ? entry.models : [];
+/** JSONC-LITE read for the files a USER hand-edits. `models.json` is documented as a
+ *  user-authored file, so a trailing comma or a // comment must not take the whole
+ *  provider catalog down (a real file in the wild had both). */
+function readJsonTolerant(file) {
+	let raw = null;
+	try { raw = fs.readFileSync(path.join(PI_DIR, file), "utf8"); } catch { return null; }
+	try { return JSON.parse(raw); } catch { /* try JSONC-lite */ }
+	try {
+		const stripped = raw
+			.replace(/\/\*[\s\S]*?\*\//g, "")                       // block comments
+			.replace(/(^|[^:"'\\])\/\/[^\n\r]*/g, "$1")            // line comments (not the // in https://)
+			.replace(/,\s*([}\]])/g, "$1");                         // trailing commas
+		const parsed = JSON.parse(stripped);
+		console.warn(`[pi-web] ${file} needed a tolerant parse (comments/trailing commas) — pi itself may reject it`);
+		return parsed;
+	} catch (err) {
+		console.error(`[pi-web] ${file} is not parsable JSON:`, err?.message || err);
+		return null;
+	}
+}
+
+/** pi-ai builtin catalog lookup (never throws — one broken provider must not kill the list). */
+function builtinModelsOf(name) {
+	try { return getBuiltinModels(name) || []; } catch { return []; }
+}
+
+/** The merged catalog (lib/pi-catalog.mjs): builtin catalog ∪ models-store.json ∪
+ *  `.pi/models.json` (user-added providers/models) ∪ auth.json (a provider you logged
+ *  into). Rebuilt on every `piModelsStore` refresh and on every /api/pi/config call, so
+ *  editing models.json shows up in the picker WITHOUT a server restart. */
+function buildCatalog() {
+	const catalog = buildProviderCatalog({
+		store: readJsonSafe("models-store.json") || {},
+		modelsJson: readJsonTolerant("models.json") || {},
+		auth: readJsonSafe("auth.json") || {},
+		builtinModels: builtinModelsOf,
+		env: process.env,
+	});
+	if (Object.keys(catalog.providers).length > 0) return catalog;
+	const providers = {};
+	for (const name of getBuiltinProviders()) {
+		const models = builtinModelsOf(name);
 		if (models.length === 0) continue;
-		providers.push({ name, baseUrl: models.find((m) => m.baseUrl)?.baseUrl || "", models });
+		providers[name] = { name, baseUrl: models.find((m) => m.baseUrl)?.baseUrl || "", models, origin: "builtin-catalog" };
 	}
-	// CATALOG FALLBACK (user request 2026-10-24): a deploy without .pi (no
-	// models-store.json, or one with no providers) used to boot with ZERO models —
-	// an empty picker that could never chat. pi-ai 1.4.0 ships a maintained builtin
-	// catalog (providers/all — 42 providers, records in exactly the models-store
-	// shape), so seed from it. Options considered: (2) REST GET {baseUrl}/models
-	// discovery — needs a key + network and returns bare ids without metadata
-	// (context window, reasoning flags) — rejected; (3) a backup-model-store.json
-	// in the repo — static, goes stale, duplicates upstream data — rejected. The
-	// builtin catalog is upstream-maintained, offline and key-free. Store entries
-	// ALWAYS win when present: they may carry custom ids/baseUrls the catalog lacks.
-	let catalogFallback = false;
-	if (providers.length === 0) {
-		try {
-			for (const name of getBuiltinProviders()) {
-				const models = getBuiltinModels(name);
-				if (models.length === 0) continue;
-				providers.push({ name, baseUrl: models.find((m) => m.baseUrl)?.baseUrl || "", models });
-			}
-			catalogFallback = providers.length > 0;
-		} catch (err) {
-			console.error("[pi-web] builtin model catalog unavailable:", err?.message || err);
-		}
-	}
+	return { ...catalog, providers };
+}
+
+function piConfig() {
+	const settings = readJsonSafe("settings.json") || {};
+	const providers = clientProviders(piModelsStore);
+	const origins = [...new Set(providers.map((p) => p.origin))];
 	return {
 		providers,
-		modelSource: providers.length === 0 ? "none" : catalogFallback ? "builtin-catalog" : "models-store",
+		modelSource: providers.length === 0 ? "none" : origins.length === 1 ? origins[0] : origins.join("+"),
 		defaults: {
 			provider: settings.default_provider || settings.defaultProvider || undefined,
 			model: settings.default_model || settings.defaultModel || undefined,
 			thinkingLevel: settings.defaultThinkingLevel || undefined,
 		},
 	};
+}
+
+/** Provider credential for a server-side run (auth.json wins, then models.json, then the
+ *  keyless placeholder) — the SAME map the hub and the summarizer use, so what the picker
+ *  offers is what actually resolves. */
+function providerKeyMap() {
+	const auth = Object.assign(Object.create(null), readJsonSafe("auth.json") || {}, readWebProviderKeys());
+	return resolvedKeys(piModelsStore, auth);
 }
 
 // --- auth: auto-generated token for non-loopback access ----------------------
@@ -395,7 +430,18 @@ app.use("*", async (c, next) => {
 	}
 });
 
-app.get("/api/health", (c) => c.json({ ok: true, bootId: BOOT_ID, buildId: BUILD_ID, piDir: PI_DIR }));
+app.get("/api/health", (c) => {
+	// TRANSFER POLICY (tail-first plan, 2026-10-24): the client decides tail-only
+	// vs full backfill from navigator.connection + this netClass fallback (the
+	// HTTP layer cannot see the client's link type — peer/Host classification is
+	// the server's only signal; the browser's NIA outranks it client-side).
+	const peer = c.env?.incoming?.socket?.remoteAddress || c.req.header("x-forwarded-for")?.split(",")[0]?.trim() || "";
+	const host = c.req.header("host") || "";
+	// Host parsing + private-range classification live in lib/net-class.mjs: pure,
+	// unit-tested, IPv6-aware (the old inline split(":")[0] broke every IPv6 host).
+	const netClass = netClassOf(peer, host);
+	return c.json({ ok: true, bootId: BOOT_ID, buildId: BUILD_ID, piDir: PI_DIR, netClass });
+});
 app.get("/api/version", (c) => c.json({ buildId: BUILD_ID, bootId: BOOT_ID }));
 app.get("/api/pi/config", (c) => { refreshModelsStore(); agentHub.defaultModelId = piDefaultModelId(); return c.json(piConfig()); });
 // pi system-prompt files — mirror pi-coding-agent resource-loader resolution exactly:
@@ -426,21 +472,44 @@ function isProjectTrusted(projectDir, agentDir) {
 		}
 	} catch { return false; } // unreadable trust.json → fail-closed, like pi-web
 }
-// Effective system prompt for the SERVER-SIDE agent (same precedence the client
-// sees from /api/pi/system): WEB_SYSTEM.md > trusted project SYSTEM.md > global
-// SYSTEM.md; APPEND_SYSTEM.md appends. undefined → pi's built-in chat default.
+// Effective system prompt for the SERVER-SIDE agent. Precedence lives in ONE place
+// (lib/system-prompt.mjs) so the hub and /api/pi/system cannot drift:
+//   WEB_SYSTEM.md > trusted project .pi/SYSTEM.md > global SYSTEM.md.
+//   APPEND_SYSTEM.md is NOT read (pi's file; the web prompt is self-contained).
+// When NO prompt file exists the resolver returns a BUILT-IN prompt composed in code
+// (pi-style sections: preamble/tools/rules/cwd) instead of undefined: pi-agent-core has
+// no built-in preamble and the hub only passes a systemPrompt when it is truthy, so the
+// old "undefined" case left the web agent with no prompt at all (2026-10-25).
 // Runtime-safe: AGENT_DIR/WORKSPACE_DIR are initialized before any call.
-function effectiveSystemPrompt() {
+function systemPromptReader() {
+	return (p) => {
+		try {
+			const st = fs.statSync(p);
+			return st.isFile() && st.size <= 1024 * 1024 ? fs.readFileSync(p, "utf8") : undefined;
+		} catch { return undefined; }
+	};
+}
+function resolveEffectiveSystemPrompt() {
 	const needsTrust = projectNeedsTrust(WORKSPACE_DIR);
 	const trusted = !needsTrust || isProjectTrusted(WORKSPACE_DIR, AGENT_DIR);
-	const read = (p) => { try { const st = fs.statSync(p); return st.isFile() && st.size <= 1024 * 1024 ? fs.readFileSync(p, "utf8") : undefined; } catch { return undefined; } };
-	const base = read(path.join(AGENT_DIR, "WEB_SYSTEM.md"))
-		|| (trusted ? read(path.join(WORKSPACE_DIR, ".pi", "SYSTEM.md")) : undefined)
-		|| read(path.join(AGENT_DIR, "SYSTEM.md"));
-	const append = (trusted ? read(path.join(WORKSPACE_DIR, ".pi", "APPEND_SYSTEM.md")) : undefined)
-		|| read(path.join(AGENT_DIR, "APPEND_SYSTEM.md"));
-	if (!base && !append) return undefined;
-	return [base, append].filter(Boolean).join("\n\n");
+	return resolveSystemPrompt({
+		agentDir: AGENT_DIR,
+		workspaceDir: WORKSPACE_DIR,
+		trusted,
+		read: systemPromptReader(),
+		docsPath: piDocsPath(),
+	});
+}
+/** The pi docs to advertise in the built-in prompt — only when they exist (a deployment
+ *  without pi_dir must not get a <docs> section pointing at a missing file). */
+function piDocsPath() {
+	const docs = path.join(AGENT_DIR, "docs");
+	if (fs.existsSync(docs)) return docs;
+	const readme = path.join(AGENT_DIR, "README.md");
+	return fs.existsSync(readme) ? readme : null;
+}
+function effectiveSystemPrompt() {
+	return resolveEffectiveSystemPrompt().text;
 }
 function systemFileMeta(p, scope, name) {
 	try {
@@ -459,8 +528,8 @@ app.get("/api/pi/system", (c) => {
 		systemFileMeta(path.join(agentDir, "WEB_SYSTEM.md"), "web", "WEB_SYSTEM.md"),
 		systemFileMeta(path.join(projectDir, ".pi", "SYSTEM.md"), "project", "SYSTEM.md"),
 		systemFileMeta(path.join(agentDir, "SYSTEM.md"), "global", "SYSTEM.md"),
-		systemFileMeta(path.join(projectDir, ".pi", "APPEND_SYSTEM.md"), "project", "APPEND_SYSTEM.md"),
-		systemFileMeta(path.join(agentDir, "APPEND_SYSTEM.md"), "global", "APPEND_SYSTEM.md"),
+		// NOTE: APPEND_SYSTEM.md is pi's file and is NOT read by the web path (2026-10-25)
+		// — the web prompt is WEB_SYSTEM.md alone, so it is not listed here either.
 	];
 	const pick = (name) => files.find((f) => f.name === name && f.scope === "project" && f.exists && trusted) || files.find((f) => f.name === name && f.scope === "global" && f.exists) || null;
 	// base precedence: WEB_SYSTEM.md (web-UI-only filename — the TUI never reads
@@ -469,9 +538,31 @@ app.get("/api/pi/system", (c) => {
 	// web file: it is the web UI's own config, not a repo-supplied resource.
 	const webBase = files.find((f) => f.name === "WEB_SYSTEM.md" && f.exists) || null;
 	const base = webBase || pick("SYSTEM.md");
-	const append = pick("APPEND_SYSTEM.md");
+	// the ACTUAL text the server-side agent gets — resolved through the same module the
+	// hub uses, so "effective" here is not a re-implementation that can drift. When no
+	// file exists this is a code-composed prompt, reported as source "builtin" (the old
+	// label "pi default" was misleading: nothing injects a pi default in this server).
+	const resolved = resolveSystemPrompt({
+		agentDir,
+		workspaceDir: projectDir,
+		trusted,
+		// separator-tolerant: the lib joins with "/" (it is runtime-agnostic), path.join
+		// produced "\" — an exact string compare silently missed and reported the BUILT-IN
+		// prompt while naming the file as the winner (caught by the live check 2026-10-25).
+		read: (p) => {
+			const norm = (x) => String(x).replace(/[\\/]+/g, "/");
+			const m = files.find((f) => norm(f.path) === norm(p) && f.exists);
+			return m ? m.content : undefined;
+		},
+		docsPath: (() => {
+			const d = path.join(agentDir, "docs");
+			if (fs.existsSync(d)) return d;
+			const r = path.join(agentDir, "README.md");
+			return fs.existsSync(r) ? r : null;
+		})(),
+	});
 	// server computes precedence so the client can't drift from pick() (sonnet review)
-	for (const f of files) f.wins = f === base || f === append;
+	for (const f of files) f.wins = f === base;
 	// NOTE: projectDir = PI_WS env || parent of agentDir — assumes .pi is a direct
 	// child of the workspace root. Git worktrees with a non-standard .pi location
 	// would need PI_WS set explicitly (same caveat @agegr's UI handles via its
@@ -480,7 +571,15 @@ app.get("/api/pi/system", (c) => {
 	// typically-tiny config files, not arbitrary user files.
 	return c.json({
 		agentDir, projectDir, needsTrust, trusted,
-		effective: { base: base ? base.path : "pi default", append: append ? append.path : null },
+		effective: {
+			base: base ? base.path : "built-in web default (composed in code)",
+			source: resolved.source,
+			chars: resolved.text.length,
+			// the ACTUAL prompt text (any size: these are prompt files, capped at 1MB) so
+			// the client uses the server's resolution verbatim instead of re-implementing
+			// the precedence — the in-browser agent and the dialog both read this.
+			text: resolved.text,
+		},
 		files,
 	}, 200, { "Cache-Control": "no-cache" });
 });
@@ -1301,6 +1400,8 @@ function normalizeToolResult(r) {
 // auth.json (provider API keys) — a human-facing browser must not expose them.
 // Paths are returned WORKSPACE-RELATIVE ("/"-separated) — absolute paths leak the
 // server layout and made the client breadcrumbs wrong (grok p6/p7).
+/** Upload cap for one client-encoded image (the browser already resized it, so this is generous). */
+const MAX_IMAGE_UPLOAD = 12 * 1024 * 1024;
 const IMAGE_MIME = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp" };
 const WORKSPACE_REAL = fs.realpathSync(WORKSPACE_DIR);
 // the system prompt files are browsable in the file viewer (user request:
@@ -1461,22 +1562,22 @@ app.get("/api/pi/keys", (c) => {
 	if (!tokenMatches(c.env?.incoming)) {
 		return c.json({ error: "unauthorized — /api/pi/keys needs x-pi-web-token (see data/auth-token.txt)" }, 401);
 	}
-	let auth;
-	try { auth = getProviderAuth(); } catch (err) { return c.json({ error: `failed to read provider keys: ${err.message}` }, 500); }
-	const out = {};
-	for (const [p, e] of Object.entries(auth)) { const k = typeof e === "string" ? e : e?.key; if (k) out[p] = k; }
-	return c.json({ keys: out });
+	try { return c.json({ keys: providerKeyMap() }); }
+	catch (err) { return c.json({ error: `failed to read provider keys: ${err.message}` }, 500); }
 });
 app.post("/api/pi/key", async (c) => {
 	if (TOKEN) { const t = c.req.header("x-pi-web-token"); if (t !== TOKEN) return c.json({ error: "unauthorized" }, 401); }
 	const body = await c.req.json().catch(() => ({}));
 	const provider = String(body?.provider || "");
 	if (!provider) return c.json({ error: "provider required" }, 400);
-	let auth;
-	try { auth = getProviderAuth(); } catch (err) { return c.json({ error: `failed to read provider keys: ${err.message}` }, 500); }
-	const key = typeof auth?.[provider] === "string" ? auth[provider] : auth?.[provider]?.key;
+	// auth.json → .pi/models.json → keyless placeholder. A provider declared in
+	// models.json with `apiKey: "none"` (or none at all) resolves here too, so the
+	// in-browser path never prompts for a credential the endpoint does not need.
+	let key;
+	try { key = providerKeyMap()[provider]; }
+	catch (err) { return c.json({ error: `failed to read provider keys: ${err.message}` }, 500); }
 	if (!key) return c.json({ error: `no key for "${provider}"` }, 404);
-	return c.json({ provider, key });
+	return c.json({ provider, key, keyless: piModelsStore[provider]?.keyless || undefined });
 });
 app.put("/api/pi/key", async (c) => {
 	const body = await c.req.json().catch(() => ({}));
@@ -1904,33 +2005,23 @@ function storeOp(op, payload = {}) {
 }
 
 // --- agent hub (server-side agents) -------------------------------------------
+// piModelsStore = name -> {name, baseUrl, api, models, apiKey, keyless, origin}. It is
+// BOTH the picker's source (clientProviders → /api/pi/config) and the HUB's resolver
+// (`_getModel` walks .models), built by lib/pi-catalog.mjs from the builtin catalog +
+// models-store.json + .pi/models.json + auth.json (see buildCatalog above). The hub
+// holds this object BY REFERENCE, so refreshModelsStore() reaches it and the server
+// picks up an edited models.json without a restart.
 let piModelsStore = {};
-// CATALOG FALLBACK for the HUB too: _getModel iterates modelsStore[provider].models,
-// so a missing .pi would leave even the /api/pi/config fallback powerless (the picker
-// would list models the hub refuses to run). Same precedence: store entries win.
-function builtinModelsStore() {
-	try {
-		const out = {};
-		for (const name of getBuiltinProviders()) {
-			const models = getBuiltinModels(name);
-			if (models.length === 0) continue;
-			out[name] = { name, models };
-		}
-		return out;
-	} catch (err) {
-		console.error("[pi-web] builtin model catalog unavailable:", err?.message || err);
-		return {};
-	}
-}
+// the hub holds the catalog by reference (`agentHub.modelsStore`); a refresh swaps
+// the object ATOMICALLY (one assignment) so a run that reads it mid-refresh can never
+// see a half-built map (refreshModelsStore also runs on every GET /api/pi/config).
+let hubRef = null;
 function refreshModelsStore() {
-	const loaded = readJsonSafe("models-store.json");
-	if (loaded && typeof loaded === "object" && !Array.isArray(loaded)) {
-		for (const key of Object.keys(piModelsStore)) delete piModelsStore[key];
-		for (const [key, value] of Object.entries(loaded)) {
-			Object.defineProperty(piModelsStore, key, { value, enumerable: true, configurable: true, writable: true });
-		}
-	}
-	if (Object.keys(piModelsStore).length === 0) Object.assign(piModelsStore, builtinModelsStore());
+	const next = buildCatalog().providers;
+	piModelsStore = next;
+	if (hubRef) hubRef.modelsStore = next;
+	dlog("[pi] catalog:", Object.entries(next).map(([n, p]) => `${n}(${p.models.length}${p.keyless ? ",keyless" : ""})`).join(" "));
+	return next;
 }
 refreshModelsStore();
 
@@ -1939,13 +2030,58 @@ function piDefaultModelId() {
 	return String(s.default_model || s.defaultModel || "");
 }
 
+/**
+ * Turn an inbound prompt/steer `images` array into ImageContent parts the model can use: inline base64
+ * passes straight through, a `{hash}` part is hydrated from the binary media store (base64 is built
+ * HERE and nowhere else), and anything unresolvable is reported instead of being dropped
+ * (grok review 2026-10-25, blocker 5).
+ */
+function hydratePromptImages(raw) {
+	const parts = Array.isArray(raw) ? raw.filter((im) => im && im.type === "image" && typeof im.mimeType === "string").slice(0, 4) : [];
+	const images = [], missing = [];
+	for (const im of parts) {
+		if (typeof im.data === "string" && im.data) { images.push({ type: "image", data: im.data, mimeType: im.mimeType || "image/png" }); continue; }
+		if (!isMediaHash(im.hash)) continue;
+		const hit = agentHub.getMedia(im.hash);
+		if (!hit?.bytes) { missing.push(im.hash); continue; }
+		images.push({ type: "image", data: Buffer.from(hit.bytes).toString("base64"), mimeType: im.mimeType || hit.mimeType || "image/png" });
+	}
+	return { images, missing };
+}
+
+/** Data-reduction debug trace (PI_WEB_DATA_REDUCTION_DEBUG=1): one line per block, so the user can
+ *  watch a live turn shrink. Off by default — this is the "let me test it on a debug server" switch. */
+const DR_DEBUG = process.env.PI_WEB_DATA_REDUCTION_DEBUG === "1";
+
 const agentHub = new AgentHub({
 	modelsStore: piModelsStore,
-	getAuth: getProviderAuth,
+	getAuth: () => providerKeyMap(),
 	persist: async (id, jsonl) => { await storeOp("put", { id, jsonl }); broadcastSessions().catch(() => {}); },
-	broadcast: (sessionId, msg) => {
-		const payload = JSON.stringify({ type: "agent", sessionId, ...msg });
-		for (const c of agentClients.get(sessionId) || []) { if (c.readyState === 1) c.send(payload); }
+	// THE delivery boundary: the only place in the app that is per-CONNECTION, which is why stream
+	// reduction (plan §2.3) lives here. A socket that never opted in keeps `__reducer.enabled ===
+	// false`, so this loop stays byte-for-byte the old one for every existing client.
+	broadcast: (sessionId, incoming) => {
+		// EGRESS REDACTION (plan §2.2b): once per broadcast, not per socket — content-addressed, so
+		// all clients can share the same redacted copy (and the hub caches it per message object).
+		const msg = agentHub.redactFrame(incoming);
+		for (const c of agentClients.get(sessionId) || []) {
+			if (c.readyState !== 1) continue;
+			let out = msg;
+			const reducer = c.__reducer; // (redaction happens ONCE per broadcast, below)
+			if (reducer?.enabled) {
+				out = reducer.transform(msg, Date.now());
+				if (!out) continue; // this client asked for the frame to be held
+				// a dying turn returns [flushed-text, error] — both must reach the client
+				const frames = Array.isArray(out) ? out : [out];
+				if (DR_DEBUG && frames.some((f) => f.event?.type === "turn_end" || f.event?.type === "error" || f.event?.type === "aborted")) {
+					const s = reducer.stats();
+					if (s.forwarded || s.dropped) console.log(`[data-reduction] ${sessionId} block end: ${describeReduction(s, reducer.cfg)}`);
+				}
+				for (const f of frames) c.send(JSON.stringify({ type: "agent", sessionId, ...f }));
+				continue;
+			}
+			c.send(JSON.stringify({ type: "agent", sessionId, ...out }));
+		}
 	},
 	// server-side agent loop (2026-10-21, now the DEFAULT chat path): the same
 	// tool objects the exec bridge exposes run IN-PROCESS; the system prompt and
@@ -1954,6 +2090,13 @@ const agentHub = new AgentHub({
 	// store READ accessor: forkSession self-hydrates cold sessions (hub restart,
 	// no attach yet) straight from the JSONL mirror
 	loadMessages: async (id) => { try { const j = await storeOp("get", { id }); return j?.messages?.length ? { messages: j.messages, metadata: j.metadata } : null; } catch { return null; } },
+	// BINARY image store on disk (user design 2026-10-25): the browser sends the ENCODED image
+	// (webp/jpeg), we keep those bytes — never the raw original, never base64 — and base64 is
+	// generated only when the LLM request is built.
+	mediaDir: path.join(DATA_DIR, "media"),
+	// Media GC at boot (review report.md M3): the disk store must not grow forever. 30 days by
+	// default, PI_WEB_MEDIA_TTL_DAYS=0 keeps everything.
+	// (the sweep itself runs right after the hub construction — see below)
 	// /compact (pi parity): the summarization LLM call runs through a THROWAWAY
 	// Agent — reuses the whole conversion/retry pipeline; no tools, thinkingLevel
 	// off. Structured checkpoint format mirrors pi's SUMMARIZATION_PROMPT.
@@ -1967,7 +2110,7 @@ const agentHub = new AgentHub({
 				messages: [{ role: "user", content: [{ type: "text", text: buildSummarizationPrompt(serialized, previousSummary) }] }],
 				tools: [],
 			},
-			getApiKey: async (p) => { const auth = getProviderAuth(); const e = auth[p]; return typeof e === "string" ? e : e?.key; },
+			getApiKey: async (p) => providerKeyMap()[p] || undefined,
 		});
 		if (signal) { try { signal.addEventListener("abort", () => summaryAgent.abort(), { once: true }); } catch { /* noop */ } }
 		await summaryAgent.prompt("Produce the structured summary now.");
@@ -2001,13 +2144,26 @@ const agentHub = new AgentHub({
 	defaultModelId: piDefaultModelId(),
 	onRuntimeChange: (sessionId, rt) => sendRuntime(sessionId, rt), // runtime deltas → tiny frame to ALL devices, bypasses all caches/throttles (fable5)
 });
+hubRef = agentHub; // catalog refreshes (GET /api/pi/config) swap the map in place here
+
+// MEDIA GC at boot (review report.md M3, 2026-10-27): the disk store had no way back down. Age-based,
+// logged, and off with PI_WEB_MEDIA_TTL_DAYS=0. The bytes are content-addressed, so a purged blob can
+// always be re-uploaded by the device that still has it ("browser" retention) or re-read from a
+// transcript that still carries inline data.
+try {
+	const ttlDays = Number(process.env.PI_WEB_MEDIA_TTL_DAYS ?? 30);
+	if (ttlDays > 0) {
+		const swept = purgeMediaOlderThan({ dir: path.join(DATA_DIR, "media"), days: ttlDays });
+		if (swept.removed) console.log(`[media] GC: removed ${swept.removed} blob(s) older than ${ttlDays}d (${(swept.bytes / 1048576).toFixed(1)}MB); kept ${swept.kept}`);
+	}
+} catch (err) { console.warn(`[media] GC failed (continuing): ${err.message}`); }
 
 const syncClients = new Set();
 import { SESSION_ID_RE } from "./session-id.mjs"; // shared with session-worker.mjs (bugs.md #14)
 let legacySyncPuts = 0; // count of legacy {data,metadata} puts — compat shim (bugs.md #15)
 let lastLegacyPutAt = 0; // epoch ms of last legacy put — decides when the shim can be removed
 const agentClients = new Map();
-const wss = new WebSocketServer({ noServer: true, maxPayload: 25 * 1024 * 1024 });
+const wss = new WebSocketServer({ noServer: true, maxPayload: 25 * 1024 * 1024, perMessageDeflate: process.env.PI_WEB_WS_DEFLATE === "off" ? false : { threshold: 1024, zlibDeflateOptions: { level: 6 } } });
 
 // --- pseudo-terminal hub (NO node-pty): winpty.exe ships with Git for Windows
 // (real hidden console → echo/colors/^C/history); falls back to bash -i over
@@ -2094,7 +2250,7 @@ async function pushWatched(id) {
 	// same shape as the explicit "get" branch: the worker returns
 	// {jsonl, metadata, messages} — the old `data: j.data` was undefined, so
 	// watched-session notifications carried NO body (P2 fix)
-	const payload = JSON.stringify({ type: "session", id, data: { messages: j.messages }, metadata: j.metadata, jsonl: j.jsonl });
+	const payload = JSON.stringify({ type: "session", id, data: { messages: agentHub.redactMessages(j.messages) }, metadata: j.metadata });
 	for (const c of syncClients) {
 		if (c.watch.has(id) && c.ws.readyState === 1 && c.ws.bufferedAmount <= MAX_BUFFERED) c.ws.send(payload);
 	}
@@ -2189,8 +2345,10 @@ function syncConn(ws) {
 				}
 			} else if (m.type === "get" && SESSION_ID_RE.test(id)) {
 				const j = await storeOp("get", { id });
-				// worker returns {jsonl, metadata, messages} — expose as data:{messages} for clients
-				if (j) safeSend(ws, { type: "session", id, data: { messages: j.messages }, metadata: j.metadata, jsonl: j.jsonl });
+				// worker returns {jsonl, metadata, messages} — expose as data:{messages} for clients.
+				// jsonl is NOT sent: the client only reads data/metadata, and it carried a second, raw
+				// copy of every inline image — the biggest egress leak in the app (2026-10-25).
+				if (j) safeSend(ws, { type: "session", id, data: { messages: agentHub.redactMessages(j.messages) }, metadata: j.metadata });
 			} else if (m.type === "watch" && SESSION_ID_RE.test(id)) {
 				client.watch.add(id);
 				pushWatched(id).catch(() => {});
@@ -2207,6 +2365,9 @@ function syncConn(ws) {
 function agentConn(ws) {
 	console.log("[agent-ws] client connected");
 	let currentSession = null;
+	// per-CONNECTION reduction state (two devices on one session may want different modes).
+	// `null` config ⇒ pass-through, i.e. today's behaviour, at the cost of one `if` per frame.
+	const reduction = { cfg: null, reducer: createStreamReducer(null) };
 	ws.on("message", async (raw) => {
 		let m;
 		try { m = JSON.parse(raw.toString()); } catch { return; }
@@ -2216,6 +2377,14 @@ function agentConn(ws) {
 					if (currentSession) detachAgentClient(currentSession, ws);
 					currentSession = String(m.sessionId || "").slice(0, 80) || crypto.randomUUID();
 					attachAgentClient(currentSession, ws);
+					// A NEW SESSION IS A BOUNDARY: reset the per-connection reducer, or the first message_start
+					// in the new session would flush the OLD session's held text (tagged with the new id) into
+					// the chat (review report.md M2, 2026-10-27). Seeding happens right after the attach
+					// snapshot is delivered (below), synchronously enough that no event can slip in between.
+					if (ws.__reducer?.enabled) {
+						ws.__reducer.reset();
+						ws.__reducer.seed(agentHub.streamingSnapshot(currentSession));
+					}
 					agentHub.emitRuntime(currentSession); // clients count changed (fable5) — MUST go through the hub so seq advances
 					// ALWAYS ensure the hub session exists — fresh sessions have no store
 					// entry, and set-thinking/prompt assume a registered agent (2026-10-21)
@@ -2226,6 +2395,8 @@ function agentConn(ws) {
 							modelId: prev.metadata.modelId,
 							thinkingLevel: prev.metadata.thinkingLevel,
 							messages: prev.messages,
+							rewriteSeq: prev.metadata.rewriteSeq,
+							rewrittenFrom: prev.metadata.rewrittenFrom,
 						});
 						} else {
 						// fresh session: honor the client's chosen model/effort (grok r3:
@@ -2233,16 +2404,22 @@ function agentConn(ws) {
 						agentHub.getSession(currentSession, { modelId: m.modelId, thinkingLevel: m.thinkingLevel });
 						}
 					} catch (err) { console.warn("[agent-ws] cold-load:", err.message); }
-					const state = agentHub.getState(currentSession);
-					safeSend(ws, { type: "state", sessionId: currentSession, ...state });
+					// TAIL-FIRST ATTACH (2026-10-24): a client that advertises tailFirst gets
+					// the last ~512KB + a sparse envelope (fromSeq/messageCount) and backfills
+					// the prefix via /range into IDB — instead of every attach shipping 2-7MB.
+					// attach() now hydrates the entry itself before snapshotting (2026-10-24) —
+					// await it so the first frame can never be an empty pre-hydration state
+					await agentHub.attach(currentSession, (msg) => safeSend(ws, msg), { tailFirst: !!m.tailFirst, haveTo: Number(m.haveTo) || 0 });
 					break;
 				}
 				case "prompt": {
 					if (!currentSession) { safeSend(ws, { type: "error", error: "attach first" }); break; }
-					// images: base64 ImageContent parts from the composer (validated + capped)
-					const images = Array.isArray(m.images)
-						? m.images.filter((im) => im && im.type === "image" && typeof im.data === "string" && typeof im.mimeType === "string").slice(0, 4)
-						: undefined;
+					// images: ImageContent parts from the composer — either inline base64, or a `hash` that
+					// the BINARY media store resolves (user design 2026-10-25: the composer posts the encoded
+					// bytes and references them). A part whose bytes are gone is REPORTED, never dropped
+					// silently (grok review 2026-10-25, blocker 5).
+					const { images, missing } = hydratePromptImages(m.images);
+					if (missing.length) safeSend(ws, { type: "note", id: m.id, note: `${missing.length} image(s) are no longer on the server — re-attach them to resend` });
 					// id echoes on the accepted reply so the composer can restore text on a reject
 					agentHub.prompt(currentSession, String(m.content || ""), images?.length ? images : undefined)
 						.then((r) => safeSend(ws, { type: "accepted", id: m.id, ...r }))
@@ -2254,9 +2431,8 @@ function agentConn(ws) {
 					// the current thinking/toolcall completes (grok review P1: a prompt
 					// here would misroute post-Stop sends into leftover steers)
 					if (!currentSession) { safeSend(ws, { type: "error", error: "attach first" }); break; }
-					const images = Array.isArray(m.images)
-						? m.images.filter((im) => im && im.type === "image" && typeof im.data === "string" && typeof im.mimeType === "string").slice(0, 4)
-						: undefined;
+					const { images, missing } = hydratePromptImages(m.images);
+					if (missing.length) safeSend(ws, { type: "note", id: m.id, note: `${missing.length} image(s) are no longer on the server — re-attach them to resend` });
 					agentHub.steer(currentSession, String(m.content || ""), images?.length ? images : undefined)
 						.then((r) => safeSend(ws, { type: "accepted", id: m.id, ...r }))
 						.catch((err) => safeSend(ws, { type: "error", id: m.id, error: err.message }));
@@ -2286,6 +2462,47 @@ function agentConn(ws) {
 					break;
 				}
 
+				case "setDataReduction": {
+					// client setting (Settings → Data use): stream coalescing for THIS connection only
+					// (plan §2.3). OFF by default — a client that never sends this keeps live streaming,
+					// and an unknown mode falls back to live rather than to a stronger reduction.
+					reduction.cfg = normalizeReductionConfig(m, m?.net === "lan" || m?.net === "metered" ? m.net : "wan");
+					// SEED from the in-flight snapshot: this client already has the full text from the state
+					// frame it attached with, and a reducer starting at 0 would truncate it backwards
+					// (grok review 2026-10-25, blocker 3).
+					reduction.reducer = createStreamReducer(reduction.cfg, { seed: agentHub.streamingSnapshot(currentSession) });
+					ws.__reducer = reduction.reducer; // the broadcast loop reads it per socket
+					// TIME-BASED rules need a driver (review report.md H2): without a tick, held text only leaves
+					// on the next delta or the block end, so a slow provider shows "thinking…" past the promised
+					// ceiling. One interval per opted-in socket; cleared on close.
+					if (!ws.__reducerTimer && reduction.reducer.enabled) {
+						ws.__reducerTimer = setInterval(() => {
+							try {
+								const out = ws.__reducer?.tick?.(Date.now());
+								if (!out || ws.readyState !== 1) return;
+								for (const f of Array.isArray(out) ? out : [out]) ws.send(JSON.stringify({ type: "agent", sessionId: f.sessionId, ...f }));
+							} catch { /* socket gone */ }
+						}, 250);
+						ws.__reducerTimer.unref?.();
+					}
+					// RETENTION rides along with the same setting: "browser" must not write images to disk
+					agentHub.setMediaPersist(m?.imageRetention !== "browser");
+					safeSend(ws, {
+						type: "data-reduction", id: m.id, ok: true, enabled: reduction.reducer.enabled,
+						streamMode: reduction.cfg?.streamMode ?? "live",
+						kinds: reduction.cfg ? Object.fromEntries(Object.entries(reduction.cfg.kinds).map(([k, v]) => [k, v.mode])) : {},
+					});
+					console.log(`[data-reduction] ${currentSession || "-"} ${describeReduction(reduction.reducer.stats(), reduction.cfg)}`);
+					break;
+				}
+
+				case "cancel-retry": {
+					// auto-retry UI (2026-10-24): cancel THIS pending retry only — auto-retry
+					// stays enabled. Attach-gated like retry (acts on the current session).
+					if (!currentSession) { safeSend(ws, { type: "error", id: m.id, error: "attach first" }); break; }
+					safeSend(ws, { type: "retry-cancelled", id: m.id, ...agentHub.cancelPendingRetry(currentSession) });
+					break;
+				}
 				case "fork": {
 					// llama.cpp-webui-style fork: clone the transcript prefix into a NEW
 					// session (original untouched); the client navigates to the new id
@@ -2372,8 +2589,8 @@ function agentConn(ws) {
 			safeSend(ws, { type: "error", id: m.id, error: err.message });
 		}
 	});
-	ws.on("close", () => { if (currentSession) { detachAgentClient(currentSession, ws); agentHub.emitRuntime(currentSession); } });
-	ws.on("error", () => { if (currentSession) { detachAgentClient(currentSession, ws); agentHub.emitRuntime(currentSession); } });
+	ws.on("close", () => { clearInterval(ws.__reducerTimer); ws.__reducerTimer = null; if (currentSession) { detachAgentClient(currentSession, ws); agentHub.emitRuntime(currentSession); } });
+	ws.on("error", () => { clearInterval(ws.__reducerTimer); ws.__reducerTimer = null; if (currentSession) { detachAgentClient(currentSession, ws); agentHub.emitRuntime(currentSession); } });
 }
 
 function attachAgentClient(sessionId, ws) {
@@ -2441,17 +2658,144 @@ app.get("/api/agent/continuation/:id", async (c) => {
 		return c.json({ continuation: best ? { id: best.id, title: best.title, messageCount: best.messageCount, lastModified: best.lastModified } : null });
 	} catch (err) { return c.json({ error: err.message }, 500); }
 });
+// EGRESS MEDIA (user design 2026-10-25): the BINARY bytes behind an image part, content-addressed by
+// sha256. Sits under /api/* so it inherits the SAME auth gate as everything else — a hash is an
+// address, never a capability. Immutable + private caching: the browser renders an image once and
+// never re-downloads it (that is what makes a warm reopen cost 0 bytes). NO Content-Encoding: the
+// image is already encoded and gz/br on image bytes measured ~0% (`tests/image-compression.test.mjs`),
+// so a second pass would only cost CPU and a copy.
+app.get("/api/agent/session/:id/media/:hash", (c) => {
+	const hash = c.req.param("hash");
+	if (!isMediaHash(hash)) return c.json({ error: "bad hash" }, 400);
+	const entry = agentHub.getMedia(hash);
+	if (!entry) return c.json({ error: "not found" }, 404);
+	return c.body(entry.bytes, 200, {
+		"Content-Type": entry.mimeType || "application/octet-stream",
+		"Content-Length": String(entry.bytes.length),
+		"Cache-Control": "private, max-age=31536000, immutable",
+	});
+});
+
+// BINARY IMAGE UPLOAD (user design 2026-10-25): the browser posts the bytes it already encoded
+// (resize + webp), so no base64 ever travels up and nothing raw is ever stored. The body IS the
+// image; the content-type is its mime. Auth comes from the /api/* gate like every other route.
+// Returns just the content address — the prompt frame then references it by hash.
+app.post("/api/agent/session/:id/media", async (c) => {
+	try {
+		const mimeType = String(c.req.header("content-type") || "").split(";")[0].trim().toLowerCase();
+		if (!/^image\//.test(mimeType)) return c.json({ error: "only image/* bodies (set Content-Type)" }, 415);
+		// cap BEFORE buffering (grok review 2026-10-25): arrayBuffer() on a 200MB body would allocate it
+		const declared = Number(c.req.header("content-length") || 0);
+		if (!declared || declared > MAX_IMAGE_UPLOAD) return c.json({ error: `image must declare a Content-Length <= ${Math.round(MAX_IMAGE_UPLOAD / 1048576)}MB` }, 413);
+		const buf = Buffer.from(await c.req.arrayBuffer());
+		if (!buf.length) return c.json({ error: "empty body" }, 400);
+		if (buf.length > MAX_IMAGE_UPLOAD) return c.json({ error: `image too large (>${Math.round(MAX_IMAGE_UPLOAD / 1048576)}MB)` }, 413);
+		// RETENTION (Settings → Data use): "server" (default) persists the blob on disk, "browser" keeps
+		// it in memory only — the client holds its own copy in IDB and re-uploads if a restart lost it.
+		// Header first, query as the fallback (so a curl test can pick it too).
+		const retention = String(c.req.header("x-pi-media-retention") || c.req.query("retention") || "server").toLowerCase();
+		const persist = retention !== "browser" && retention !== "memory";
+		const stored = agentHub.putMedia(buf, mimeType, { persist });
+		if (!stored) return c.json({ error: "empty body" }, 400);
+		return c.json({ hash: stored.hash, mimeType, bytes: stored.bytes, persisted: stored.persisted });
+	} catch (err) { return c.json({ error: err.message }, 500); }
+});
+
 app.get("/api/agent/session/:id", async (c) => {
+	try {
+		const id = c.req.param("id");
+		// ?meta=1 (tail-first plan): metadata ONLY — the open-session flow just needs
+		// existence + counts; shipping the full 2-7.3MB body for a boolean was waste
+		const metaOnly = c.req.query("meta") === "1";
+		if (!agentHub.has(id)) {
+			const stored = await storeOp("get", { id });
+			if (stored?.metadata && stored?.messages) {
+				agentHub.getSession(id, { modelId: stored.metadata.modelId, thinkingLevel: stored.metadata.thinkingLevel, messages: stored.messages, rewriteSeq: stored.metadata.rewriteSeq, rewrittenFrom: stored.metadata.rewrittenFrom });
+			}
+		}
+		if (metaOnly) {
+			const st = agentHub.getState(id);
+			return c.json({
+				sessionId: id,
+				exists: !!st.exists,
+				messageCount: Array.isArray(st.messages) ? st.messages.length : 0,
+				rewriteSeq: st.rewriteSeq ?? 0,
+				rewrittenFrom: st.rewrittenFrom ?? 0,
+			});
+		}
+		const state = agentHub.getState(id);
+		const payload = JSON.stringify({ sessionId: id, ...state });
+		// wire compression (transfer plan, 2026-10-24): these bodies reach 2-7.3MB
+		// and the browser decompresses Content-Encoding natively — zero client code
+		const accept = c.req.header("accept-encoding") || "";
+		if (Buffer.byteLength(payload, "utf8") > 2048 && /gzip/.test(accept)) { // bytes, not UTF-16 units
+			return c.body(zlib.gzipSync(payload), 200, { "Content-Type": "application/json", "Content-Encoding": "gzip", Vary: "Accept-Encoding" });
+		}
+		return c.body(payload, 200, { "Content-Type": "application/json", Vary: "Accept-Encoding" });
+	} catch (err) { return c.json({ error: err.message }, 500); }
+});
+
+// RANGE endpoint (tail-first client cache, 2026-10-24): a seq window of the
+// CURRENT transcript, raw application/gzip so the client can put the SAME
+// bytes into IndexedDB and DecompressionStream them on read (Content-Encoding
+// would strip gzip before JS). X-headers carry the cache identity.
+app.get("/api/agent/session/:id/range", async (c) => {
 	try {
 		const id = c.req.param("id");
 		if (!agentHub.has(id)) {
 			const stored = await storeOp("get", { id });
 			if (stored?.metadata && stored?.messages) {
-				agentHub.getSession(id, { modelId: stored.metadata.modelId, thinkingLevel: stored.metadata.thinkingLevel, messages: stored.messages });
+				agentHub.getSession(id, { modelId: stored.metadata.modelId, thinkingLevel: stored.metadata.thinkingLevel, messages: stored.messages, rewriteSeq: stored.metadata.rewriteSeq, rewrittenFrom: stored.metadata.rewrittenFrom });
 			}
 		}
-		const state = agentHub.getState(id);
-		return c.json({ sessionId: id, ...state });
+		const tailBytes = Number(c.req.query("tailBytes")) || 0;
+		let fromSeq = Number(c.req.query("fromSeq")) || 0;
+		let toSeq = c.req.query("toSeq") ? Number(c.req.query("toSeq")) : Infinity;
+		if (tailBytes > 0) {
+			// tail: walk backwards accumulating serialized size (server-side mirror
+			// of the hub's attach tail slice)
+			const st = agentHub.getState(id);
+			const msgs = st.exists ? st.messages : [];
+			let acc = 0, from = msgs.length;
+			while (from > 0 && (acc < tailBytes || from === msgs.length)) {
+				from--;
+				try { acc += JSON.stringify(msgs[from]).length; } catch { acc += 256; }
+			}
+			fromSeq = from;
+			toSeq = Infinity;
+		}
+		// cap uncompressed JSON at 1MB per response — KEEP THE HIGH END (grok review
+		// 01a16a54): expand/tail windows must stay ADJACENT to the loaded tail
+		// (filledFrom). Dropping low seqs (not high) prevents seq gaps next to the
+		// dense window. At least one message is always kept.
+		const range = agentHub.getRange(id, { fromSeq, toSeq });
+		if (!range) return c.json({ error: "session not found" }, 404);
+		// WINDOW PLANNING (review 2026-10-25): the budget walk, the user-turn walk and
+		// the C4 chunk snapping all live in ONE pure, unit-tested place
+		// (lib/range-window.mjs) — both reviewers found bounds bugs in the inline copy
+		// that no test could see. Contract: fromSeq <= start <= end <= min(toSeq, count),
+		// and the headers below describe exactly the bytes in the slice.
+		const { start, end } = planRangeWindow({ messages: range.messages, fromSeq: range.fromSeq, toSeq: range.toSeq, messageCount: range.messageCount });
+		// EGRESS REDACTION on the BACKFILL path too (review report.md H1, 2026-10-27): this was the one
+		// egress that still shipped inline image base64 — and it is exactly the path a warm client uses
+		// to fill its prefix (fillWindow -> IDB), so the image win was not achieved end-to-end. Redacting
+		// after the window is computed keeps the seq accounting intact (ids/seqs are untouched).
+		const rawSlice = start >= end ? [] : range.messages.slice(start - range.fromSeq, end - range.fromSeq);
+		const slice = rawSlice.length ? agentHub.redactMessages(rawSlice) : rawSlice;
+		const ndjson = slice.map((m) => JSON.stringify(m)).join("\n");
+		// 204 MUST NOT carry a body (RFC 9110) — the headers alone describe the empty
+		// window, and the client keys its "nothing more to load" decision off re <= rs.
+		const gz = slice.length === 0 ? null : zlib.gzipSync(ndjson);
+		return c.body(gz, slice.length === 0 ? 204 : 200, {
+			"Content-Type": "application/x-ndjson",
+			"X-Pi-Encoding": "gzip",
+			"X-Session-Mutate-Epoch": String(range.rewriteSeq),
+			"X-Session-Message-Count": String(range.messageCount),
+			"X-Range-From-Seq": String(start),
+			"X-Range-To-Seq": String(end),
+			"X-Rewritten-From": String(range.rewrittenFrom),
+			Vary: "Accept-Encoding",
+		});
 	} catch (err) { return c.json({ error: err.message }, 500); }
 });
 app.post("/api/agent/session", async (c) => {

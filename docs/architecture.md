@@ -1,6 +1,6 @@
 # pi-web-ui — Architecture
 
-> Updated 2026-10-21 · Index + reading order: [docs/README.md](README.md)
+> Updated 2026-10-27 · Index + reading order: [docs/README.md](README.md)
 
 Docs index: **architecture.md** (this file) · [server.md](server.md) · [terminal.md](terminal.md) · [client.md](client.md)
 
@@ -75,7 +75,9 @@ refresh, `?session=` restore.
 1. **Chat turn (default, SERVER-side loop, 2026-10-21)**: Editor send → `ProxyAgent.prompt()` → WS
    `/ws/agent` `{prompt, content, images}` → `agent-hub.mjs` runs the Agent **in Node**: tools
    (read/write/edit/bash + pi extensions) execute IN-PROCESS (same objects as the exec bridge), API
-   keys come from `.pi/auth.json`, system prompt = `WEB_SYSTEM.md`/`SYSTEM.md` precedence. EVERY event
+   keys come from `.pi/auth.json` (then a provider's own `apiKey` in `.pi/models.json`; a models.json
+   provider with none resolves to the keyless placeholder — see [server.md](server.md) §Provider
+   catalog), system prompt = `WEB_SYSTEM.md`/`SYSTEM.md` precedence. EVERY event
    (message_update, tool_execution_update partials, agent_end) is broadcast to ALL attached devices —
    send from the PC, watch live from the phone, close the phone and the run keeps going.
    `?local=1` → legacy browser loop (`streamFn` via `/api/proxy` when the provider lacks CORS).
@@ -151,7 +153,9 @@ refresh, `?session=` restore.
   real gate).
 - **Filesystem**: all fs paths (tools + picker) go through `assertInsideRoots()` (realpath walk, roots =
   workspace + agent dir). Dotfiles hidden/403 in the picker, with an allowlist for the three system
-  prompt files (`.pi/WEB_SYSTEM.md`, `.pi/SYSTEM.md`, `.pi/APPEND_SYSTEM.md`); `.pi/auth.json` etc. stay
+  prompt files (`.pi/WEB_SYSTEM.md` — the self-contained WEB prompt — and `.pi/SYSTEM.md`; resolved by
+`lib/system-prompt.mjs`, which COMPOSES a built-in prompt when none exist; `.pi/APPEND_SYSTEM.md` is
+pi's file and is not read here); `.pi/auth.json` etc. stay
   blocked. Tool execution is audited via `/api/debug/state` (keep last 50, EXPOSE last 20; that route
   has the same Host-derived Origin check as the proxy).
 

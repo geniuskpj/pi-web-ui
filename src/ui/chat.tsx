@@ -31,9 +31,12 @@ import type { SystemNotificationMessage } from "../llm.js";
 import { getAppStorage } from "../storage.js";
 import { looksLikeAuthError, createApiKeyResolver } from "./proxy-stream.js";
 import { copyText } from "../id.js";
+import { gateIndex, gateSeqOfLastTurns, prevUserSeq, resolveGateSeq } from "../../lib/display-gate.mjs";
 import { FilePickerDialog, type PickedFile } from "./file-picker.js";
 import { TerminalPanel, termBus } from "./terminal.js";
 import { renderMarkdown } from "./markdown.js";
+// egress media (plan §2.2b): a transcript image part may carry only a hash → hydrate before re-sending
+import { hydrateImageParts, currentSessionId } from "./media.js";
 const ARG_PREVIEW_MAX = 160;
 const OUTPUT_TAIL_MAX = 2000;
 const PARTIAL_STORE_MAX = 4096; // cap UI-only partial strings (bash can stream MBs)
@@ -138,6 +141,47 @@ function UserBubble({ message, onOpenFile, index, canMutate, onEditMessage, edit
 		setTimeout(() => editBtnRef.current?.focus(), 0);
 	};
 	const actions = canMutate && typeof index === "number" && onEditMessage && !editing;
+	// LONG-PRESS → edit (mobile multi-line entry, sonnet-5 design 2026-10-24):
+	// touch/pen only (mouse long-press fights text-drag-select), 480ms (~native
+	// window), 10px move-slop cancels on scroll, fire-time selection check (the OS
+	// mid-selection-drag wins), haptic tick, ✎ stays as the explicit control.
+	const pressRef = useRef<{ x: number; y: number; id: number } | null>(null);
+	const pressTimer = useRef<number | null>(null);
+	const [pressed, setPressed] = useState(false);
+	const clearPress = () => {
+		if (pressTimer.current) { clearTimeout(pressTimer.current); pressTimer.current = null; }
+		pressRef.current = null;
+		setPressed(false);
+	};
+	useEffect(() => clearPress, []); // unmount mid-press: no late onEditMessage
+	const pressFire = () => {
+		const sel = window.getSelection?.()?.toString();
+		clearPress();
+		if (sel) return; // user was selecting text, not requesting edit
+		if (typeof index !== "number") return;
+		if (navigator.vibrate) { try { navigator.vibrate(12); } catch { /* unsupported */ } }
+		onEditMessage?.(index);
+	};
+	const onBubblePointerDown = (e: any) => {
+		if (!canMutate) return;
+		if (e.pointerType !== "touch" && e.pointerType !== "pen") return; // desktop: ✎ only
+		if ((e.target as HTMLElement)?.closest?.(".pw-msg-act")) return; // press ON ✎ = tap
+		if (pressRef.current) return; // defensive multitouch: one pointer at a time
+		pressRef.current = { x: e.clientX, y: e.clientY, id: e.pointerId };
+		setPressed(true);
+		pressTimer.current = window.setTimeout(pressFire, 480);
+	};
+	const onBubblePointerMove = (e: any) => {
+		const s = pressRef.current;
+		if (!s || s.id !== e.pointerId) return;
+		if (Math.hypot(e.clientX - s.x, e.clientY - s.y) > 10) clearPress(); // scroll
+	};
+	const onBubblePointerEnd = (e: any) => {
+		if (pressRef.current?.id === e.pointerId) clearPress();
+	};
+	const onBubbleContextMenu = (e: any) => {
+		if (canMutate && !editing) e.preventDefault(); // our long-press owns the hold gesture (iOS callout / Android menu)
+	};
 	return (
 		<div class={"pw-msg-row pw-user-row" + (dimmed ? " pw-will-replace" : "")}>
 			{editing ? (
@@ -167,7 +211,14 @@ function UserBubble({ message, onOpenFile, index, canMutate, onEditMessage, edit
 						{onEditMessage && <button ref={editBtnRef} type="button" class="pw-msg-act" aria-label="Edit message" title="Edit message — the old turn becomes a restorable version when you save a different text" onClick={() => onEditMessage(index)}>✎</button>}
 					</div>
 				)}
-				<div class="pw-msg pw-user">
+				<div
+					class={"pw-msg pw-user" + (pressed ? " pw-msg--pressed" : "")}
+					onPointerDown={onBubblePointerDown}
+					onPointerMove={onBubblePointerMove}
+					onPointerUp={onBubblePointerEnd}
+					onPointerCancel={onBubblePointerEnd}
+					onContextMenu={onBubbleContextMenu}
+				>
 					<div class="pw-text-plain">{text}</div>
 				{files.length > 0 && onOpenFile && (
 					<div class="pw-user-files">
@@ -255,6 +306,37 @@ function ToolRow({
 	);
 }
 
+/** Server-driven pending auto-retry (auto-retry UI 2026-10-24, sonnet-5 design):
+ *  countdown ticks locally from retryAt (epoch ms) — no server pushes needed;
+ *  when remaining hits 0 the label goes indeterminate until the runtime frame
+ *  resolves (the retry fired or was refused). Cancel cancels THIS pending retry
+ *  only (auto-retry stays enabled); Retry now dispatches immediately. */
+function RetryCountdown({ retryState, onCancel, onRetryNow }: { retryState: any; onCancel?: () => void; onRetryNow?: () => void }) {
+	const [, setNow] = useState(0);
+	useEffect(() => {
+		const id = setInterval(() => setNow((n: number) => n + 1), 250);
+		return () => clearInterval(id);
+	}, []);
+	const remaining = Math.max(0, (retryState.retryAt || 0) - Date.now());
+	const pct = retryState.delayMs ? Math.min(1, 1 - remaining / retryState.delayMs) : 1;
+	return (
+		<div class="pw-retry-pending">
+			<div class="pw-retry-countdown">
+				<span class="pw-retry-countdown-text">
+					{remaining > 0
+						? `Retrying in ${Math.ceil(remaining / 1000)}s — attempt ${retryState.attempt}/${retryState.attempts}`
+						: "Retrying…"}
+				</span>
+				<div class="pw-retry-countdown-bar" style={{ transform: `scaleX(${pct})` }} />
+			</div>
+			<div class="pw-retry-actions">
+				{onCancel && <button type="button" class="pw-retry-cancel" onClick={onCancel}>Cancel</button>}
+				{onRetryNow && <button type="button" class="pw-retry" onClick={onRetryNow}>Retry now</button>}
+			</div>
+		</div>
+	);
+}
+
 function AssistantBubble({
     message,
     streaming,
@@ -263,6 +345,9 @@ function AssistantBubble({
     partials,
     isLast,
     onRetry,
+    onRetryNow,
+    onCancelRetry,
+    retryState,
     dimmed,
 }: {
 	message: AssistantMessage;
@@ -272,9 +357,13 @@ function AssistantBubble({
 	partials?: Map<string, string>;
 	isLast?: boolean;
 	onRetry?: () => void;
+	onRetryNow?: () => void;
+	onCancelRetry?: () => void;
+	retryState?: any;
 	dimmed?: boolean;
 	}) {
 	const failed = message.stopReason === "error" || message.stopReason === "aborted";
+	const showScheduledRetry = failed && !streaming && isLast && retryState?.state === "scheduled" && !!onCancelRetry;
 	return (
 	 <div class={"pw-msg pw-assistant" + (failed ? " pw-failed" : "") + (dimmed ? " pw-will-replace" : "")}>
 			{message.content.map((part, i) => {
@@ -308,16 +397,25 @@ function AssistantBubble({
 						{message.stopReason === "aborted" ? "⏹ Aborted" : "⚠ Error"}
 						{message.errorMessage ? ` — ${message.errorMessage}` : ""}
 					</span>
-					{/* plan §2.7: Retry = resend last user message as a NEW turn — never
-					    replay tool calls; aborted ≠ error so Retry can't double-run a
-					    cancelled tool (§2.8 #8) */}
-					{!streaming && message.stopReason === "error" && isLast && onRetry && (
-						<button
-							class="pw-retry"
-							onClick={onRetry}
-						>
-							Retry
-						</button>
+					{/* auto-retry UI (2026-10-24): the pending retry renders INSIDE the error
+					    chrome (sonnet-5 design) — same row, same lifecycle; the countdown is
+					    server-driven (retryAt epoch) with Cancel (this pending retry only) and
+					    Retry now (immediate dispatch). Give-up shows its note + plain Retry. */}
+					{showScheduledRetry && (
+						<RetryCountdown retryState={retryState} onCancel={onCancelRetry} onRetryNow={onRetryNow || onRetry} />
+					)}
+					{!streaming && message.stopReason === "error" && isLast && !showScheduledRetry && (
+						<>
+							{retryState?.state === "given-up" && retryState.note && <span class="pw-retry-giveup-note">{retryState.note}</span>}
+							{onRetry && (
+								<button
+									class="pw-retry"
+									onClick={onRetry}
+								>
+									Retry
+								</button>
+							)}
+						</>
 					)}
 				</div>
 			)}
@@ -368,8 +466,11 @@ function MessageView(props: {
 	onCancelEdit?: () => void;
 	dimmed?: boolean;
 	onRetry?: () => void;
+	onRetryNow?: () => void;
+	onCancelRetry?: () => void;
+	retryState?: any;
 	onOpenFile?: (path: string) => void;
-}) {
+	}) {
 	const { message } = props;
 	if (message.role === "user") {
 		if ((message as any).isCompactionSummary) {
@@ -393,16 +494,19 @@ function MessageView(props: {
 	if (message.role === "assistant")
 	 return (
 	  <AssistantBubble
-	   message={message as AssistantMessage}
-	   streaming={!!props.streaming}
-	   toolResults={props.toolResults}
-	   pending={props.pending}
-	   partials={props.partials}
-	   isLast={props.isLast}
-	   onRetry={props.onRetry}
-	   dimmed={props.dimmed}
-	  />
-	 );
+	  message={message as AssistantMessage}
+	  streaming={!!props.streaming}
+	  toolResults={props.toolResults}
+	  pending={props.pending}
+	  partials={props.partials}
+	  isLast={props.isLast}
+	  onRetry={props.onRetry}
+	  onRetryNow={props.onRetryNow}
+	  onCancelRetry={props.onCancelRetry}
+	  retryState={props.retryState}
+	  dimmed={props.dimmed}
+	 />
+	);
 	if (message.role === "system-notification") return <NotificationLine message={message as SystemNotificationMessage} />;
 	// toolResult messages render inline inside their assistant toolCall row
 	return null;
@@ -428,6 +532,11 @@ function renderMarkdownCached(text: string): string {
 // makes the opened dropdown options invisible on Windows Chrome).
 // ----------------------------------------------------------------------------
 function ModelPill({ model, onPickModel }: { model?: any; onPickModel: () => void }) {
+	// mobile (user request 2026-10-24): hide the "provider/" prefix — narrow
+	// screens show just the model name ("glm-5.3-flash", not "z-ai/glm-5.3-flash");
+	// the tooltip + the picker keep the full id. CSS hides pw-pill-provider <48rem.
+	const id = String(model?.id || "");
+	const slash = id.indexOf("/");
 	return (
 		<button
 			type="button"
@@ -436,7 +545,10 @@ function ModelPill({ model, onPickModel }: { model?: any; onPickModel: () => voi
 			aria-haspopup="dialog"
 			onClick={onPickModel}
 		>
-			<span class="pw-pill-text">{model ? model.id : "model"}</span>
+			<span class="pw-pill-text">
+				{slash > 0 && <span class="pw-pill-provider" aria-hidden="true">{id.slice(0, slash + 1)}</span>}
+				{slash > 0 ? id.slice(slash + 1) : (id || "model")}
+			</span>
 			<span class="pw-pill-caret" aria-hidden="true" />
 		</button>
 	);
@@ -458,8 +570,10 @@ function EffortPill({ agent }: { agent: Agent }) {
 		setTick((t) => t + 1);
 	};
 	return (
-		<label class="pw-pill pw-pill-select">
-			<span class="pw-pill-label" aria-hidden="true">effort</span>
+		<label class="pw-pill pw-pill-select" title="Reasoning effort">
+			{/* user request 2026-10-28: the lamp instead of the word "effort" — the select
+			    keeps its aria-label, the label keeps a tooltip for what the glyph means */}
+			<span class="pw-pill-label" aria-hidden="true">💡</span>
 			<select
 				class="pw-pill-select-el"
 				value={level}
@@ -562,11 +676,85 @@ function UsageBar({ agent, canCompact, compacting, onCompact, canVersions, versi
 // ----------------------------------------------------------------------------
 // ChatView
 // ----------------------------------------------------------------------------
-export function ChatView({ agent }: { agent: Agent }) {
+export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; retryState?: any; onCancelRetry?: () => void }) {
 	const [, setTick] = useState(0);
 	const scrollRef = useRef<HTMLDivElement>(null);
 	const stick = useRef(true);
 	const lastTop = useRef(0);
+	// DISPLAY BY USER TURN (user request 2026-10-24, tail-first sessions only):
+	// the view shows the last N conversational turns (from the first user message
+	// of that window down); the button reveals the previous turn — a pure VIEW
+	// change when the turn is already in memory, a /range fetch when it isn't.
+	// null = show everything (small sessions / full state frames — never gated).
+	// Only sparse (large) sessions get the gated view.
+	// N = `pi.turnWindow` (Settings → Composer → Turns visible, default 3; user request 2026-10-27 —
+	// it was hardcoded to ONE turn and, worse, applied to EVERY session: a null
+	// gate was resolved to "the last user turn", which gated small chats too and
+	// put the ⤒ button at the first message of a one-turn session).
+	// SEQ SPACE (review 2026-10-25 #4): the gate is the SEQ of a user turn,
+	// never an array index — fillWindow prepends older messages (and mutates the
+	// sparse envelope in place, so the "new envelope" trigger never fires again) and
+	// a fully-warm reopen attaches an EMPTY window where no index exists at all.
+	// Before this, the warm path rendered the whole filled window instead of one turn.
+	const [displayFromSeq, setDisplayFromSeq] = useState<number | null>(null);
+	const sparseSeen = useRef<any>(null);
+	// PROVISIONAL GATE: a sparse attach can carry an EMPTY window (the fully-warm
+	// reopen: the client fills the body from IDB afterwards). The only truthful gate
+	// at that instant is "the window starts at fromSeq" — which is NOT a user choice
+	// and must be re-anchored the moment the fill arrives, or the whole filled window
+	// renders (the very bug review #4 fixed). A gate computed on real messages is
+	// kept verbatim (it points at a user turn the user can see).
+	const gateProvisional = useRef(false);
+	const filledSeqRef = useRef(0);
+	const messagesRef = useRef<any[]>([]);
+	const [turnWindow, setTurnWindow] = useState<number>(() => turnsVisiblePref());
+	// settings change → live re-gate (the gate is recomputed from the LAST turn, so
+	// the user sees the effect immediately, even mid-conversation). Refs, not the
+	// render values: this listener outlives the render it was created in.
+	useEffect(() => {
+		const onPref = () => {
+			const n = turnsVisiblePref();
+			setTurnWindow(n);
+			if (sparseSeen.current) setDisplayFromSeq(gateSeqOfLastTurns(messagesRef.current, filledSeqRef.current, n));
+		};
+		window.addEventListener("pi-turn-window-changed", onPref);
+		return () => window.removeEventListener("pi-turn-window-changed", onPref);
+	}, []);
+	// SYNC: a NEW sparse envelope (attach) gates the view to the last N turns;
+	// full state frames / small chats (no sparse) clear the gate.
+	useEffect(() => {
+		const sp = (state as any).sparse;
+		if (sp && sp !== sparseSeen.current) {
+			sparseSeen.current = sp;
+			const base = Number(sp.filledFrom ?? sp.fromSeq) || 0;
+			gateProvisional.current = state.messages.length === 0;
+			setDisplayFromSeq(gateSeqOfLastTurns(state.messages, base, turnWindow));
+		} else if (!sp && sparseSeen.current) { sparseSeen.current = null; gateProvisional.current = false; setDisplayFromSeq(null); }
+		// the fill landed (IDB prefix or the attach's own window) → re-anchor the
+		// provisional gate to the last N turns of what is now loaded
+		if (gateProvisional.current && state.messages.length > 0) {
+			gateProvisional.current = false;
+			setDisplayFromSeq(gateSeqOfLastTurns(state.messages, Number((state as any).sparse?.filledFrom ?? (state as any).sparse?.fromSeq) || 0, turnWindow));
+		}
+	});
+	/** ⤒ reveal the PREVIOUS user turn: pure view change when it is already in
+	 *  memory (instant); a /range fetch (user-turn aligned server-side) when it
+	 *  isn't. Anchor by message IDENTITY (indices shift on prepend) and store the
+	 *  gate as a SEQ, so the next prepend cannot invalidate it. */
+	const expandTurns = async () => {
+		const msgs = state.messages;
+		const df = displayFromRef.current ?? 0;
+		const prev = prevUserSeq(msgs, df - 1, filledSeq);
+		if (prev != null) { setDisplayFromSeq(prev); return; }
+		const anchor = msgs[df] || msgs[msgs.length - 1];
+		const ok = await (agent as any).expandEarlier?.();
+		if (!ok) { note("could not load earlier turns — check the server log"); return; }
+		const arr = state.messages;
+		const newFilled = Number((state as any).sparse?.filledFrom ?? 0) || 0;
+		const anchorIdx = anchor ? arr.indexOf(anchor) : -1;
+		const prev2 = prevUserSeq(arr, (anchorIdx >= 0 ? anchorIdx : arr.length) - 1, newFilled);
+		setDisplayFromSeq(prev2 != null ? prev2 : newFilled);
+	};
 	// UI-ONLY streaming partials for running tools (never enters messages)
 	const partials = useRef(new Map<string, string>());
 	// attachment state lives here so composer chips AND sent-message file chips
@@ -593,12 +781,19 @@ export function ChatView({ agent }: { agent: Agent }) {
 		setSteerDraft({ text: pendingSteer.text || "", seq: steerSeq.current });
 		const steerImages = pendingSteer.images;
 		if (steerImages && steerImages.length) {
-			setImages((prev) => [
-				...prev,
-				...steerImages
-					.filter((im: any) => im?.type === "image" && im.data && im.mimeType)
-					.map((im: any, k: number) => ({ name: `steered-${k + 1}`, data: im.data, mimeType: im.mimeType, preview: `data:${im.mimeType};base64,${im.data}` })),
-			]);
+			// the pending steer's images come back through a state frame, i.e. REDACTED (hash only) —
+			// fetch the bytes back so the composer can send them again (async: fills in place)
+			void (async () => {
+				try {
+					const filled = await hydrateImageParts(steerImages.filter((im: any) => im?.type === "image"), currentSessionId(agent));
+					setImages((prev) => [
+						...prev,
+						...filled
+							.filter((im: any) => im?.data && im?.mimeType)
+							.map((im: any, k: number) => ({ name: `steered-${k + 1}`, data: im.data, mimeType: im.mimeType, preview: `data:${im.mimeType};base64,${im.data}` })),
+					]);
+				} catch { /* offline: the text still comes back */ }
+			})();
 		}
 		(agent as any).cancelSteering?.();
 	};
@@ -644,7 +839,13 @@ export function ChatView({ agent }: { agent: Agent }) {
 	 // gate the UI (hub.prompt resolves at run end; the old await left the editor
 	 // open + the region dimmed while the response streamed invisibly)
 	 try {
-	  const r = await (agent as any).editCommit(i, text);
+	  // TAIL-FIRST (2026-10-24): the client array index is window-relative — the
+	  // server's editCommit wants the ABSOLUTE seq. Use sparse.filledFrom (NOT the
+	  // attach-time fromSeq — grok review 01a16a54 #2: fromSeq froze at attach and
+	  // pointed edits at the wrong turn after any expand; filledFrom advances in
+	  // lockstep with fromSeq on every prepend).
+	  const fromSeq = Number((agent.state as any).sparse?.filledFrom ?? (agent.state as any).sparse?.fromSeq) || 0;
+	  const r = await (agent as any).editCommit(i + fromSeq, text);
 	  if (!r?.ok) throw new Error(r?.reason || r?.error || "edit failed");
 	  note(`✎ saved — the old turn was parked as version #${r.version?.vid ?? "?"} (🕘 picker); the edited message is on its way`);
 	  forceStick(); // the response streams at the bottom — follow it
@@ -659,6 +860,15 @@ export function ChatView({ agent }: { agent: Agent }) {
 		clearTimeout(attachNoteTimer.current);
 		attachNoteTimer.current = setTimeout(() => setAttachNote(""), 3000);
 	};
+	// hub NOTE frames (e.g. "N image(s) are no longer on the server — re-attach them to resend"):
+	// the agent forwards them, the composer chip shows them. Without this a hash-only image that the
+	// server cannot resolve would fail silently (review report.md M1, 2026-10-27).
+	useEffect(() => {
+		const a = agent as any;
+		if (!a || typeof a !== "object") return;
+		a.onNote = (m: string) => note(m);
+		return () => { try { delete a.onNote; } catch { /* frozen */ } };
+	}, [agent]);
 	const addPicked = (f: PickedFile) => {
 		if (f.kind === "image") {
 			setImages((prev) => {
@@ -852,13 +1062,42 @@ export function ChatView({ agent }: { agent: Agent }) {
 		const u = msgs[uIdx] as UserMessage;
 		const text = textOf(u.content);
 		if (!text) return;
-		const imgs = (Array.isArray(u.content) ? u.content.filter((b: any) => b?.type === "image") : []) as any[];
+		const rawImgs = (Array.isArray(u.content) ? u.content.filter((b: any) => b?.type === "image") : []) as any[];
 		agent.state.messages = msgs.slice(0, uIdx);
-		void (imgs.length ? agent.prompt(text, imgs) : agent.prompt(text)).catch((err: any) => console.error("[chat] retry failed:", err));
+		// the transcript is redacted on egress (plan §2.2b): a hash-only image part must be hydrated
+		// from the media route before the model can see it again — the server DROPS image parts that
+		// have no `data`, so a silent retry would send a text-only turn.
+		void (async () => {
+			try {
+				const imgs = rawImgs.length ? await hydrateImageParts(rawImgs, currentSessionId(agent)) : [];
+				const sendable = imgs.filter((im: any) => typeof im?.data === "string" && im.data);
+				if (rawImgs.length && !sendable.length) console.warn(`[chat] retry: could not reload ${rawImgs.length} image(s) — sending text only`);
+				await (sendable.length ? agent.prompt(text, sendable) : agent.prompt(text));
+			} catch (err: any) { console.error("[chat] retry failed:", err); }
+		})();
 		forceStick();
 	};
 
 	const state = agent.state;
+	// derived PER RENDER from the gate seq (see the gate comment above) — the seq
+	// survives every prefix fill, the index never did
+	const filledSeq = Number((state as any).sparse?.filledFrom ?? (state as any).sparse?.fromSeq) || 0;
+	filledSeqRef.current = filledSeq;
+	messagesRef.current = state.messages;
+	// resolveGateSeq re-anchors the fallback an empty-window attach had to use (see
+	// lib/display-gate.mjs) — that is what makes a fully-warm reopen show the last
+	// N turns instead of the whole filled window. A null gate stays null: small
+	// chats are never gated.
+	const gateSeq = resolveGateSeq(displayFromSeq, filledSeq, state.messages, turnWindow);
+	const displayFrom = gateIndex(gateSeq, filledSeq, state.messages.length);
+	// hidden = messages the loaded window is holding back; earlier = messages the
+	// server still has (not fetched yet) — the button is truthful about both.
+	const hiddenMsgs = (displayFrom || 0) + filledSeq;
+	// debuggable from the console (like __PI_PROVIDERS/__app): what the display gate
+	// decided this render — `__piGate.turnWindow` is the settings value in effect
+	(window as any).__piGate = { gateSeq, displayFrom, filledSeq, len: state.messages.length, turnWindow, provisional: gateProvisional.current };
+	const displayFromRef = useRef<number | null>(null);
+	displayFromRef.current = displayFrom;
 	// compact progress: server truth (state.compacting) drives the banner so ALL
 	// devices see it and it survives a client-side await timeout (the server
 	// keeps compacting and the next state frame clears the banner)
@@ -959,8 +1198,24 @@ export function ChatView({ agent }: { agent: Agent }) {
 				   <button type="button" class="pw-continuation-open" onClick={() => { setContinuation(null); window.dispatchEvent(new CustomEvent("pi-open-session", { detail: continuation.id })); }}>open it</button>
 				  </div>
 				 )}
+					{hiddenMsgs > 0 && (
+					<div class="pw-expand">
+						<button
+							type="button"
+							class="pw-expand-btn"
+							title={displayFrom && filledSeq ? "reveals the previous turn — in memory when it is loaded, fetched from the server when it is not" : filledSeq ? "fetches the previous turn from the server" : "reveals the previous turn from memory"}
+							onClick={() => { void expandTurns(); }}
+						>
+							⤒ Load earlier turns
+							{displayFrom || 0 ? ` · ${displayFrom} in view hidden` : ""}
+							{filledSeq > 0 ? ` · ${filledSeq} not loaded` : ""}
+						</button>
+					</div>
+					)}
 					{state.messages.map((m: any, i: number) => (
 					<Fragment key={keyOf(m)}>
+					{displayFrom != null && i < displayFrom ? null /* hidden by the user-turn display gate */ : (
+					<>
 					{editingIdx !== null && i === editingIdx + 1 && (
 						<div class="pw-edit-divider">messages below will be replaced — the old turn is saved as a restorable version on Resubmit</div>
 					)}
@@ -979,8 +1234,13 @@ export function ChatView({ agent }: { agent: Agent }) {
 						onSaveEdit={saveEdit}
 						onCancelEdit={() => setEditingIdx(null)}
 						onRetry={retry}
+						onRetryNow={retry}
+						onCancelRetry={onCancelRetry}
+						retryState={retryState}
 						onOpenFile={openFileViewer}
-					/>
+						/>
+					</>
+					)}
 					</Fragment>
 				))}
 					{state.streamingMessage ? (
@@ -1077,6 +1337,53 @@ export function ChatView({ agent }: { agent: Agent }) {
 const DRAFT_KEY = "pi.web.draft";
 const MAX_TEXT_ATTACH = 6;
 const MAX_IMAGE_ATTACH = 4;
+/** Feather-style paperclip (stroke=currentColor) — an emoji 📎 renders
+ *  fixed-size and dark in BOTH themes (user report); SVG inherits the pill's
+ *  color and scales with it. Same pattern as main.tsx's Icon. */
+const PaperclipIcon = () => (
+	<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+		<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+	</svg>
+);
+// ENTER BEHAVIOR (mobile multi-line, sonnet-5 design 2026-10-24): desktop
+// Enter=send is unchanged; on coarse pointers (phones) Enter inserts a newline —
+// the soft keyboard has no Shift/Ctrl, so Enter=send made multi-line IMPOSSIBLE
+// (user report). Tri-state pref for the counter-case (bluetooth keyboard on a
+// tablet): "auto" | "always" | "never" in pi.enterSends. Ctrl/Cmd+Enter always
+// sends in every mode — one muscle-memory shortcut app-wide (mirrors the edit
+// textarea's Ctrl+Enter=Resubmit). enterkeyhint relabels the soft key to match.
+type EnterSendsPref = "auto" | "always" | "never";
+export const enterSendsPref = (): EnterSendsPref => {
+	try {
+		const v = localStorage.getItem("pi.enterSends");
+		if (v === "always" || v === "never" || v === "auto") return v;
+	} catch { /* private mode */ }
+	return "auto";
+};
+// TURNS VISIBLE (user request 2026-10-27): how many conversational turns a
+// sparse (large, tail-first) session shows before "⤒ Load earlier turns" has to
+// be used. Default 3. Only the sparse view is gated — small sessions always
+// render in full, so this is a VIEW preference, never a data change.
+export const TURNS_VISIBLE_DEFAULT = 3;
+export const turnsVisiblePref = (): number => {
+	try {
+		const v = Number(localStorage.getItem("pi.turnWindow"));
+		if (Number.isFinite(v) && v >= 1) return Math.min(20, Math.floor(v));
+	} catch { /* private mode */ }
+	return TURNS_VISIBLE_DEFAULT;
+};
+export const setTurnsVisible = (n: number): number => {
+	const v = Math.max(1, Math.min(20, Math.floor(Number(n) || TURNS_VISIBLE_DEFAULT)));
+	try { localStorage.setItem("pi.turnWindow", String(v)); } catch { /* quota */ }
+	window.dispatchEvent(new CustomEvent("pi-turn-window-changed", { detail: v }));
+	return v;
+};
+
+const computeEnterSends = (pref: EnterSendsPref) => {
+	if (pref === "always") return true;
+	if (pref === "never") return false;
+	try { return !window.matchMedia("(pointer: coarse)").matches; } catch { return true; }
+};
 
 export function Editor({
 	agent,
@@ -1219,6 +1526,9 @@ export function Editor({
 	};
 	const ext = (p: string) => (p.match(/\.([a-z0-9]+)$/i)?.[1] || "").toLowerCase();
 	const fenceLang = (p: string) => ({ ts: "ts", tsx: "tsx", js: "js", jsx: "jsx", py: "python", json: "json", md: "md", css: "css", html: "html", yml: "yaml", yaml: "yaml", sh: "bash", bat: "bat", sql: "sql", rs: "rust", go: "go", java: "java", c: "c", cpp: "cpp", cs: "csharp" } as Record<string, string>)[ext(p)] || "";
+	// recomputed per render (cheap matchMedia) — a settings change applies on the
+	// next keystroke without any event plumbing
+	const enterSends = computeEnterSends(enterSendsPref());
 
 	const send = async () => {
 		const text = value.trim();
@@ -1320,9 +1630,17 @@ export function Editor({
 			(agent as any).cancelSteering?.();
 			const steerImages = pendingSteer.images;
 			if (steerImages && steerImages.length) {
-				for (const im of steerImages) {
-					if (im?.type === "image" && im.data && im.mimeType) onAddImage(`stopped-${Date.now().toString(36)}`, im.data, im.mimeType);
-				}
+				// the recalled images come back through a state frame, i.e. possibly REDACTED (hash only) —
+				// hydrate them like ✎-edit recall does, or Stop would silently drop the photos
+				// (review report.md L1, 2026-10-27).
+				void (async () => {
+					try {
+						const filled = await hydrateImageParts(steerImages.filter((im: any) => im?.type === "image"), currentSessionId(agent));
+						for (const im of filled) {
+							if (im?.data && im.mimeType) onAddImage(`stopped-${Date.now().toString(36)}`, im.data, im.mimeType);
+						}
+					} catch { /* offline: the text still comes back */ }
+				})();
 			}
 			if (text) {
 				setValue((cur) => (cur.trim() ? cur.replace(/\s*$/, "") + "\n\n" + text : text)); // never clobber a live draft
@@ -1335,13 +1653,22 @@ export function Editor({
 
 	const onKeyDown = (e: KeyboardEvent) => {
 		if (e.key !== "Enter") return;
-		// IME-safe: never send while composing
+		// IME-safe: never send while composing (checked FIRST — unchanged)
 		if (composing.current || (e as any).isComposing || e.keyCode === 229) return;
-		if (!e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+		// Ctrl/Cmd+Enter always sends — universal override in every enterSends mode
+		if (e.ctrlKey || e.metaKey) {
 			e.preventDefault();
-			// streaming + server-side ⇒ Enter STEERS (held until the step completes)
 			if (!streaming || (agent as any).serverSide) send();
+			return;
 		}
+		// newline mode (coarse pointer / "never" pref): let the browser insert \n —
+		// this is the fix for "can't use return key" on mobile
+		if (!enterSends) return;
+		// desktop Shift+Enter / Alt+Enter still insert a newline
+		if (e.shiftKey || e.altKey) return;
+		e.preventDefault();
+		// streaming + server-side ⇒ Enter STEERS (held until the step completes)
+		if (!streaming || (agent as any).serverSide) send();
 	};
 
 	return (
@@ -1383,6 +1710,7 @@ export function Editor({
 					class="pw-input"
 					placeholder={streaming ? "Generating… (Stop to interrupt)" : "Message pi…"}
 					rows={1}
+					enterkeyhint={enterSends ? "send" : "enter"}
 					value={value}
 					onInput={(e) => setValue((e.target as HTMLTextAreaElement).value)}
 					onKeyDown={onKeyDown}
@@ -1397,7 +1725,7 @@ export function Editor({
 						title="Attach workspace files (or paste an image)"
 						onClick={onOpenPicker}
 					>
-						+ files
+						<PaperclipIcon />
 					</button>
 					<ModelPill model={agent.state.model} onPickModel={() => onPickModel?.()} />
 					<EffortPill agent={agent} />
