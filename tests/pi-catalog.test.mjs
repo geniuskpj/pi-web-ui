@@ -10,7 +10,7 @@
 //   so an endpoint that needs no credential was unusable.
 //
 // Usage: node tests/pi-catalog.test.mjs
-import { buildProviderCatalog, clientProviders, resolvedKeys, isKeylessKey, resolveModelsJsonKey, KEYLESS_PLACEHOLDER } from "../lib/pi-catalog.mjs";
+import { buildProviderCatalog, clientProviders, resolvedKeys, isKeylessKey, resolveModelsJsonKey, KEYLESS_PLACEHOLDER, providerUsable, unavailableProviders } from "../lib/pi-catalog.mjs";
 
 let passed = 0, failed = 0;
 const check = (name, ok, extra = "") => {
@@ -89,6 +89,29 @@ const builtin = (name) => (name === "google" ? [model("gemini-3-pro"), model("ge
 	check("S1 the provider shape the UI reads is intact", client.length === 1 && client[0].name === "local" && client[0].models.length === 1);
 	check("S2 resolvedKeys is what the hub/summarizer resolve", resolvedKeys(providers, { local: "from-auth" }).local === "from-auth" && resolvedKeys(providers, {}).local === "sk-secret");
 	check("S2 a keyless provider resolves to the placeholder (no 'No API key for provider' throw)", resolvedKeys(buildProviderCatalog({ modelsJson: { providers: { l: { apiKey: "none", models: [{ id: "m" }] } } }, builtinModels: () => [] }).providers, {}).l === KEYLESS_PLACEHOLDER);
+}
+
+// ── U) the picker offers ONLY what the web UI can run (user report 2026-10-28) ──
+// The user had added nvidia alone, yet the picker listed openai / github-copilot (pi's
+// discovery cache) and google (builtin catalog) — none of which could run.
+{
+	const store = { nvidia: { models: [model("z-ai/glm-5.3")] }, openai: { models: [model("gpt-5")] }, "github-copilot": { models: [model("claude-fable-5")] }, google: { models: [] } };
+	const modelsJson = { providers: { nvidia: { baseUrl: "https://integrate.api.nvidia.com/v1", apiKey: "nvapi-literal", models: [{ id: "z-ai/glm-5.3" }] } } };
+	const auth = { nvidia: { type: "api_key", key: "nvapi-literal" } };
+	const { providers } = buildProviderCatalog({ store, modelsJson, auth, builtinModels: (n) => (n === "google" ? [model("gemini-3-pro")] : n === "nvidia" ? [model("catalog-only")] : []) });
+	const shown = clientProviders(providers, { onlyUsable: true });
+	check("U1 only the provider the user actually added is offered", shown.map((p) => p.name).join(",") === "nvidia", shown.map((p) => p.name).join(","));
+	check("U1 its models are still merged (models.json + cache + catalog)", shown[0].models.length >= 2);
+	const hidden = unavailableProviders(providers).map((u) => u.name).sort();
+	check("U2 the cache-only and catalog-only providers are reported, not silently dropped", hidden.join(",") === "github-copilot,google,openai", hidden.join(","));
+	check("U2 each hidden provider carries a reason", unavailableProviders(providers).every((u) => typeof u.reason === "string" && u.reason.length > 5));
+	check("U2 a discovery-cache entry says so", unavailableProviders(providers).find((u) => u.name === "openai").reason.includes("discovery"));
+	check("U3 a provider with an auth.json key is offered even without a models.json entry", clientProviders(buildProviderCatalog({ auth: { anthropic: "sk-ant-api-x" }, builtinModels: (n) => (n === "anthropic" ? [model("claude-sonnet-5")] : []) }).providers, { onlyUsable: true }).map((p) => p.name).join(",") === "anthropic");
+	check("U3 an OAuth-only credential is NOT offered (it cannot run from the web UI)", clientProviders(buildProviderCatalog({ auth: { anthropic: { type: "oauth", access_token: "x" } }, builtinModels: (n) => (n === "anthropic" ? [model("claude-sonnet-5")] : []) }).providers, { onlyUsable: true }).length === 0);
+	check("U3 that OAuth reason is spelled out", unavailableProviders(buildProviderCatalog({ auth: { anthropic: { type: "oauth" } }, builtinModels: () => [model("m")] }).providers).some((u) => /OAuth/.test(u.reason)));
+	check("U4 a keyless models.json endpoint stays offered", clientProviders(buildProviderCatalog({ modelsJson: { providers: { local: { apiKey: "none", models: [{ id: "m" }] } } }, builtinModels: () => [] }).providers, { onlyUsable: true }).map((p) => p.name).join(",") === "local");
+	check("U5 the hub's map keeps EVERY provider (a session may still name a cache-only model)", Object.keys(providers).sort().join(",") === "github-copilot,google,nvidia,openai");
+	check("U5 onlyUsable defaults to off (the unfiltered projection is unchanged)", clientProviders(providers).length === 4 && providerUsable(providers.nvidia) && !providerUsable(providers.google));
 }
 
 // ── D) degenerate inputs never explode ──────────────────────────────────────

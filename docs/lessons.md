@@ -43,6 +43,26 @@ All three of these bugs were invisible because each layer was tested against its
 ### Silent-failure observability
 #14 degraded to a caught+logged ReferenceError, #15 to a falsy-condition skip, #16 to a 404 interpreted as "no session". Preventive measures: watch `[sync] error` counts in server logs, track ignored-put counters (`legacySyncPuts` in `/api/debug/state`), and never treat a 404 on a known `/api/*` path as benign. The next instance of this pattern should announce itself, not require CDP archaeology.
 
+### A deps-array `useEffect` can run with a STALE closure here (2026-10-28, measured)
+Symptom: a search/debounce effect keyed on locally-set state (`useEffect(..., [q])` where `q` comes from an
+`onInput`) either never fired or fired ONE VALUE BEHIND. Measured live with a probe counter: after typing
+`markLine` then `Z`, the effect body ran with `q = "markLine"` while the state was `"markLineZ"` (the status
+line kept showing the previous query's spinner). Cost: the chat find bar and the file-viewer content search
+both looked broken while every unit-level piece was correct.
+
+Mechanism (preact/hooks 10.x): `options.diffed` commits `hook._args = hook._pendingArgs` at DIFF time, but the
+callback itself runs later in the afterPaint flush — `flushAfterPaintEffects` invokes `state._value`, i.e. the
+callback captured when the effect was QUEUED. When a render and the flush interleave (state set inside an
+input handler, another render before the paint), the invoked closure is the previous render's, and because
+`_args` was already advanced, the hook is not re-queued for the new value. Do not chase this with
+`useRef`-mirrored deps or extra renders.
+
+Standing rule: input-driven work (debounced searches, filters, autosave) is IMPERATIVE — do it in the event
+handler with a `setTimeout`/`AbortController` held in a ref (`onSearchQuery` in `src/ui/chat.tsx` /
+`src/ui/file-picker.tsx`). Effects stay for reacting to mounts, props, and stream events. Debugging pattern
+that found it: a throwaway `window.__probe = (window.__probe||0)+1` / `window.__probeDeps = [q]` inside the
+effect, then read it over `cdp_eval` after driving the UI (cheaper than reasoning about the framework).
+
 ### Boot breadcrumbs (compile-time gated)
 ```ts
 dlog.debug("[init]", since(), "boot model:", bootModel.id);

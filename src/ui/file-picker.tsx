@@ -4,9 +4,14 @@
 // with a batch bar. Server endpoints: /api/ws/files (listing) + /api/ws/file
 // (text or base64 image). Dotfiles hidden + dotfile paths 403 server-side;
 // paths are workspace-relative ("/"-separated).
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import hljs from "highlight.js";
 import { escapeHtml } from "./markdown.js";
+// per-line rendering (user report 2026-10-28): a real box per source line so a search hit
+// is a `[data-line]` scroll/highlight TARGET — for code AND prose (prose has no <pre>, the
+// old band could not exist there at all). hljs spans crossing newlines are re-opened per
+// line by the splitter. See src/ui/line-split.ts + tests/line-split.test.mjs.
+import { splitHljsLines, codeLinesHtml } from "./line-split.js";
 
 // CONTENT SEARCH (user request 2026-10-28: "find for the file viewer"): the left pane gets a
 // second input that runs ripgrep on the SERVER (`GET /api/ws/search` — argv-only, .gitignore
@@ -131,6 +136,10 @@ export function FilePickerDialog({
 	const [error, setError] = useState("");
 	const [loading, setLoading] = useState(false);
 	const [filter, setFilter] = useState("");
+	// ONE search box, two MODES (sonnet review 2026-10-28: two stacked inputs with no stated
+	// relationship were the core "not good" complaint). Name = client-side filename filter,
+	// Contents = the server-side rg search; switching preserves each query.
+	const [mode, setMode] = useState<"name" | "contents">("name");
 	const [busy, setBusy] = useState("");
 	const [sel, setSel] = useState<Entry | null>(null); // previewed file (right pane)
 	const [selPath, setSelPath] = useState<string | null>(null); // FULL workspace path of `sel` (search can open a file outside `path`)
@@ -147,8 +156,11 @@ export function FilePickerDialog({
 	const [searching, setSearching] = useState(false);
 	const searchAbort = useRef<AbortController | null>(null);
 	const [targetLine, setTargetLine] = useState<number | null>(null);
-	const [lineH, setLineH] = useState(0);
-	const codeRef = useRef<HTMLPreElement>(null);
+	const [hitWarn, setHitWarn] = useState<string | null>(null);
+	const codeRef = useRef<HTMLDivElement>(null);
+	const proseRef = useRef<HTMLDivElement>(null);
+	// which pane the jump must scroll (assigned during render, read by the effect)
+	const previewIsCodeRef = useRef(false);
 
 	// Escape closes (dialog parity)
 	useEffect(() => {
@@ -235,63 +247,86 @@ export function FilePickerDialog({
 		setTimeout(() => inputRef.current?.focus(), 50);
 	}, [open, initialFile]);
 
-	// CONTENT SEARCH: debounced (300ms) + aborted per keystroke, run in the CURRENT dir.
-	// The server owns the caps (400 matches, 20/file, 5s) and kills rg on disconnect.
-	useEffect(() => {
-		if (!open) return;
-		const q = sq.trim();
-		if (!q) { searchAbort.current?.abort(); setSres(null); setSearching(false); return; }
+	// CONTENT SEARCH — IMPERATIVE (not a deps-array effect). Measured in the live app
+	// (2026-10-28): a `useEffect(..., [sq, path, open])` ran with a STALE closure one value
+	// behind (`deps: ["markLine"]` while the state was already "markLineZ", Preact commits
+	// hook `_args` at diff time and the afterPaint flush invokes the previous render's
+	// callback) — so the search fired for the WRONG query, or not at all. Doing the debounce
+	// in the event handler removes the whole class of staleness. Same fix as the chat find
+	// bar. The server owns the caps (400 matches, 20/file, 5s) and kills rg on disconnect.
+	const searchTimer = useRef<any>(null);
+	const pathRef = useRef<string | null>(path);
+	pathRef.current = path;
+	const runSearch = async (q: string) => {
+		searchAbort.current?.abort();
+		const ac = new AbortController();
+		searchAbort.current = ac;
 		setSearching(true);
-		const t = setTimeout(() => {
-			searchAbort.current?.abort();
-			const ac = new AbortController();
-			searchAbort.current = ac;
-			void (async () => {
-				try {
-					const r = await fetch(`/api/ws/search?q=${encodeURIComponent(q)}${path ? `&dir=${encodeURIComponent(path)}` : ""}`, { signal: ac.signal });
-					const j = await r.json().catch(() => null);
-					if (ac.signal.aborted) return;
-					if (!r.ok || !j) throw new Error(j?.error || `search failed (${r.status})`);
-					setSres(j);
-				} catch (err: any) {
-					if (ac.signal.aborted) return;
-					setSres({ dir: path || "", files: [], total: 0, truncated: false, elapsedMs: 0, error: String(err?.message || err) });
-				} finally {
-					if (!ac.signal.aborted) setSearching(false);
-				}
-			})();
-		}, 300);
-		return () => clearTimeout(t);
-	}, [sq, path, open]);
+		const dir = pathRef.current;
+		try {
+			const r = await fetch(`/api/ws/search?q=${encodeURIComponent(q)}${dir ? `&dir=${encodeURIComponent(dir)}` : ""}`, { signal: ac.signal });
+			const j = await r.json().catch(() => null);
+			if (ac.signal.aborted) return;
+			if (!r.ok || !j) throw new Error(j?.error || `search failed (${r.status})`);
+			setSres(j);
+		} catch (err: any) {
+			if (ac.signal.aborted) return;
+			setSres({ dir: dir || "", files: [], total: 0, truncated: false, elapsedMs: 0, error: String(err?.message || err) });
+		} finally {
+			if (!ac.signal.aborted) setSearching(false);
+		}
+	};
+	/** Query input → debounce (300ms) + fire. A blank query clears the result list. */
+	const onSearchQuery = (v: string) => {
+		setSq(v);
+		clearTimeout(searchTimer.current);
+		const q = v.trim();
+		if (!q) { searchAbort.current?.abort(); setSres(null); setSearching(false); return; }
+		searchTimer.current = setTimeout(() => { void runSearch(q); }, 300);
+	};
+	/** Switching to Contents runs the query already in the box (no retyping). */
+	const setSearchMode = (m: "name" | "contents") => {
+		setMode(m);
+		if (m !== "contents") return;
+		const q = sq.trim();
+		if (!q) return;
+		clearTimeout(searchTimer.current);
+		searchTimer.current = setTimeout(() => { void runSearch(q); }, 0);
+	};
 
-	/** Open a search hit: preview that file (even outside the current dir) and band its line. */
+	/** Open a search hit: preview that file (even outside the current dir) and land on its line. */
 	const jumpTo = async (relPath: string, line: number) => {
 		const name = relPath.split("/").pop() || relPath;
 		const gen = ++selectGen.current;
 		setError("");
 		setTargetLine(null);
+		setHitWarn(null);
 		setSel({ name, dir: false, size: 0, mtime: 0 });
 		setSelPath(relPath);
 		setPreview(null);
 		const p = await fetchPreview(relPath);
 		if (gen !== selectGen.current) return;
-		if (p) {
-			setPreview(p);
-			setSel({ name, dir: false, size: p.size || 0, mtime: 0 });
-			setTargetLine(line);
+		if (!p) return;
+		setPreview(p);
+		setSel({ name, dir: false, size: p.size || 0, mtime: 0 });
+		// TRUNCATION (sonnet review): the preview stops at 120k chars — a hit past that point
+		// cannot be shown, and silently landing at the end of the file is a lie
+		const total = p.kind === "text" ? (p.content || "").split("\n").length : 0;
+		if (p.kind !== "text") return; // image/binary: open it, no line to jump to
+		if (line > total) {
+			setHitWarn(`line ${line} is past the ${total}-line preview (file truncated at 120k chars) — attach the file to read it in full`);
+			return;
 		}
+		setTargetLine(line);
 	};
 
-	// line jump: the code view is ONE <pre> (no per-line boxes), so the band is positioned by
-	// the computed line height and the scroller is offset to it — rendering stays untouched
+	/** Scroll a line into view inside whichever pane is rendered (code or prose). The element
+	 *  IS the line (`[data-line]`), so this is exact — no line-height arithmetic. */
 	useEffect(() => {
 		if (targetLine == null) return;
-		const el = codeRef.current;
-		const wrap = el?.parentElement as HTMLElement | null;
-		if (!el || !wrap) return;
-		const lh = parseFloat(getComputedStyle(el).lineHeight) || 18;
-		setLineH(lh);
-		wrap.scrollTop = Math.max(0, (targetLine - 1) * lh - wrap.clientHeight / 3);
+		const root = previewIsCodeRef.current ? codeRef.current : proseRef.current;
+		const el = root?.querySelector(`[data-line="${targetLine}"]`) as HTMLElement | null;
+		if (el) el.scrollIntoView({ block: "center" });
 	}, [targetLine, preview]);
 
 	// pure fetch+cache — no pane state (used by select AND batch attach)
@@ -399,25 +434,41 @@ export function FilePickerDialog({
 					: 1,
 		);
 	const selName = selPath || (sel ? (path ? path + "/" + sel.name : sel.name) : "");
-	const searchMode = sq.trim().length > 0;
+	const searchMode = mode === "contents" && sq.trim().length > 0;
 
 	// text preview → syntax-highlighted code view (or prose flow, no gutter)
 	const previewText = preview && preview.kind === "text" ? (preview.content || "").slice(0, PREVIEW_TRUNCATE) : "";
 	const previewIsCode = !!preview && preview.kind === "text" && !isProse(sel?.name || "");
 	const codeExt = sel ? (sel.name.match(/\.([a-z0-9]+)$/i)?.[1] || "").toLowerCase() : "";
 	const codeLang = CODE_LANG[codeExt];
-	const codeHtml = (() => {
-		if (!previewIsCode) return "";
+	previewIsCodeRef.current = previewIsCode;
+	// PER-LINE html (once per file, and once per jump so the hit line can carry its class —
+	// a jump is user-initiated, and ONE innerHTML write keeps it a single layout pass)
+	const codeLines = useMemo(() => {
+		if (!previewIsCode) return [] as string[];
 		if (codeLang && hljs.getLanguage(codeLang)) {
 			try {
-				return hljs.highlight(previewText, { language: codeLang, ignoreIllegals: true }).value;
+				return splitHljsLines(hljs.highlight(previewText, { language: codeLang, ignoreIllegals: true }).value);
 			} catch {
-				return escapeHtml(previewText);
+				return splitHljsLines(escapeHtml(previewText));
 			}
 		}
-		return escapeHtml(previewText);
-	})();
-	const gutterLines = previewIsCode ? previewText.split("\n").length : 0;
+		return splitHljsLines(escapeHtml(previewText));
+	}, [previewIsCode, previewText, codeLang]);
+	const codeHtml = useMemo(() => codeLinesHtml(codeLines, targetLine), [codeLines, targetLine]);
+	const proseLines = useMemo(() => (previewIsCode ? [] : previewText.split("\n")), [previewIsCode, previewText]);
+	const gutterLines = previewIsCode ? codeLines.length : 0;
+	// the open file's hits → the in-preview "n / m in file" stepper (sonnet review)
+	const fileMatches = useMemo(() => {
+		if (!sres || !selPath) return [] as SearchHit[];
+		return sres.files.find((f) => f.path === selPath)?.matches || [];
+	}, [sres, selPath]);
+	const hitIndex = targetLine == null ? -1 : fileMatches.findIndex((m) => m.line === targetLine);
+	const stepHit = (delta: number) => {
+		if (!fileMatches.length) return;
+		const next = hitIndex < 0 ? 0 : (hitIndex + delta + fileMatches.length) % fileMatches.length;
+		setTargetLine(fileMatches[next].line);
+	};
 
 	return (
 		<div class="pw-overlay" onClick={onClose}>
@@ -446,24 +497,46 @@ export function FilePickerDialog({
 						</span>
 					))}
 				</div>
-				<input
-					ref={inputRef}
-					class="pi-input pw-dialog-search"
-					type="text"
-					placeholder="Filter by name…"
-					value={filter}
-					onInput={(e) => setFilter((e.target as HTMLInputElement).value)}
-				/>
-				{/* content search (user request 2026-10-28): rg on the server, results in the left pane */}
-				<input
-					class="pi-input pw-dialog-search pw-content-search"
-					type="search"
-					placeholder={`Find in ${path || "workspace"}… (file contents, rg)`}
-					value={sq}
-					aria-label="Find in file contents"
-					onInput={(e) => setSq((e.target as HTMLInputElement).value)}
-					onKeyDown={(e) => { if (e.key === "Escape" && sq) { e.stopPropagation(); setSq(""); } }}
-				/>
+				{/* ONE box + a Name/Contents mode switch (sonnet review): the two stacked inputs
+				    had no visible relationship, and the old ✕-less box made it hard to get back */}
+				<div class="pw-search-bar">
+					<span class="pw-search-ico" aria-hidden="true">{mode === "name" ? "🗂" : "🔍"}</span>
+					<input
+						ref={inputRef}
+						class="pi-input pw-search-input"
+						type="search"
+						placeholder={mode === "name" ? "Filter by name…" : `Find in ${path || "workspace"}… (file contents, rg)`}
+						value={mode === "name" ? filter : sq}
+						aria-label={mode === "name" ? "Filter files by name" : "Find in file contents"}
+						onInput={(e) => { const v = (e.target as HTMLInputElement).value; if (mode === "name") setFilter(v); else onSearchQuery(v); }}
+						onKeyDown={(e) => {
+							if (e.key === "Escape" && (filter || sq)) { e.stopPropagation(); e.preventDefault(); setFilter(""); onSearchQuery(""); return; }
+							if (mode === "contents" && e.key === "Enter") {
+								e.preventDefault();
+								// walk the open file's hits; with nothing open, open the first result
+								if (fileMatches.length) stepHit(e.shiftKey ? -1 : 1);
+								else { const first = sres?.files[0]; if (first?.matches[0]) void jumpTo(first.path, first.matches[0].line); }
+							}
+						}}
+					/>
+					{(filter || sq) ? (
+						<button type="button" class="pw-search-clear" title="Clear" onClick={() => { setFilter(""); onSearchQuery(""); }}>✕</button>
+					) : null}
+					<div class="pw-search-modes" role="group" aria-label="Search mode">
+						<button
+							type="button"
+							class={"pw-search-mode" + (mode === "name" ? " pw-search-mode-on" : "")}
+							title="Filter the file list by name (client-side)"
+							onClick={() => setSearchMode("name")}
+						>Name</button>
+						<button
+							type="button"
+							class={"pw-search-mode" + (mode === "contents" ? " pw-search-mode-on" : "")}
+							title="Search inside file contents (ripgrep on the server)"
+							onClick={() => setSearchMode("contents")}
+						>Contents</button>
+					</div>
+				</div>
 				{error && (
 					<div class="pw-note pw-note-destructive" style={{ padding: "0 16px" }}>
 						{error}
@@ -489,7 +562,13 @@ export function FilePickerDialog({
 										<span class="pw-search-count">{f.matches.length}</span>
 									</button>
 									{f.matches.map((m, i) => (
-										<button type="button" class="pw-search-hit" key={i} title={`open ${f.path} at line ${m.line}`} onClick={() => void jumpTo(f.path, m.line)}>
+										<button
+											type="button"
+											class={"pw-search-hit" + (selPath === f.path && targetLine === m.line ? " pw-search-hit-active" : "")}
+											key={i}
+											title={`open ${f.path} at line ${m.line}`}
+											onClick={() => void jumpTo(f.path, m.line)}
+										>
 											<span class="pw-search-ln">{m.line}</span>
 											<span class="pw-search-text">{markLine(m.text, sq.trim())}</span>
 										</button>
@@ -583,33 +662,53 @@ export function FilePickerDialog({
 										{attached.has(selName) ? "Attach again" : "Attach"}
 									</button>
 								</div>
+								{/* IN-FILE MATCH STEPPER (sonnet review): the open file's hits, walkable without
+								    going back to the result list; ✕ just clears the highlight */}
+								{fileMatches.length > 0 ? (
+									<div class="pw-preview-toolbar">
+										<span class="pw-preview-toolbar-count">
+											{hitIndex >= 0 ? `${hitIndex + 1} / ${fileMatches.length}` : `${fileMatches.length}`} match{fileMatches.length === 1 ? "" : "es"} in file
+										</span>
+										<button type="button" class="pw-preview-nav" title="Previous match in this file (Shift+Enter)" onClick={() => stepHit(-1)}>▲</button>
+										<button type="button" class="pw-preview-nav" title="Next match in this file (Enter)" onClick={() => stepHit(1)}>▼</button>
+										<button type="button" class="pw-preview-nav pw-preview-nav-close" title="Clear the highlight" onClick={() => { setTargetLine(null); setHitWarn(null); }}>✕</button>
+									</div>
+								) : null}
+								{hitWarn ? (
+									<div class="pw-preview-warn" role="alert">
+										<span>⚠ {hitWarn}</span>
+										<button type="button" class="pw-preview-nav" title="Dismiss" onClick={() => setHitWarn(null)}>✕</button>
+									</div>
+								) : null}
 								{preview.kind === "image" ? (
 									<div class="pw-preview-imgwrap">
 										<img class="pw-preview-img" src={`data:${preview.mimeType};base64,${preview.base64}`} alt={sel.name} />
 									</div>
 								) : isProse(sel.name) ? (
-									// prose (md/txt/log): humanist flow, no gutter, no mono —
-									// line numbers imply addressable code (sonnet round)
-									<div class="pw-preview-prose">{previewText}</div>
+									// prose (md/txt/log): humanist flow, no gutter — but still ONE ELEMENT PER LINE,
+									// so a content-search hit is scrollable and highlightable here too (it was not:
+									// the old band lived in the code <pre> and prose has none)
+									<div class="pw-preview-prose" ref={proseRef}>
+										{proseLines.map((text, i) => (
+											<div
+												key={i}
+												class={"pw-prose-line" + (i + 1 === targetLine ? " pw-prose-line-hit" : "")}
+												data-line={i + 1}
+											>
+												{text || "\u00a0"}
+											</div>
+										))}
+										{preview.truncated ? <div class="pw-code-trunc">… preview truncated — attach the file for the full content</div> : null}
+									</div>
 								) : (
-									// syntax-highlighted code view (user request) with a sticky
-									// line-number gutter; no wrap so gutter/code stay aligned
+									// syntax-highlighted code view (user request) with a sticky line-number
+									// gutter; per-line boxes keep gutter/code aligned (same line-height, and a
+									// min-height so even an empty line still occupies its row)
 									<div class="pw-preview-codewrap">
-										{targetLine != null && lineH > 0 ? (
-											<div class="pw-code-hit" aria-hidden="true" style={{ top: `${(targetLine - 1) * lineH}px`, height: `${lineH}px` }} />
-										) : null}
 										<pre class="pw-code-gutter" aria-hidden="true">
 											{Array.from({ length: gutterLines }, (_, i) => i + 1).join("\n")}
 										</pre>
-										<pre
-											ref={codeRef}
-											class="pw-code-html"
-											dangerouslySetInnerHTML={{
-												__html:
-													codeHtml +
-													(preview.truncated ? "\n\n… preview truncated — full content is attached" : ""),
-											}}
-										/>
+										<div class="pw-code-html" ref={codeRef} dangerouslySetInnerHTML={{ __html: codeHtml }} />
 									</div>
 								)}
 							</>

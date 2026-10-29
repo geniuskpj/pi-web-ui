@@ -44,7 +44,7 @@ import { streamSimple } from "@earendil-works/pi-ai/compat";
 // pi-ai 1.4.0 builtin catalog — the no-.pi fallback for the model list (5.6KB
 // aggregation module; the per-provider model data loads alongside it)
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
-import { buildProviderCatalog, clientProviders, resolvedKeys } from "./lib/pi-catalog.mjs";
+import { buildProviderCatalog, clientProviders, resolvedKeys, unavailableProviders } from "./lib/pi-catalog.mjs";
 import { searchMessages, DEFAULT_LIMIT, MAX_LIMIT } from "./lib/session-search.mjs";
 import { rgArgs, parseRgJson } from "./lib/rg-json.mjs";
 import { AgentHub } from "./agent-hub.mjs";
@@ -160,10 +160,21 @@ function buildCatalog() {
 
 function piConfig() {
 	const settings = readJsonSafe("settings.json") || {};
-	const providers = clientProviders(piModelsStore);
+	// THE PICKER OFFERS ONLY WHAT THE WEB UI CAN RUN (user report 2026-10-28: it listed
+	// openai / github-copilot / google — providers that exist only in pi's discovery cache
+	// or the builtin catalog — while the user had added nvidia alone). A provider counts as
+	// usable when a credential resolves (auth.json / models.json) or it is declared keyless.
+	// `unavailable` is reported instead of silently dropped; and if NOTHING is usable (a
+	// fresh machine with no keys) the full catalog is returned so the picker is not empty.
+	const usable = clientProviders(piModelsStore, { onlyUsable: true });
+	const fallbackToCatalog = usable.length === 0;
+	const providers = fallbackToCatalog ? clientProviders(piModelsStore) : usable;
+	const unavailable = fallbackToCatalog ? [] : unavailableProviders(piModelsStore);
 	const origins = [...new Set(providers.map((p) => p.origin))];
 	return {
 		providers,
+		unavailable,
+		catalogFallback: fallbackToCatalog || undefined,
 		modelSource: providers.length === 0 ? "none" : origins.length === 1 ? origins[0] : origins.join("+"),
 		defaults: {
 			provider: settings.default_provider || settings.defaultProvider || undefined,

@@ -130,12 +130,38 @@ the app draws one (markdown input/memoization is never touched).
   re-run in the live app during verification.
 - `window.__piFind` exposes the bar's state for debugging (like `__piGate`/`__PI_PROVIDERS`).
 
-**File viewer** (`ui/file-picker.tsx`): a second input under the name filter runs the server-side rg search
-for the CURRENT directory; the left pane switches to grouped results (`path (n)` + `line: text` with `<mark>`)
-and clicking one opens the file in the preview **at that line** — the code view is still one `<pre>`, so the
-band is positioned by the computed line height (`.pw-code-hit` inside the `position: relative`
-`.pw-preview-codewrap`) instead of restructuring the highlighted HTML. `jumpTo()` carries the file's FULL
-path (`selPath`), so a hit from another directory previews and attaches correctly.
+**File viewer** (`ui/file-picker.tsx`): **ONE search box with a Name / Contents mode switch** (two stacked
+inputs were the "not good" part — sonnet review 2026-10-28); switching preserves each query, and switching TO
+Contents re-runs what is already typed. Contents searches the CURRENT directory on the server; the left pane
+switches to grouped results (`path (n)` + `line: text` with `<mark>`), the active hit is highlighted, and the
+status line sticks to the top of the scroller. Clicking a hit opens the file **at that line**; the preview head
+gains a `n / m matches in file` stepper (▲▼ + ✕, Enter/Shift+Enter while the box is focused) and a warning when
+the hit is past the 120k-char preview (never a silent landing at the end). `jumpTo()` carries the file's FULL
+path (`selPath`), so a hit from another directory previews/attaches correctly (`attachSel()`).
+
+**Per-line preview rendering** (`ui/line-split.ts`, user report 2026-10-28: "a bug in highlighting lines ui"):
+the hit line used to be an absolutely positioned BAND whose `top` came from the CSS line-height against the
+scroll container's padding box — off by the `<pre>`'s own padding, drifting with the sticky gutter, and
+impossible in the PROSE preview (no `<pre>` at all: a hit in a `.md`/`.txt` jumped nowhere). Every source line
+is now its own element (`<div class="pw-code-line" data-line="N">`, or `.pw-prose-line` for prose, both with a
+min-height so blank lines keep their row), built with ONE `innerHTML` write per file (`codeLinesHtml`, rebuilt
+on a jump so the hit carries `.pw-code-line-hit`) — the jump is then `querySelector('[data-line]')` +
+`scrollIntoView`, exact for code and prose alike. hljs spans that CROSS newlines are closed/re-opened per line
+by `splitHljsLines` (block comments, template literals) so the markup stays well-formed and copy still works.
+
+**Input-driven work is IMPERATIVE here, not a deps-array effect** (measured 2026-10-28, see
+[lessons.md](lessons.md) → "A deps-array useEffect can run with a stale closure"): both the chat find bar and
+this viewer search debounce inside the input handler with a `setTimeout` ref. A `useEffect(..., [q])` ran with
+the PREVIOUS query (Preact commits hook `_args` at diff time and the afterPaint flush invokes the previous
+render's callback), so the search fired for the wrong text or not at all.
+
+**Theme** (`ui/theme.ts`): `readTheme()/applyThemeClass()/setTheme()` own the `theme` key + `.dark` class; the
+header cycle button is gone (user request) and Settings → Appearance holds the select. The shell only applies
+the class at boot and follows the OS while `system` is selected.
+
+**Mobile chrome**: `@media (max-width: 800px), (pointer: coarse)` tightens the header — 32px buttons, zero flex
+`gap`, 4px padding (the visible spacing was the BUTTON's own slack, not the gap; `pointer: coarse` covers a
+phone browsing in desktop mode).
 
 ## Model selector (`ui/model-selector.tsx`)
 

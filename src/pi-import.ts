@@ -19,6 +19,10 @@ export interface PiProviderConfig {
 
 export interface PiConfig {
 	providers: PiProviderConfig[];
+	/** providers the picker does NOT offer, with the reason (no key / OAuth-only / cache-only) */
+	unavailable?: Array<{ name: string; reason: string; models?: number }>;
+	/** true = nothing was usable, so the full catalog was returned instead of an empty picker */
+	catalogFallback?: boolean;
 	defaults: {
 		provider?: string;
 		model?: string;
@@ -31,6 +35,9 @@ const CACHE_KEY = "pi.modelsCache";
 declare global {
 	interface Window {
 		__PI_PROVIDERS?: Array<{ name: string; models: AnyModel[]; origin?: string; keyless?: boolean }>;
+		/** the picker's "why is X missing" footer data (server-side filter, 2026-10-28) */
+		__PI_UNAVAILABLE?: Array<{ name: string; reason: string; models?: number }>;
+		__PI_CATALOG_FALLBACK?: boolean;
 	}
 }
 
@@ -46,6 +53,8 @@ export function loadCachedConfig(): PiConfig | null {
 			origin: p.origin,
 			keyless: p.keyless,
 		}));
+		(window as any).__PI_UNAVAILABLE = cfg.unavailable || [];
+		(window as any).__PI_CATALOG_FALLBACK = !!cfg.catalogFallback;
 		return cfg;
 	} catch {
 		return null;
@@ -60,6 +69,8 @@ export function applyConfig(config: PiConfig) {
 		origin: p.origin,
 		keyless: p.keyless,
 	}));
+	(window as any).__PI_UNAVAILABLE = config.unavailable || [];
+	(window as any).__PI_CATALOG_FALLBACK = !!config.catalogFallback;
 	try {
 		localStorage.setItem(
 			CACHE_KEY,

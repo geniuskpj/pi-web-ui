@@ -12,6 +12,9 @@ import { getAppStorage } from "../storage.js";
 import { enterSendsPref, turnsVisiblePref, setTurnsVisible, TURNS_VISIBLE_DEFAULT } from "./chat.js";
 import { getProxyUrlSync } from "./proxy-stream.js";
 import { retryServerAuth } from "../server-auth.js"; // re-probe after a token change (clears the banner)
+// theme (user request 2026-10-28: "Move theme selector in settings"): the header cycle
+// button is gone — the pref lives in src/ui/theme.ts (localStorage `theme` + `.dark`)
+import { readTheme, setTheme, themeLabel, THEMES, type ThemeMode } from "./theme.js";
 // data-reduction LEVELS (images · reasoning/answer/tool streaming). All decisions live in the
 // tested pure layer; this file only persists them and prints the resolved parameters.
 import {
@@ -64,6 +67,7 @@ export function SettingsDialog({
 	const [enterPref, setEnterPref] = useState<string>(() => enterSendsPref());
 	// turns visible in a large (tail-first) session — pi.turnWindow, default 3
 	const [turnWindow, setTurnWindow] = useState<number>(() => turnsVisiblePref());
+	const [theme, setThemeState] = useState<ThemeMode>(() => readTheme());
 	const [quota, setQuota] = useState<{ usage: number; percent: number } | null>(null);
 	const [saved, setSaved] = useState("");
 	// thinking level is read from agent.state at render (no stale local snapshot —
@@ -220,6 +224,27 @@ export function SettingsDialog({
 								))}
 							</select>
 						</label>
+					</section>
+
+					<section class="pw-set-section">
+						<h3>Appearance</h3>
+						<label class="pw-set-row" title="System follows the operating system's light/dark preference.">
+							<span>Theme</span>
+							<select
+								class="pi-input pw-set-input"
+								value={theme}
+								onChange={(e) => {
+									const v = setTheme((e.target as HTMLSelectElement).value as ThemeMode);
+									setThemeState(v);
+									flash(`Theme: ${themeLabel(v)}`);
+								}}
+							>
+								{THEMES.map((m) => (
+									<option key={m} value={m}>{themeLabel(m)}</option>
+								))}
+							</select>
+						</label>
+						<div class="pw-hint">Saved as <code>theme</code> in this browser (same key as before — an existing choice is kept).</div>
 					</section>
 
 					<section class="pw-set-section">

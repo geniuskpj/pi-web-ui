@@ -253,6 +253,31 @@ html.dark .pw-sessions-err {
 	}
 }
 
+/* Tighter icon row on phones / any TOUCH device (user request 2026-10-28, refined after
+   "gap between icon is not reduced": the visible distance was mostly the BUTTON's own
+   padding — a 40px button with a 20px icon leaves 10px of slack per side, so zeroing the
+   flex `gap` changed almost nothing). `pointer: coarse` is in the list so a phone browsing
+   in desktop mode (viewport >800px) still gets it. 32px stays a comfortable tap target. */
+@media (max-width: 800px), (pointer: coarse) {
+	.pi-header {
+		gap: 2px;
+		padding-left: calc(4px + env(safe-area-inset-left));
+		padding-right: calc(4px + env(safe-area-inset-right));
+	}
+	.pi-header-left,
+	.pi-header-right {
+		gap: 0;
+	}
+	.pi-btn {
+		width: 32px;
+		height: 32px;
+	}
+	.pi-btn svg {
+		width: 18px;
+		height: 18px;
+	}
+}
+
 /* ---------- loading splash ---------- */
 .pi-splash {
 	height: 100%;
@@ -1136,7 +1161,7 @@ html.dark { --stat-warn: #fbbf24; --stat-danger: #f87171; --stat-ok: #4ade80; --
 	flex: 1;
 	min-height: 0;
 	display: flex;
-	position: relative; /* anchor for .pw-code-hit (find jump band) */
+	position: relative;
 	align-items: flex-start; /* CRITICAL: default stretch shrinks both <pre>s to the
 		viewport height — their text then overflows and the code paints over the
 		gutter below the first screen (user-reported line-number overlap) */
@@ -1163,6 +1188,7 @@ html.dark { --stat-warn: #fbbf24; --stat-danger: #f87171; --stat-ok: #4ade80; --
 }
 .pw-code-html {
 	flex: 1;
+	min-width: 0;
 	margin: 0;
 	padding: 10px 14px;
 	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -2196,10 +2222,89 @@ html.dark .pw-retry-giveup-note { color: #fbbf24; }
 .pw-search-ln { flex: none; font-variant-numeric: tabular-nums; opacity: 0.55; min-width: 2.6em; text-align: right; }
 .pw-search-text { flex: 1 1 auto; min-width: 0; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .pw-search-text mark { background: rgba(245, 165, 36, 0.4); color: inherit; border-radius: 3px; padding: 0 1px; }
-/* the jumped-to line: the code view is one <pre>, so the band is positioned by line height */
-.pw-code-hit {
-	position: absolute; left: 0; right: 0; pointer-events: none;
+
+/* --- model picker: what was hidden and why (user report 2026-10-28) ---------- */
+.pw-model-more {
+	margin: 6px 10px 10px; padding: 6px 8px; border-radius: 8px;
+	border: 1px dashed rgba(128, 128, 128, 0.35); font-size: 11.5px;
+}
+.pw-model-more summary { cursor: pointer; color: var(--muted-foreground, #888); }
+.pw-model-more summary:hover { color: #f5a524; }
+.pw-model-hint { padding: 6px 2px 0; color: var(--muted-foreground, #888); line-height: 1.45; }
+.pw-model-hidden { margin: 6px 0 0; padding-left: 18px; color: var(--muted-foreground, #888); }
+.pw-model-hidden li { margin: 3px 0; line-height: 1.4; }
+.pw-model-hidden b { color: inherit; }
+
+/* --- per-line preview rendering (user report 2026-10-28: "bug in highlighting lines ui") ---
+   The jumped-to line used to be an absolutely positioned BAND whose top was computed from
+   the CSS line-height against the scroll container's padding box: off by the <pre>'s own
+   padding, drifting with the sticky gutter, and IMPOSSIBLE in the prose preview (which has
+   no <pre>, so a hit in a .md/.txt/.log jumped nowhere). Now every source line is a real
+   element with `data-line`, so the jump is a plain scrollIntoView + a class. */
+.pw-code-line { min-height: var(--code-line-h, 20px); }
+.pw-code-line-hit {
+	background: rgba(245, 165, 36, 0.16);
+	box-shadow: inset 3px 0 0 rgba(245, 165, 36, 0.85);
+}
+.pw-prose-line { padding: 0 2px; border-radius: 3px; min-height: 1.6em; }
+.pw-prose-line-hit {
 	background: rgba(245, 165, 36, 0.18);
-	border-top: 1px solid rgba(245, 165, 36, 0.5);
-	border-bottom: 1px solid rgba(245, 165, 36, 0.5);
+	box-shadow: inset 3px 0 0 rgba(245, 165, 36, 0.85);
+}
+.pw-code-trunc {
+	position: sticky; bottom: 0; padding: 6px 10px; font-size: 11px;
+	color: var(--muted-foreground, #888); background: var(--background, #fff);
+	border-top: 1px dashed rgba(128, 128, 128, 0.35);
+}
+
+/* in-preview match stepper + jump warnings */
+.pw-preview-toolbar {
+	display: flex; align-items: center; gap: 6px; padding: 4px 8px; flex-shrink: 0;
+	border: 1px solid rgba(245, 165, 36, 0.35); border-radius: 8px;
+	background: rgba(245, 165, 36, 0.08); font-size: 11.5px; margin-bottom: 6px;
+}
+.pw-preview-toolbar-count { margin-right: auto; color: var(--muted-foreground, #888); }
+.pw-preview-nav {
+	appearance: none; border: 1px solid var(--border, rgba(128,128,128,.35)); background: transparent;
+	color: inherit; cursor: pointer; font-size: 11px; line-height: 1; padding: 5px 8px;
+	border-radius: 6px; min-width: 26px; min-height: 26px;
+}
+.pw-preview-nav:hover { background: rgba(128, 128, 128, 0.16); }
+.pw-preview-nav-close { opacity: 0.7; }
+.pw-preview-warn {
+	display: flex; align-items: center; gap: 8px; padding: 6px 10px; flex-shrink: 0;
+	font-size: 11.5px; border-radius: 8px; margin-bottom: 6px;
+	background: rgba(245, 165, 36, 0.14); border: 1px solid rgba(245, 165, 36, 0.45);
+}
+.pw-preview-warn span { margin-right: auto; }
+
+/* --- file viewer: one search box with a Name/Contents mode switch -------------- */
+.pw-search-bar {
+	display: flex; align-items: center; gap: 6px; flex-shrink: 0;
+	margin: 10px 16px 4px;
+}
+.pw-search-ico { font-size: 14px; opacity: 0.65; flex: none; }
+.pw-search-input { flex: 1 1 auto; min-width: 0; margin: 0 !important; }
+.pw-search-clear {
+	appearance: none; border: 0; background: transparent; color: inherit; cursor: pointer;
+	font-size: 12px; line-height: 1; padding: 6px 7px; border-radius: 6px; flex: none;
+}
+.pw-search-clear:hover { background: rgba(128, 128, 128, 0.16); }
+.pw-search-modes { display: flex; flex: none; border: 1px solid var(--border, rgba(128,128,128,.35)); border-radius: 7px; overflow: hidden; }
+.pw-search-mode {
+	appearance: none; border: 0; background: transparent; color: var(--muted-foreground, #888);
+	cursor: pointer; font: inherit; font-size: 11.5px; padding: 5px 10px;
+}
+.pw-search-mode:hover { background: rgba(128, 128, 128, 0.14); }
+.pw-search-mode-on { background: #f5a524; color: #1b1b1d; font-weight: 600; }
+/* the results status sticks to the top of the scrolling left pane */
+.pw-search-status {
+	position: sticky; top: 0; z-index: 2;
+	background: var(--background, #1b1b1d);
+}
+.pw-search-hit-active { background: rgba(245, 165, 36, 0.14); }
+.pw-search-hit-active .pw-search-ln { color: #f5a524; font-weight: 600; }
+@media (max-width: 48rem) {
+	.pw-search-mode { padding: 5px 7px; }
+	.pw-search-bar { margin: 8px 10px 4px; }
 }

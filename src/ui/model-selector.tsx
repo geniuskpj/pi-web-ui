@@ -91,6 +91,37 @@ export function ModelSelector({
 				/>
 				<div class="pw-dialog-body">
 					{groups.length === 0 && <div class="pw-empty">No models. Use the 🗄️ import button, or check the server.</div>}
+					{/* HONEST FOOTER (user report 2026-10-28): the picker offers only providers the web UI
+					    can actually run — say what was left out and why instead of hiding it silently */}
+					{(() => {
+						const unavailable = ((window as any).__PI_UNAVAILABLE || []) as Array<{ name: string; reason: string; models?: number }>;
+						const catalogFallback = !!(window as any).__PI_CATALOG_FALLBACK;
+						if (!unavailable.length && !catalogFallback) return null;
+						return (
+							<details class="pw-model-more">
+								<summary>
+									{catalogFallback
+										? "No provider has a key yet — showing the built-in catalog"
+										: `${unavailable.length} provider${unavailable.length === 1 ? "" : "s"} hidden (no key)`}
+								</summary>
+								{catalogFallback ? (
+									<div class="pw-model-hint">
+										Add a key in Settings → API keys, put one in <code>.pi/auth.json</code>, or declare a keyless
+										endpoint in <code>.pi/models.json</code> — the picker then lists only usable providers.
+									</div>
+								) : (
+									<ul class="pw-model-hidden">
+										{unavailable.map((u) => (
+											<li key={u.name}>
+												<b>{u.name}</b> — {u.reason}
+												{u.models ? ` · ${u.models} models available` : ""}
+											</li>
+										))}
+									</ul>
+								)}
+							</details>
+						);
+					})()}
 					{groups.map((g) => (
 						<div key={g.name} class="pw-model-group">
 							<div class="pw-model-provider">

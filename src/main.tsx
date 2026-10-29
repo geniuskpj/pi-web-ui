@@ -11,6 +11,7 @@ import { makeId } from "./id.js";
 import { SessionListDialog } from "./ui/session-list.js";
 import { AliveSessionsDialog } from "./ui/alive-sessions.js";
 import { SettingsDialog } from "./ui/settings.js";
+import { applyThemeClass } from "./ui/theme.js";
 import { ModelSelector } from "./ui/model-selector.js";
 import { AppStorage, CustomProvidersStore, ProviderKeysStore, SessionsStore, SettingsStore, setAppStorage } from "./storage.js";
 import { ChatView } from "./ui/chat.js";
@@ -321,17 +322,9 @@ function setServerStatus(online: boolean) {
 	window.dispatchEvent(new CustomEvent("pi-server-status", { detail: online }));
 }
 
-/** mini-lit ThemeToggle replacement: same "theme" key + .dark class contract. */
-function applyThemeClass() {
-	let t: string;
-	try {
-		t = localStorage.getItem("theme") || "system";
-	} catch {
-		t = "system";
-	}
-	const dark = t === "dark" || (t === "system" && window.matchMedia?.("(prefers-color-scheme: dark)").matches);
-	document.documentElement.classList.toggle("dark", dark);
-}
+// theme lives in ONE module now (src/ui/theme.ts) — the header button moved into
+// Settings (user request 2026-10-28), so the shell only applies the class at boot and
+// follows the OS while `system` is selected.
 
 function setToastBg(msg: string) {
 	window.dispatchEvent(new CustomEvent("pi-toast", { detail: msg }));
@@ -533,7 +526,7 @@ function App() {
 	const [aliveOpen, setAliveOpen] = useState(false);
 	const [settingsOpen, setSettingsOpen] = useState(false);
 	const [modelOpen, setModelOpen] = useState(false);
-	const [themeMode, setThemeMode] = useState<string>(localStorage.getItem("theme") || "system");
+
 	const [titleDraft, setTitleDraft] = useState("");
 	const inputRef = useRef<HTMLInputElement>(null);
 
@@ -605,15 +598,6 @@ function App() {
 		notify();
 	};
 
-	const cycleTheme = () => {
-		const order = ["system", "light", "dark"] as const;
-		const cur = (localStorage.getItem("theme") as any) || "system";
-		const next = order[(order.indexOf(cur) + 1) % order.length];
-		localStorage.setItem("theme", next);
-		applyThemeClass();
-		setThemeMode(next);
-	};
-
 	// alive sessions (running/error) EXCLUDING the current one — the badge counts
 	// "other stuff needs me"; the dialog lists ALL alive incl. current (claude review)
 	const aliveElsewhere = [...runtime.values()].filter(
@@ -669,9 +653,6 @@ function App() {
 								{aliveElsewhere.length}
 							</span>
 						)}
-					</button>
-	<button class="pi-btn pi-theme" title={`Theme: ${themeMode} (click to cycle)`} onClick={cycleTheme}>
-						<span style={{ fontSize: 11, fontWeight: 600 }}>{themeMode === "system" ? "Auto" : themeMode === "light" ? "Light" : "Dark"}</span>
 					</button>
 					<button class="pi-btn" title="Settings" onClick={() => setSettingsOpen(true)}>
 						<Icon d={ICONS.settings} />
