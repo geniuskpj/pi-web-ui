@@ -1,6 +1,6 @@
 # Client — main.tsx, chat.tsx, storage, sync, connectivity
 
-> Updated 2026-10-27 · See also: [architecture.md](architecture.md) (data flows, trust model) ·
+> Updated 2026-10-28 · See also: [architecture.md](architecture.md) (data flows, trust model) ·
 [server.md](server.md) (exec bridge, /ws/sync hub) · [terminal.md](terminal.md) (command bridge consumer)
 
 Covers `src/main.tsx`, `src/ui/chat.tsx`, `src/storage.ts`, `src/local-storage-backend.js`,
@@ -103,6 +103,39 @@ Covers `src/main.tsx`, `src/ui/chat.tsx`, `src/storage.ts`, `src/local-storage-b
   attachments.
 - Usage bar: last-call context % (prefers `usage.totalTokens`, else the 4-way sum; labeled "last-call"
   because provider usage shapes differ) + session totals ↑↓$.
+
+## Find (chat + file viewer, 2026-10-28)
+
+**Chat** (`ui/find.tsx` + `chat.tsx`, `Ctrl/Cmd+F` or the header 🔍): the bar queries
+`GET /api/agent/session/:id/search` (server-side, whole session — see [server.md](server.md) §Find) and lists
+each hit as **role badge + turn + 1–2 lines of context** with the match marked by `<mark>` — the ONLY place
+the app draws one (markdown input/memoization is never touched).
+
+- **Seq-keyed, never index-keyed**: a prefix fill PREPENDS `state.messages`, so a hit is addressed by its
+  absolute seq (`data-seq` on the `.pw-anchor` wrapper) and re-resolved at jump time.
+- **Jump**: in the live window (and not behind the display gate) → `highlightSeq` outline + `details`
+  opened + `scrollIntoView`, auto-scroll pinned off. Otherwise a **read-only PEEK sheet**: the loaded slice
+  when the hit is already in memory, else ONE `/range` fetch (`ProxyAgent.peekRange` — fetch + gunzip +
+  header-validated, **never spliced** into `state.messages`; `fillWindow` would have to prepend up to the
+  hit and then mount everything behind the gate). The peek says `seq a–b · read-only peek · not in the live
+  window`; hits are steppable with Enter/Shift+Enter and the sheet closes with Esc.
+- **Staleness**: the response's `rewriteSeq` is compared with `state.sparse.rewriteSeq` — a rewrite
+  (edit/retry/restore/compact) marks the list dirty (“search again”); appends never invalidate it. A
+  mirror-only (`source: jsonl`) list is marked dirty as soon as the hub attaches. A session switch clears
+  everything (and the query).
+- **Honest status line**: `N matches · live transcript|saved mirror · M messages · K searched` (+`truncated`).
+  Searches `user`+`assistant` text only (tool output/thinking excluded in v1).
+- Ctrl/Cmd+F keeps the browser's native find when text is SELECTED in a field; otherwise it opens the bar.
+  The debounce is IMPERATIVE (a `setTimeout` in the input handler) — a deps-array effect silently did not
+  re-run in the live app during verification.
+- `window.__piFind` exposes the bar's state for debugging (like `__piGate`/`__PI_PROVIDERS`).
+
+**File viewer** (`ui/file-picker.tsx`): a second input under the name filter runs the server-side rg search
+for the CURRENT directory; the left pane switches to grouped results (`path (n)` + `line: text` with `<mark>`)
+and clicking one opens the file in the preview **at that line** — the code view is still one `<pre>`, so the
+band is positioned by the computed line height (`.pw-code-hit` inside the `position: relative`
+`.pw-preview-codewrap`) instead of restructuring the highlighted HTML. `jumpTo()` carries the file's FULL
+path (`selPath`), so a hit from another directory previews and attaches correctly.
 
 ## Model selector (`ui/model-selector.tsx`)
 

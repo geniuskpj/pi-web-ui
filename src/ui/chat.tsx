@@ -26,13 +26,16 @@ import type {
 	UserMessage,
 } from "@earendil-works/pi-ai";
 import { Fragment } from "preact";
-import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import type { SystemNotificationMessage } from "../llm.js";
 import { getAppStorage } from "../storage.js";
 import { looksLikeAuthError, createApiKeyResolver } from "./proxy-stream.js";
 import { copyText } from "../id.js";
 import { gateIndex, gateSeqOfLastTurns, prevUserSeq, resolveGateSeq } from "../../lib/display-gate.mjs";
 import { FilePickerDialog, type PickedFile } from "./file-picker.js";
+// whole-session find (user request 2026-10-28): bar + read-only peek of a hit that is
+// outside the live window. Search itself is SERVER-side (lib/session-search.mjs).
+import { ChatFindBar, PeekSheet, type FindHit, type FindMeta } from "./find.js";
 import { TerminalPanel, termBus } from "./terminal.js";
 import { renderMarkdown } from "./markdown.js";
 // egress media (plan §2.2b): a transcript image part may carry only a hash → hydrate before re-sending
@@ -1098,6 +1101,205 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 	(window as any).__piGate = { gateSeq, displayFrom, filledSeq, len: state.messages.length, turnWindow, provisional: gateProvisional.current };
 	const displayFromRef = useRef<number | null>(null);
 	displayFromRef.current = displayFrom;
+	// ---------------------------------------------------------------------------
+	// FIND IN CONVERSATION (user request 2026-10-28) — server-side whole-session search
+	// ---------------------------------------------------------------------------
+	// The browser holds a tail-first WINDOW plus the display gate, so an in-page find
+	// would lie. `GET /api/agent/session/:id/search` scans the array `/range` serves from
+	// and returns seq-keyed hits with 1–2 lines of context. Rules (grok review 2026-10-28):
+	//  - every hit is addressed by SEQ (a prefetch PREPENDS the array — indices rot)
+	//  - a hit inside the live window is highlighted IN PLACE (row outline, details opened)
+	//  - a hit outside it opens a read-only PEEK; the window/gate are NEVER re-windowed
+	//    (prepending up to a far hit would mount hundreds of markdown blocks)
+	//  - <mark> lives only in the result list — markdown input is never rewritten
+	const [findOpen, setFindOpen] = useState(false);
+	const [findQ, setFindQ] = useState("");
+	const [findHits, setFindHits] = useState<FindHit[]>([]);
+	const [findIndex, setFindIndex] = useState(0);
+	const [findMeta, setFindMeta] = useState<FindMeta>({ source: null, messageCount: 0, scanned: 0, truncated: false, dirty: false, searching: false, error: null });
+	const [highlightSeq, setHighlightSeq] = useState<number | null>(null);
+	const [peek, setPeek] = useState<{ hitSeq: number; turn: number; role: string; fromSeq: number; toSeq: number; messages: any[]; source: "memory" | "server" } | null>(null);
+	const findGen = useRef<number | null>(null); // rewriteSeq the hit list is as-of
+	const findSrc = useRef<string | null>(null); // "live" | "jsonl"
+	const findAbort = useRef<AbortController | null>(null);
+	const findOpenRef = useRef(false);
+	const peekRef = useRef<any>(null);
+	const peekScrollRef = useRef<HTMLDivElement>(null);
+	findOpenRef.current = findOpen;
+	peekRef.current = peek;
+	const hitSeqSet = useMemo(() => new Set(findOpen ? findHits.map((h) => h.seq) : []), [findOpen, findHits]);
+	// the peek window is self-contained (the server aligns it to the user turn, so an
+	// assistant toolCall and its toolResult live in the same slice) — its OWN result map
+	// keeps tool rows from rendering as "queued" when the row came from the server
+	const peekToolResults = useMemo(() => {
+		const map = new Map<string, ToolResultMessage>();
+		for (const m of (peek?.messages || []) as any[]) if (m?.role === "toolResult") map.set(m.toolCallId, m);
+		return map;
+	}, [peek]);
+
+	const runFind = async (q: string) => {
+		const sid = (agent as any).currentSessionId || currentSessionId(agent);
+		if (!sid) { setFindMeta((m) => ({ ...m, searching: false, error: "no session yet" })); return; }
+		findAbort.current?.abort();
+		const ac = new AbortController();
+		findAbort.current = ac;
+		setFindMeta((m) => ({ ...m, searching: true, error: null }));
+		try {
+			const r = await fetch(`/api/agent/session/${encodeURIComponent(sid)}/search?q=${encodeURIComponent(q)}`, { signal: ac.signal });
+			const j = await r.json().catch(() => null);
+			if (ac.signal.aborted) return;
+			if (!r.ok || !j) throw new Error(j?.error || `search failed (${r.status})`);
+			setFindHits(j.hits || []);
+			setFindIndex(0);
+			findGen.current = typeof j.rewriteSeq === "number" ? j.rewriteSeq : null;
+			findSrc.current = j.source || null;
+			setFindMeta({ source: j.source || null, messageCount: j.messageCount || 0, scanned: j.scanned || 0, truncated: !!j.truncated, dirty: false, searching: false, error: null });
+		} catch (err: any) {
+			if (ac.signal.aborted) return;
+			setFindHits([]);
+			setFindMeta((m) => ({ ...m, searching: false, error: String(err?.message || err) }));
+		}
+	};
+	// QUERY HANDLER (imperative debounce, no effect): the search fires from the input
+	// event itself — a deps-array effect silently did not re-run in the live app, and this
+	// is both simpler to reason about and impossible to miss (grok: 300ms debounce)
+	const findTimer = useRef<any>(null);
+	const onFindQuery = (q: string) => {
+		setFindQ(q);
+		clearTimeout(findTimer.current);
+		const t = q.trim();
+		if (!t) {
+			setFindHits([]); setFindIndex(0); setHighlightSeq(null);
+			setFindMeta((m) => ({ ...m, dirty: false, searching: false, error: null }));
+			return;
+		}
+		findTimer.current = setTimeout(() => { void runFind(t); }, 250);
+	};
+	// STALENESS: a rewrite (edit/retry/restore/compact) bumps the hub's rewriteSeq — the
+	// seqs in the list then describe a different transcript. Appends never invalidate
+	// (they land at the end), but a mirror-only scan is stale as soon as the hub attaches.
+	useEffect(() => {
+		if (!findOpen || !findHits.length) return;
+		const sp = (state as any).sparse;
+		const dirty = findSrc.current === "jsonl"
+			? !!sp
+			: findGen.current != null && sp && typeof sp.rewriteSeq === "number" && sp.rewriteSeq !== findGen.current;
+		setFindMeta((m) => (m.dirty === dirty ? m : { ...m, dirty }));
+	});
+	// a session switch invalidates every hit (different transcript)
+	const findSid = (agent as any).currentSessionId ?? null;
+	useEffect(() => {
+		findAbort.current?.abort();
+		clearTimeout(findTimer.current);
+		setFindQ("");
+		setFindHits([]); setFindIndex(0); setHighlightSeq(null); setPeek(null); findGen.current = null; findSrc.current = null;
+		setFindMeta((m) => ({ ...m, dirty: false, searching: false, error: null }));
+	}, [findSid]);
+
+	// debuggable from the console (like __piGate/__PI_PROVIDERS): the find bar's state
+	(window as any).__piFind = { open: findOpen, q: findQ, hits: findHits, index: findIndex, meta: findMeta, highlightSeq, peek: peek ? { hitSeq: peek.hitSeq, fromSeq: peek.fromSeq, toSeq: peek.toSeq, source: peek.source, messages: peek.messages.length } : null };
+	const closeFind = () => {
+		clearTimeout(findTimer.current);
+		setFindOpen(false);
+		setHighlightSeq(null);
+		setPeek(null);
+		setFindMeta((m) => ({ ...m, dirty: false }));
+	};
+	const openFind = () => {
+		setFindOpen(true);
+		setPeek(null);
+		// reopening with a query already in the box re-runs it (the imperative debounce
+		// only fires on typing — reopening must not show an empty list for a filled box)
+		const t = findQ.trim();
+		if (t) findTimer.current = setTimeout(() => { void runFind(t); }, 0);
+	};
+
+	/** Read-only peek of a hit that is NOT visible in the transcript. Uses the loaded
+	 *  array when the hit is already in memory, otherwise ONE `/range` fetch (the server
+	 *  aligns the start down to the turn's user message and keeps the high end). The
+	 *  fetched window is NEVER spliced into state.messages. */
+	const openPeek = async (h: FindHit) => {
+		setHighlightSeq(null);
+		peekRef.current = null;
+		const filled = filledSeqRef.current;
+		const msgs = messagesRef.current || [];
+		const localFrom = Math.max(0, h.turnStartSeq);
+		const localTo = Math.min(Math.max(h.turnEndSeq, h.seq + 1), h.seq + 12, filled + msgs.length);
+		if (localFrom >= filled && localTo > h.seq && localTo <= filled + msgs.length) {
+			setPeek({ hitSeq: h.seq, turn: h.turn, role: h.role, fromSeq: localFrom, toSeq: localTo, messages: msgs.slice(localFrom - filled, localTo - filled), source: "memory" });
+			return;
+		}
+		const r = await (agent as any).peekRange?.(h.turnStartSeq, h.seq + 12);
+		if (!r) { setFindMeta((m) => ({ ...m, error: "could not load that part of the session" })); return; }
+		if (r.fromSeq > h.seq || r.toSeq <= h.seq) { setFindMeta((m) => ({ ...m, error: "that message is outside the served window" })); return; }
+		if (findSrc.current === "live" && findGen.current != null && r.rewriteSeq !== findGen.current) {
+			setFindMeta((m) => ({ ...m, error: "the conversation changed — search again", dirty: true }));
+			return;
+		}
+		setPeek({ hitSeq: h.seq, turn: h.turn, role: h.role, fromSeq: r.fromSeq, toSeq: r.toSeq, messages: r.messages, source: "server" });
+	};
+
+	const jumpToHit = (i: number) => {
+		const h = findHits[i];
+		if (!h) return;
+		setFindIndex(i);
+		setFindMeta((m) => ({ ...m, error: null }));
+		const filled = filledSeqRef.current;
+		const len = (messagesRef.current || []).length;
+		const visible = h.seq >= filled && h.seq < filled + len && (displayFromRef.current == null || h.seq >= displayFromRef.current);
+		if (visible) {
+			setPeek(null);
+			stick.current = false; // never chase the tail while the user is reading a hit
+			setHighlightSeq(h.seq);
+			return;
+		}
+		void openPeek(h);
+	};
+	const stepHit = (delta: number) => {
+		if (!findHits.length) return;
+		const n = findHits.length;
+		jumpToHit(((findIndex + delta) % n + n) % n);
+	};
+	// open `<details>` and scroll to the highlighted row (after the DOM has it)
+	useLayoutEffect(() => {
+		if (highlightSeq == null) return;
+		const root = scrollRef.current;
+		const el = root?.querySelector(`[data-seq="${highlightSeq}"]`) as HTMLElement | null;
+		if (!el) return;
+		el.querySelectorAll("details").forEach((d) => { (d as HTMLDetailsElement).open = true; });
+		el.scrollIntoView({ block: "center" });
+	}, [highlightSeq]);
+	useLayoutEffect(() => {
+		if (!peek) return;
+		const root = peekScrollRef.current;
+		const el = root?.querySelector(`[data-seq="${peek.hitSeq}"]`) as HTMLElement | null;
+		if (!el) return;
+		el.querySelectorAll("details").forEach((d) => { (d as HTMLDetailsElement).open = true; });
+		el.scrollIntoView({ block: "center" });
+	}, [peek]);
+	// Ctrl/Cmd+F opens the find bar (user request). A selection inside a text field keeps
+	// the browser's native find — the app's shortcut takes over only otherwise.
+	useEffect(() => {
+		const onKey = (e: KeyboardEvent) => {
+			if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === "f" || e.key === "F")) {
+				const t = e.target as HTMLInputElement | HTMLTextAreaElement | null;
+				const inField = !!t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || (t as any).isContentEditable);
+				if (inField && t && t.selectionStart != null && t.selectionStart !== t.selectionEnd) return;
+				e.preventDefault();
+				openFind();
+				return;
+			}
+			if (e.key === "Escape" && findOpenRef.current && !peekRef.current) closeFind();
+		};
+		document.addEventListener("keydown", onKey);
+		return () => document.removeEventListener("keydown", onKey);
+	}, []);
+	// header 🔍 (touch devices have no Ctrl+F) opens the same bar
+	useEffect(() => {
+		const onOpen = () => openFind();
+		window.addEventListener("pi-open-find", onOpen);
+		return () => window.removeEventListener("pi-open-find", onOpen);
+	}, []);
 	// compact progress: server truth (state.compacting) drives the banner so ALL
 	// devices see it and it survives a client-side await timeout (the server
 	// keeps compacting and the next state frame clears the banner)
@@ -1215,6 +1417,9 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 					{state.messages.map((m: any, i: number) => (
 					<Fragment key={keyOf(m)}>
 					{displayFrom != null && i < displayFrom ? null /* hidden by the user-turn display gate */ : (
+					/* data-seq = the ABSOLUTE seq: the find jump targets rows by seq, never by
+					   array index (a prefix fill prepends the array and shifts every index) */
+					<div class={"pw-anchor" + (highlightSeq === filledSeq + i ? " pw-find-target" : hitSeqSet.has(filledSeq + i) ? " pw-find-mark" : "")} data-seq={filledSeq + i}>
 					<>
 					{editingIdx !== null && i === editingIdx + 1 && (
 						<div class="pw-edit-divider">messages below will be replaced — the old turn is saved as a restorable version on Resubmit</div>
@@ -1240,6 +1445,7 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 						onOpenFile={openFileViewer}
 						/>
 					</>
+					</div>
 					)}
 					</Fragment>
 				))}
@@ -1256,6 +1462,36 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 					{state.isStreaming && !state.streamingMessage && <div class="pw-thinking-hint">thinking…</div>}
 					</div>
 					</div>
+					{findOpen && (
+						<ChatFindBar
+							query={findQ}
+							onQuery={onFindQuery}
+							hits={findHits}
+							index={findIndex}
+							meta={findMeta}
+							onStep={stepHit}
+							onJump={jumpToHit}
+							onClose={closeFind}
+						/>
+					)}
+					{peek && (
+						<PeekSheet
+							title={`${peek.role === "user" ? "Your message" : "Assistant"}${peek.turn ? ` · turn ${peek.turn}` : ""}`}
+							sub={`seq ${peek.fromSeq}–${peek.toSeq} · read-only peek${peek.source === "server" ? " (fetched from the session on the server)" : " (from memory)"} · not in the live window`}
+							index={findIndex}
+							count={findHits.length}
+							onStep={stepHit}
+							onClose={() => setPeek(null)}
+						>
+							<div class="pw-peek-thread" ref={peekScrollRef}>
+								{peek.messages.map((m: any, i: number) => (
+									<div class={"pw-anchor" + (peek.fromSeq + i === peek.hitSeq ? " pw-find-target" : "")} data-seq={peek.fromSeq + i} key={keyOf(m)}>
+										<MessageView message={m} toolResults={peekToolResults} />
+									</div>
+								))}
+							</div>
+						</PeekSheet>
+					)}
 					{pendingSteer && (
 					<div class="pw-steer-chip" role="status">
 					<span class="pw-steer-ico">⏩</span>

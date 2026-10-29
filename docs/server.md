@@ -83,6 +83,44 @@ See [architecture.md](architecture.md) for the module map and trust-boundary sum
 | `WS /ws/sync`, `WS /ws/agent` | token for non-loopback at upgrade | hubs below |
 | `WS /ws/terminal` | token for non-loopback + hub Origin allowlist | see [terminal.md](terminal.md) |
 | `POST /api/agent/*`, `GET /api/agent/session/:id`, `GET /api/agent/events` (SSE) | blanket | server-side agent path |
+| `GET /api/agent/session/:id/search?q=&limit=&afterSeq=` | blanket | **whole-session find** (below): scans the array `/range` serves from, JSON, seq-keyed hits |
+| `GET /api/ws/search?q=&dir=&perFile=&limit=` | **always token** | **workspace find** (below): `spawn(rg, argv)`, `--json`, .gitignore honored, capped + killed on disconnect |
+
+## Find: whole-session search + workspace search (2026-10-28)
+
+**User request:** *“Add find function for chat/file viewer … find should be done whole target chat/session in
+server. search result ui shows each searched text with one or two line of chat”* (plus Ctrl/Cmd+F opens the
+chat find bar).
+
+### `GET /api/agent/session/:id/search` (`lib/session-search.mjs`)
+
+Why server-side: the browser holds only a tail-first WINDOW plus the display gate, so an in-page find would
+silently miss most of a large conversation. The scan runs over the **same message array `/range` serves
+from** — the hub's live transcript when the session is attached (`agentHub.getRange(id, {})`), the
+session-worker JSONL mirror when it is cold — so every hit's `seq` is directly usable by `/range` for the
+jump. Response: `{q, source: 'live'|'jsonl', rewriteSeq, messageCount, scanned, truncated, hits[]}` where a
+hit is `{seq, role, turn, turnStartSeq, turnEndSeq, summary?, snippet, matchStart, matchLen}`.
+
+- **Scope (v1, deliberate):** `user` + `assistant` TEXT parts. Tool results / thinking blocks are the bulk
+  of a session's bytes, they drown the hit list, and a jump into a 1MB tool dump is not a useful target.
+- Case-insensitive substring (no regex), whitespace collapsed ONCE before matching so the snippet offsets
+  stay valid; **≤3 hits per message** (a paste cannot flood the list), `limit` ≤200, `truncated` reported.
+- `rewriteSeq` is the HUB generation the list is as-of (`null` for a mirror read) — the client uses it to
+  mark the list stale after an edit/retry/restore/compact. Appends never invalidate (they land at the end).
+- Tests: `npm run test:search` (25 checks: roles, per-message cap, snippet offsets, truncation, malformed
+  messages, unicode).
+
+### `GET /api/ws/search` (`lib/rg-json.mjs`)
+
+`spawn(rgBin(), rgArgs(q))` at the requested dir (`assertInsideRoots` + the dot-segment gate, same as
+`/api/ws/files`), **argv only** — a user query must never reach a shell (`POST /api/exec/tool` + `bash rg`
+was rejected for exactly that reason, plus Windows quoting and `--vimgrep` being unparseable on `C:\…`).
+`--json -F -i`, `.gitignore` honored, `--glob !.git`, `--max-count 20` per file, 400 matches / 5s wall
+clock / 4MB output caps, and the child is killed on client disconnect (`c.req.raw.signal`). rg exit 1
+(“nothing found”) is a RESULT, not an error. Hit paths are returned **workspace-relative** (rg reports them
+relative to its cwd) so the client can open them directly. `rg` is looked up in `PI_WEB_RG` →
+`<PI_DIR>/bin/rg.exe` → PATH; a missing rg answers with a plain “ripgrep is not available” error.
+Tests: `npm run test:rgjson` (17 checks incl. the real CRLF/Windows-path sample).
 
 ## Provider catalog (`lib/pi-catalog.mjs`, 2026-10-27)
 

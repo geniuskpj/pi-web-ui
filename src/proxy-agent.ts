@@ -688,6 +688,32 @@ export class ProxyAgent {
 		} catch (err: any) { console.warn("[backfill] fillWindow failed:", err?.message || err); return false; }
 	}
 
+	/** PEEK (chat find, user request 2026-10-28): fetch a seq window for READ-ONLY display
+	 *  WITHOUT touching the dense window. `fillWindow` PREPENDS and requires the response to
+	 *  tile the loaded top — exactly wrong for a jump into the middle of a 2000-message
+	 *  session (no un-prepend exists, and revealing the gap would mount everything). The
+	 *  caller renders this in a modal sheet and never splices it into state.messages.
+	 *  The server aligns the start DOWN to a user turn and keeps the HIGH end (1MB cap), so
+	 *  the returned window always describes exactly the bytes it sent (X-Range-* headers). */
+	async peekRange(fromSeq: number, toSeq: number): Promise<{ fromSeq: number; toSeq: number; rewriteSeq: number; messageCount: number; messages: any[] } | null> {
+		try {
+			const res = await fetch(`/api/agent/session/${encodeURIComponent(this.sessionId)}/range?fromSeq=${Math.max(0, Math.floor(fromSeq) || 0)}&toSeq=${Math.max(0, Math.floor(toSeq) || 0)}`, { signal: AbortSignal.timeout(15000) });
+			if (!res.ok && res.status !== 204) { console.warn("[peek] range fetch failed:", res.status); return null; }
+			const buf = await res.arrayBuffer();
+			const rs = Number(res.headers.get("x-range-from-seq") || fromSeq);
+			const re = Number(res.headers.get("x-range-to-seq") || toSeq);
+			const count = Number(res.headers.get("x-session-message-count") || 0);
+			const rsq = Number(res.headers.get("x-session-mutate-epoch") || 0);
+			if (re <= rs) return null; // nothing in that window
+			const text = await gunzip(new Blob([buf], { type: "application/gzip" }));
+			if (text == null) { console.warn("[peek] gunzip failed"); return null; }
+			const verdict = verifyChunkText(text, rs, re);
+			if (!verdict.ok) { console.warn("[peek] body rejected —", verdict.reason); return null; }
+			const messages = text.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+			return { fromSeq: rs, toSeq: re, rewriteSeq: rsq, messageCount: count, messages };
+		} catch (err: any) { console.warn("[peek] failed:", err?.message || err); return null; }
+	}
+
 	cancelSteering(): void {
 		this.sendMsg({ type: "steering-cancel" });
 	}

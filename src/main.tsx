@@ -506,6 +506,8 @@ const ICONS = {
 		"M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z",
 	],
 	terminal: ["m4 17 6-6-6-6", "M12 19h8"],
+	// find in conversation (Ctrl+F on desktop, this button on touch)
+	search: ["M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z", "M21 21l-4.3-4.3"],
 	activity: ["M22 12h-4l-3 9L9 3l-3 9H2"], // heartbeat — active server-side runs
 };
 
@@ -650,6 +652,9 @@ function App() {
 					)}
 				</div>
 				<div class="pi-header-right">
+					<button class="pi-btn" title="Find in conversation (Ctrl+F)" onClick={() => window.dispatchEvent(new CustomEvent("pi-open-find"))}>
+						<Icon d={ICONS.search} />
+					</button>
 					<button class="pi-btn" title="Terminal (bash dock — no node-pty)" onClick={() => termBus.toggle()}>
 						<Icon d={ICONS.terminal} />
 					</button>

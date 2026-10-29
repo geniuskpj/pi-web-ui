@@ -8,6 +8,14 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import hljs from "highlight.js";
 import { escapeHtml } from "./markdown.js";
 
+// CONTENT SEARCH (user request 2026-10-28: "find for the file viewer"): the left pane gets a
+// second input that runs ripgrep on the SERVER (`GET /api/ws/search` — argv-only, .gitignore
+// honored, capped; see lib/rg-json.mjs) over the current directory. Results are grouped by
+// file; clicking one opens the preview AT that line (the band is positioned by line height,
+// so the syntax-highlighted <pre> stays exactly as it was).
+type SearchHit = { line: number; text: string; col: number; matchLen: number };
+type SearchResult = { dir: string; files: Array<{ path: string; matches: SearchHit[] }>; total: number; truncated: boolean; elapsedMs: number; error?: string };
+
 export interface PickedFile {
 	path: string;
 	name: string;
@@ -56,6 +64,22 @@ const CODE_LANG: Record<string, string> = {
 	sql: "sql", toml: "ini", ini: "ini", cfg: "ini", env: "ini", diff: "diff", patch: "diff",
 };
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp)$/i;
+
+/** Mark the query inside a search-result line (case-insensitive, first occurrence).
+ *  The ONLY <mark> in this file — the syntax-highlighted preview is never rewritten. */
+function markLine(text: string, q: string) {
+	const t = String(text || "");
+	if (!q) return t;
+	const i = t.toLowerCase().indexOf(q.toLowerCase());
+	if (i < 0) return t;
+	return (
+		<>
+			{t.slice(0, i)}
+			<mark>{t.slice(i, i + q.length)}</mark>
+			{t.slice(i + q.length)}
+		</>
+	);
+}
 
 function toggleCheckedIn(setter: (fn: (prev: Set<string>) => Set<string>) => void, key: string) {
 	setter((prev) => {
@@ -109,6 +133,7 @@ export function FilePickerDialog({
 	const [filter, setFilter] = useState("");
 	const [busy, setBusy] = useState("");
 	const [sel, setSel] = useState<Entry | null>(null); // previewed file (right pane)
+	const [selPath, setSelPath] = useState<string | null>(null); // FULL workspace path of `sel` (search can open a file outside `path`)
 	const [preview, setPreview] = useState<Preview | null>(null);
 	const [attached, setAttached] = useState<Set<string>>(new Set()); // full paths attached this open
 	const [checked, setChecked] = useState<Set<string>>(new Set()); // multi-select (full paths)
@@ -116,6 +141,14 @@ export function FilePickerDialog({
 	const loadGen = useRef(0);
 	const selectGen = useRef(0);
 	const inputRef = useRef<HTMLInputElement>(null);
+	// content search (server-side rg) + the line the preview must jump to
+	const [sq, setSq] = useState("");
+	const [sres, setSres] = useState<SearchResult | null>(null);
+	const [searching, setSearching] = useState(false);
+	const searchAbort = useRef<AbortController | null>(null);
+	const [targetLine, setTargetLine] = useState<number | null>(null);
+	const [lineH, setLineH] = useState(0);
+	const codeRef = useRef<HTMLPreElement>(null);
 
 	// Escape closes (dialog parity)
 	useEffect(() => {
@@ -178,6 +211,10 @@ export function FilePickerDialog({
 		if (!open) {
 			setAttached(new Set());
 			previewCache.current.clear();
+			searchAbort.current?.abort();
+			setSq("");
+			setSres(null);
+			setTargetLine(null);
 			return;
 		}
 		if (initialFile) {
@@ -197,6 +234,65 @@ export function FilePickerDialog({
 		}
 		setTimeout(() => inputRef.current?.focus(), 50);
 	}, [open, initialFile]);
+
+	// CONTENT SEARCH: debounced (300ms) + aborted per keystroke, run in the CURRENT dir.
+	// The server owns the caps (400 matches, 20/file, 5s) and kills rg on disconnect.
+	useEffect(() => {
+		if (!open) return;
+		const q = sq.trim();
+		if (!q) { searchAbort.current?.abort(); setSres(null); setSearching(false); return; }
+		setSearching(true);
+		const t = setTimeout(() => {
+			searchAbort.current?.abort();
+			const ac = new AbortController();
+			searchAbort.current = ac;
+			void (async () => {
+				try {
+					const r = await fetch(`/api/ws/search?q=${encodeURIComponent(q)}${path ? `&dir=${encodeURIComponent(path)}` : ""}`, { signal: ac.signal });
+					const j = await r.json().catch(() => null);
+					if (ac.signal.aborted) return;
+					if (!r.ok || !j) throw new Error(j?.error || `search failed (${r.status})`);
+					setSres(j);
+				} catch (err: any) {
+					if (ac.signal.aborted) return;
+					setSres({ dir: path || "", files: [], total: 0, truncated: false, elapsedMs: 0, error: String(err?.message || err) });
+				} finally {
+					if (!ac.signal.aborted) setSearching(false);
+				}
+			})();
+		}, 300);
+		return () => clearTimeout(t);
+	}, [sq, path, open]);
+
+	/** Open a search hit: preview that file (even outside the current dir) and band its line. */
+	const jumpTo = async (relPath: string, line: number) => {
+		const name = relPath.split("/").pop() || relPath;
+		const gen = ++selectGen.current;
+		setError("");
+		setTargetLine(null);
+		setSel({ name, dir: false, size: 0, mtime: 0 });
+		setSelPath(relPath);
+		setPreview(null);
+		const p = await fetchPreview(relPath);
+		if (gen !== selectGen.current) return;
+		if (p) {
+			setPreview(p);
+			setSel({ name, dir: false, size: p.size || 0, mtime: 0 });
+			setTargetLine(line);
+		}
+	};
+
+	// line jump: the code view is ONE <pre> (no per-line boxes), so the band is positioned by
+	// the computed line height and the scroller is offset to it — rendering stays untouched
+	useEffect(() => {
+		if (targetLine == null) return;
+		const el = codeRef.current;
+		const wrap = el?.parentElement as HTMLElement | null;
+		if (!el || !wrap) return;
+		const lh = parseFloat(getComputedStyle(el).lineHeight) || 18;
+		setLineH(lh);
+		wrap.scrollTop = Math.max(0, (targetLine - 1) * lh - wrap.clientHeight / 3);
+	}, [targetLine, preview]);
 
 	// pure fetch+cache — no pane state (used by select AND batch attach)
 	const fetchPreview = async (key: string): Promise<Preview | null> => {
@@ -237,25 +333,26 @@ export function FilePickerDialog({
 		setError("");
 		const gen = ++selectGen.current;
 		setSel(entry);
+		setSelPath(key);
+		setTargetLine(null); // a plain click clears any search jump
 		setPreview(null);
 		const p = await fetchPreview(key);
 		if (gen !== selectGen.current) return; // superseded
 		if (p) setPreview(p);
 	};
 
-	const attach = async (entry: Entry) => {
-		if (entry.dir) return;
-		const key = path ? path + "/" + entry.name : entry.name;
-		const p = await fetchPreview(key);
+	/** Attach the PREVIEWED file by its full path (search can open a file from another dir,
+	 *  so `path + "/" + sel.name` is not always the file's path). */
+	const attachSel = async () => {
+		if (!sel || !selPath) return;
+		const p = await fetchPreview(selPath);
 		if (!p) return;
-		// 512KB gate applies to TEXT only, after kind is known (grok p8: images
-		// were wrongly blocked at 512KB); images are already ≤8MB (list pre-gate)
 		if (p.kind === "text" && (p.size || 0) > MAX_TEXT) {
-			setError(`text file too large to inline (>512KB): ${entry.name}`);
+			setError(`text file too large to inline (>512KB): ${sel.name}`);
 			return;
 		}
-		onPick({ path: key, name: entry.name, kind: p.kind, content: p.content, base64: p.base64, mimeType: p.mimeType, size: p.size });
-		setAttached((prev) => new Set(prev).add(key)); // keyed by full path (grok p8)
+		onPick({ path: selPath, name: sel.name, kind: p.kind, content: p.content, base64: p.base64, mimeType: p.mimeType, size: p.size });
+		setAttached((prev) => new Set(prev).add(selPath));
 	};
 
 	/** Multi-select batch attach (user request): sequential fetch+attach per file. */
@@ -301,7 +398,8 @@ export function FilePickerDialog({
 					? -1
 					: 1,
 		);
-	const selName = sel ? (path ? path + "/" + sel.name : sel.name) : "";
+	const selName = selPath || (sel ? (path ? path + "/" + sel.name : sel.name) : "");
+	const searchMode = sq.trim().length > 0;
 
 	// text preview → syntax-highlighted code view (or prose flow, no gutter)
 	const previewText = preview && preview.kind === "text" ? (preview.content || "").slice(0, PREVIEW_TRUNCATE) : "";
@@ -356,6 +454,16 @@ export function FilePickerDialog({
 					value={filter}
 					onInput={(e) => setFilter((e.target as HTMLInputElement).value)}
 				/>
+				{/* content search (user request 2026-10-28): rg on the server, results in the left pane */}
+				<input
+					class="pi-input pw-dialog-search pw-content-search"
+					type="search"
+					placeholder={`Find in ${path || "workspace"}… (file contents, rg)`}
+					value={sq}
+					aria-label="Find in file contents"
+					onInput={(e) => setSq((e.target as HTMLInputElement).value)}
+					onKeyDown={(e) => { if (e.key === "Escape" && sq) { e.stopPropagation(); setSq(""); } }}
+				/>
 				{error && (
 					<div class="pw-note pw-note-destructive" style={{ padding: "0 16px" }}>
 						{error}
@@ -363,6 +471,34 @@ export function FilePickerDialog({
 				)}
 				<div class="pw-file-panes">
 					<div class="pw-file-list">
+					{searchMode ? (
+						<div class="pw-search-results">
+							<div class="pw-search-status">
+								{searching
+									? "searching…"
+									: sres
+										? `${sres.total} match${sres.total === 1 ? "" : "es"} in ${sres.files.length} file${sres.files.length === 1 ? "" : "s"} · ${sres.elapsedMs}ms${sres.truncated ? " · truncated" : ""}`
+										: ""}
+								{sres?.error ? <span class="pw-find-err"> · {sres.error}</span> : null}
+							</div>
+							{sres && !searching && sres.files.length === 0 && !sres.error ? <div class="pw-empty">No match for “{sq.trim()}” here.</div> : null}
+							{(sres?.files || []).map((f) => (
+								<div key={f.path} class="pw-search-file">
+									<button type="button" class="pw-search-path" title={f.path} onClick={() => void jumpTo(f.path, f.matches[0]?.line || 1)}>
+										{f.path}
+										<span class="pw-search-count">{f.matches.length}</span>
+									</button>
+									{f.matches.map((m, i) => (
+										<button type="button" class="pw-search-hit" key={i} title={`open ${f.path} at line ${m.line}`} onClick={() => void jumpTo(f.path, m.line)}>
+											<span class="pw-search-ln">{m.line}</span>
+											<span class="pw-search-text">{markLine(m.text, sq.trim())}</span>
+										</button>
+									))}
+								</div>
+							))}
+						</div>
+					) : (
+					<>
 						{loading && <div class="pw-empty">Loading…</div>}
 						{!loading && shown.length === 0 && !error && filter && (
 							<div class="pw-empty">
@@ -419,6 +555,8 @@ export function FilePickerDialog({
 								</div>
 							);
 						})}
+					</>
+					)}
 					</div>
 					<div class="pw-file-preview">
 						{busy ? (
@@ -440,7 +578,7 @@ export function FilePickerDialog({
 										class="pw-send"
 										disabled={preview.kind === "text" && (preview.size || 0) > MAX_TEXT}
 										title={preview.kind === "text" && (preview.size || 0) > MAX_TEXT ? "text files >512KB cannot be inlined" : "Attach to message"}
-										onClick={() => void attach(sel)}
+										onClick={() => void attachSel()}
 									>
 										{attached.has(selName) ? "Attach again" : "Attach"}
 									</button>
@@ -457,10 +595,14 @@ export function FilePickerDialog({
 									// syntax-highlighted code view (user request) with a sticky
 									// line-number gutter; no wrap so gutter/code stay aligned
 									<div class="pw-preview-codewrap">
+										{targetLine != null && lineH > 0 ? (
+											<div class="pw-code-hit" aria-hidden="true" style={{ top: `${(targetLine - 1) * lineH}px`, height: `${lineH}px` }} />
+										) : null}
 										<pre class="pw-code-gutter" aria-hidden="true">
 											{Array.from({ length: gutterLines }, (_, i) => i + 1).join("\n")}
 										</pre>
 										<pre
+											ref={codeRef}
 											class="pw-code-html"
 											dangerouslySetInnerHTML={{
 												__html:

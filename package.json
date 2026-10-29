@@ -36,6 +36,8 @@
     "test:hydration": "node tests/hub-hydration.test.mjs",
     "test:gate": "node tests/display-gate.test.mjs",
     "test:catalog": "node tests/pi-catalog.test.mjs",
+    "test:search": "node tests/session-search.test.mjs",
+    "test:rgjson": "node tests/rg-json.test.mjs",
     "test:keyless": "node tests/pi-catalog-keyless.e2e.mjs",
     "test:pty": "node tests/term-pty.test.mjs",
     "test:toolcall": "node tests/restore-toolcall.test.mjs",

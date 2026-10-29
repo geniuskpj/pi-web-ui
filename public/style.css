@@ -1136,6 +1136,7 @@ html.dark { --stat-warn: #fbbf24; --stat-danger: #f87171; --stat-ok: #4ade80; --
 	flex: 1;
 	min-height: 0;
 	display: flex;
+	position: relative; /* anchor for .pw-code-hit (find jump band) */
 	align-items: flex-start; /* CRITICAL: default stretch shrinks both <pre>s to the
 		viewport height — their text then overflows and the code paints over the
 		gutter below the first screen (user-reported line-number overlap) */
@@ -2098,3 +2099,107 @@ html.dark .pw-retry-giveup-note { color: #fbbf24; }
 	min-height: 32px;
 }
 .pw-expand-btn:hover { border-color: #f5a524; color: #f5a524; }
+
+/* --- find in conversation + peek (user request 2026-10-28) -------------------- */
+/* the anchor is a flex item of .pw-thread (was the row itself): it carries the
+   ABSOLUTE seq of the message so the find jump can target a row by seq */
+.pw-anchor { display: block; min-width: 0; }
+.pw-anchor.pw-find-mark > .pw-msg-row,
+.pw-anchor.pw-find-mark > .pw-msg { box-shadow: inset 3px 0 0 rgba(245, 165, 36, 0.55); }
+.pw-anchor.pw-find-target > .pw-msg-row,
+.pw-anchor.pw-find-target > .pw-msg,
+.pw-anchor.pw-find-target > .pw-note {
+	outline: 2px solid #f5a524;
+	outline-offset: 3px;
+	border-radius: 10px;
+	animation: pw-find-flash 900ms ease-out;
+}
+@keyframes pw-find-flash { from { outline-color: #f5a524; background: rgba(245, 165, 36, 0.14); } to { background: transparent; } }
+
+.pw-find {
+	position: absolute;
+	top: 8px;
+	right: 12px;
+	z-index: 40;
+	width: min(30rem, calc(100vw - 24px));
+	max-height: min(60vh, 30rem);
+	display: flex;
+	flex-direction: column;
+	background: var(--background, #1b1b1d);
+	border: 1px solid var(--border, rgba(128, 128, 128, 0.35));
+	border-radius: 12px;
+	box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+	overflow: hidden;
+}
+.pw-find-head { display: flex; align-items: center; gap: 4px; padding: 6px 8px; border-bottom: 1px solid var(--border, rgba(128,128,128,0.25)); }
+.pw-find-ico { font-size: 13px; opacity: 0.7; }
+.pw-find-input { flex: 1 1 auto; min-width: 0; font-size: 13px; padding: 5px 8px; }
+.pw-find-count { font-size: 11px; color: var(--muted-foreground, #888); white-space: nowrap; padding: 0 4px; }
+.pw-find-nav {
+	appearance: none; border: 0; background: transparent; color: inherit; cursor: pointer;
+	font-size: 11px; line-height: 1; padding: 6px 7px; border-radius: 6px; min-width: 26px; min-height: 26px;
+}
+.pw-find-nav:hover:not(:disabled) { background: rgba(128, 128, 128, 0.18); }
+.pw-find-nav:disabled { opacity: 0.35; cursor: default; }
+.pw-find-status { font-size: 11px; color: var(--muted-foreground, #888); padding: 5px 10px 3px; }
+.pw-find-err { color: #e5484d; }
+.pw-find-dirty { font-size: 11px; color: #f5a524; padding: 4px 10px; background: rgba(245, 165, 36, 0.1); }
+.pw-find-empty { font-size: 12px; color: var(--muted-foreground, #888); padding: 10px; }
+.pw-find-list { overflow-y: auto; overscroll-behavior: contain; padding: 2px 4px 6px; }
+.pw-find-hit {
+	display: flex; align-items: baseline; gap: 6px; width: 100%; text-align: left;
+	appearance: none; border: 0; background: transparent; color: inherit; cursor: pointer;
+	font: inherit; font-size: 12.5px; line-height: 1.35; padding: 6px 7px; border-radius: 8px;
+}
+.pw-find-hit:hover { background: rgba(128, 128, 128, 0.14); }
+.pw-find-hit.pw-find-current { background: rgba(245, 165, 36, 0.16); }
+.pw-find-badge {
+	flex: none; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em;
+	padding: 1px 5px; border-radius: 999px; border: 1px solid currentColor; opacity: 0.85;
+}
+.pw-find-badge.pw-find-user { color: #3b82f6; }
+.pw-find-badge.pw-find-assistant { color: #22c55e; }
+.pw-find-turn { flex: none; font-size: 10px; color: var(--muted-foreground, #888); }
+.pw-find-snip { flex: 1 1 auto; min-width: 0; word-break: break-word; }
+.pw-find-snip mark { background: rgba(245, 165, 36, 0.4); color: inherit; border-radius: 3px; padding: 0 1px; }
+
+.pw-peek-overlay { align-items: center; }
+.pw-peek { width: min(52rem, calc(100vw - 24px)); max-height: min(80vh, 44rem); display: flex; flex-direction: column; }
+.pw-peek-count { font-size: 11px; color: var(--muted-foreground, #888); margin-left: auto; padding-right: 6px; }
+.pw-peek-sub { font-size: 11px; color: var(--muted-foreground, #888); padding: 0 12px 6px; }
+.pw-peek-body { overflow-y: auto; overscroll-behavior: contain; }
+.pw-peek-thread { display: flex; flex-direction: column; gap: 16px; padding: 10px 14px 18px; }
+
+@media (max-width: 48rem) {
+	.pw-find { top: 4px; right: 4px; left: 4px; width: auto; max-height: 62vh; }
+}
+
+/* --- workspace content search (file viewer, user request 2026-10-28) ---------- */
+.pw-content-search { margin-top: -4px; }
+.pw-search-results { padding: 6px 8px 10px; font-size: 12px; }
+.pw-search-status { color: var(--muted-foreground, #888); font-size: 11px; padding: 2px 2px 8px; }
+.pw-search-file { margin-bottom: 8px; }
+.pw-search-path {
+	display: flex; align-items: center; gap: 6px; width: 100%; text-align: left;
+	appearance: none; border: 0; background: transparent; color: inherit; cursor: pointer;
+	font: inherit; font-weight: 600; font-size: 11.5px; padding: 3px 4px; border-radius: 6px;
+	word-break: break-all;
+}
+.pw-search-path:hover { background: rgba(128, 128, 128, 0.14); }
+.pw-search-count { margin-left: auto; font-weight: 400; opacity: 0.7; }
+.pw-search-hit {
+	display: flex; align-items: baseline; gap: 7px; width: 100%; text-align: left;
+	appearance: none; border: 0; background: transparent; color: inherit; cursor: pointer;
+	font: inherit; font-size: 12px; line-height: 1.35; padding: 3px 4px; border-radius: 6px;
+}
+.pw-search-hit:hover { background: rgba(128, 128, 128, 0.14); }
+.pw-search-ln { flex: none; font-variant-numeric: tabular-nums; opacity: 0.55; min-width: 2.6em; text-align: right; }
+.pw-search-text { flex: 1 1 auto; min-width: 0; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.pw-search-text mark { background: rgba(245, 165, 36, 0.4); color: inherit; border-radius: 3px; padding: 0 1px; }
+/* the jumped-to line: the code view is one <pre>, so the band is positioned by line height */
+.pw-code-hit {
+	position: absolute; left: 0; right: 0; pointer-events: none;
+	background: rgba(245, 165, 36, 0.18);
+	border-top: 1px solid rgba(245, 165, 36, 0.5);
+	border-bottom: 1px solid rgba(245, 165, 36, 0.5);
+}

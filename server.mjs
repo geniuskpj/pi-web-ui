@@ -45,6 +45,8 @@ import { streamSimple } from "@earendil-works/pi-ai/compat";
 // aggregation module; the per-provider model data loads alongside it)
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { buildProviderCatalog, clientProviders, resolvedKeys } from "./lib/pi-catalog.mjs";
+import { searchMessages, DEFAULT_LIMIT, MAX_LIMIT } from "./lib/session-search.mjs";
+import { rgArgs, parseRgJson } from "./lib/rg-json.mjs";
 import { AgentHub } from "./agent-hub.mjs";
 import { createTerminalHub } from "./terminal-hub.mjs";
 // per-connection stream reduction (plan §2.3): OFF unless the client opts in with
@@ -1438,6 +1440,91 @@ app.get("/api/ws/file", (c) => {
 	}
 });
 
+// WORKSPACE SEARCH (user request 2026-10-28: "find for the file viewer"): ripgrep over the
+// containment root, argv-only (NEVER bash/exec-bridge — a user query must not reach a shell),
+// `--json` (vimgrep is unparseable on Windows paths), .gitignore honored, capped by matches/
+// per-file/wall-clock, and the child is killed when the client disconnects. Token-gated like
+// /api/ws/file: search RESULTS are a secrets oracle (a hit line is file content).
+let rgBinCache;
+function rgBin() {
+	if (rgBinCache !== undefined) return rgBinCache;
+	const cands = [process.env.PI_WEB_RG, path.join(PI_BIN_DIR, "rg.exe"), path.join(PI_BIN_DIR, "rg"), "/usr/bin/rg"];
+	rgBinCache = null;
+	for (const c of cands) {
+		if (!c) continue;
+		try { if (fs.statSync(c).isFile()) { rgBinCache = c; break; } } catch { /* try the next candidate */ }
+	}
+	if (!rgBinCache) rgBinCache = "rg"; // last resort: PATH (spawn reports ENOENT if absent)
+	return rgBinCache;
+}
+app.get("/api/ws/search", (c) => {
+	if (!tokenMatches(c.env?.incoming)) {
+		return c.json({ error: "unauthorized — workspace search needs x-pi-web-token (see data/auth-token.txt)" }, 401);
+	}
+	try {
+		const q = String(c.req.query("q") ?? "");
+		if (!q.trim()) return c.json({ error: "q required" }, 400);
+		if (q.length > 200) return c.json({ error: "query too long (200 chars)" }, 400);
+		const dir = assertInsideRoots(c.req.query("dir") || WORKSPACE_DIR, { mustExist: true });
+		if (hasDotSegment(dir)) return c.json({ error: "access denied: hidden paths are not searchable" }, 403);
+		if (!fs.statSync(dir).isDirectory()) return c.json({ error: "not a directory" }, 400);
+		const maxPerFile = Math.max(1, Math.min(50, Number(c.req.query("perFile")) || 20));
+		const cap = Math.max(1, Math.min(1000, Number(c.req.query("limit")) || 400));
+		const started = Date.now();
+		return runRgSearch(c, { q, dir, maxPerFile, cap, started });
+	} catch (err) {
+		return c.json({ error: stripWs(err?.message || err) }, 400);
+	}
+});
+
+/** One-shot JSON search (the client aborts its fetch to cancel; the child is killed on
+ *  abort AND on the wall-clock cap, so a slow tree can never pin a core). */
+function runRgSearch(c, { q, dir, maxPerFile, cap, started }) {
+	return new Promise((resolve) => {
+		const child = spawn(rgBin(), rgArgs(q, { maxPerFile }), { cwd: dir, windowsHide: true });
+		let out = "", errOut = "", killed = null, settled = false;
+		const finish = (truncatedByKill) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			try { child.kill(); } catch { /* already gone */ }
+			let parsed;
+			try { parsed = parseRgJson(out, { maxPerFile, cap }); } catch (err) { parsed = { files: [], total: 0, truncated: false, errors: [String(err?.message || err)] }; }
+			const rel = toRel(dir);
+			// rg reports paths relative to its cwd ("ui/chat.tsx", with a "./" prefix when
+			// the target is ".") — make every hit WORKSPACE-relative so the client can open
+			// it directly (the preview/attach endpoints take workspace paths)
+			const clean = (p) => String(p || "").replace(/\\/g, "/").replace(/^\.\//, "");
+			const files = parsed.files.map((f) => ({ ...f, path: rel ? `${rel}/${clean(f.path)}` : clean(f.path) }));
+			resolve(c.json({
+				q, dir: rel, files,
+				total: parsed.total,
+				truncated: parsed.truncated || !!truncatedByKill,
+				elapsedMs: Date.now() - started,
+				// rg exits 1 for "no matches" — that is a RESULT, not an error
+				error: killed && killed !== "no-match" ? killed : (parsed.errors[0] || undefined),
+			}));
+		};
+		const timer = setTimeout(() => { killed = "search timed out (5s) — showing partial results"; finish(true); }, 5000);
+		try { c.req.raw?.signal?.addEventListener("abort", () => finish(true)); } catch { /* adapter without a signal */ }
+		child.stdout?.on("data", (b) => {
+			out += b.toString("utf8");
+			// kill early once the parse budget is spent (a 200MB hit stream is not a UI feature)
+			if (out.length > 4 * 1024 * 1024 || (out.match(/"type":"match"/g) || []).length > cap + 40) { killed = "too many matches — showing the first ones"; finish(true); }
+		});
+		child.stderr?.on("data", (b) => { errOut += b.toString("utf8"); });
+		child.on("error", (err) => { killed = err?.code === "ENOENT" ? "ripgrep (rg) is not available on this machine" : String(err?.message || err); finish(false); });
+		child.on("close", (code) => {
+			if (settled) return;
+			// rg exits 1 for "nothing found" — with --json that still emits begin/end/summary
+			// events, so `out` is NOT empty; it is a RESULT (0 matches), never an error
+			if (code === 1) killed = "no-match";
+			else if (code > 1) killed = errOut.trim().split("\n")[0] || `rg exited ${code}`;
+			finish(false);
+		});
+	});
+}
+
 app.get("/api/exec/tools", (c) => {
 	if (TOKEN) { const t = c.req.header("x-pi-web-token"); if (t !== TOKEN) return c.json({ error: "unauthorized" }, 401); }
 	const allow = (process.env.PI_WEB_TOOLS || "").split(",").map((s) => s.trim()).filter(Boolean); // optional per-tool allowlist
@@ -2679,6 +2766,51 @@ app.get("/api/agent/session/:id", async (c) => {
 		}
 		return c.body(payload, 200, { "Content-Type": "application/json", Vary: "Accept-Encoding" });
 	} catch (err) { return c.json({ error: err.message }, 500); }
+});
+
+// WHOLE-SESSION FIND (user request 2026-10-28): the browser holds only a tail-first
+// window + a display gate, so an in-page find would silently miss most of a large
+// conversation. The scan runs over the SAME array `/range` serves from — the hub's live
+// transcript when the session is attached, the JSONL mirror when it is cold — so every
+// hit's `seq` is directly usable by `/range` for the jump. One-shot JSON (a 7MB scan is
+// nothing next to a bad jump); the client owns the hit list and the jump.
+app.get("/api/agent/session/:id/search", async (c) => {
+	try {
+		const id = c.req.param("id");
+		if (!SESSION_ID_RE.test(String(id || ""))) return c.json({ error: "bad session id" }, 400);
+		const q = c.req.query("q") ?? "";
+		if (!String(q).trim()) return c.json({ error: "q required" }, 400);
+		const limit = Math.max(1, Math.min(MAX_LIMIT, Number(c.req.query("limit")) || DEFAULT_LIMIT));
+		const afterSeq = Number(c.req.query("afterSeq"));
+		const live = agentHub.has(id);
+		let messages = [];
+		let rewriteSeq = null;
+		if (live) {
+			// NO redaction needed: only text snippets leave here (no images, no media hashes)
+			const range = agentHub.getRange(id, {});
+			if (!range) return c.json({ error: "session not found" }, 404);
+			messages = range.messages;
+			rewriteSeq = range.rewriteSeq;
+		} else {
+			const stored = await storeOp("get", { id });
+			if (!stored) return c.json({ error: "session not found" }, 404);
+			messages = Array.isArray(stored.messages) ? stored.messages : [];
+		}
+		const all = searchMessages(messages, q, { limit: Number.isFinite(afterSeq) && afterSeq >= 0 ? MAX_LIMIT : limit });
+		const hits = Number.isFinite(afterSeq) && afterSeq >= 0 ? all.hits.filter((h) => h.seq > afterSeq).slice(0, limit) : all.hits;
+		return c.json({
+			q: all.q,
+			source: live ? "live" : "jsonl",
+			rewriteSeq,                 // hub generation; null for a mirror read (no live entry)
+			messageCount: all.messageCount,
+			scanned: all.scanned,       // user/assistant messages actually searched
+			truncated: all.truncated,
+			hits,
+		}, 200, { "Cache-Control": "no-cache" });
+	} catch (err) {
+		console.error("[pi-web] session search failed:", err?.message || err);
+		return c.json({ error: String(err?.message || err) }, 500);
+	}
 });
 
 // RANGE endpoint (tail-first client cache, 2026-10-24): a seq window of the
