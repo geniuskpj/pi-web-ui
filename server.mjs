@@ -45,6 +45,11 @@ import { streamSimple } from "@earendil-works/pi-ai/compat";
 // aggregation module; the per-provider model data loads alongside it)
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { buildProviderCatalog, clientProviders, resolvedKeys, unavailableProviders } from "./lib/pi-catalog.mjs";
+// PROVIDER MODEL DISCOVERY (user request 2026-10-28: "show other model with user selected
+// provider … you could get it when server is started"): GET {baseUrl}/models with the
+// provider's own key and merge the ids into that provider's list, so the picker shows the
+// user's hand-written models PLUS everything the endpoint actually serves.
+import { fetchProviderModelIds, mergeDiscoveredModels } from "./lib/provider-models.mjs";
 import { searchMessages, DEFAULT_LIMIT, MAX_LIMIT } from "./lib/session-search.mjs";
 import { rgArgs, parseRgJson } from "./lib/rg-json.mjs";
 import { AgentHub } from "./agent-hub.mjs";
@@ -171,9 +176,12 @@ function piConfig() {
 	const providers = fallbackToCatalog ? clientProviders(piModelsStore) : usable;
 	const unavailable = fallbackToCatalog ? [] : unavailableProviders(piModelsStore);
 	const origins = [...new Set(providers.map((p) => p.origin))];
+	// what the provider's own /models said (user request: show the provider's OTHER models too)
+	const discovery = [...discoveredModels.entries()].map(([provider, d]) => ({ provider, found: d.ids?.length || 0, added: d.added || 0, at: d.at || null, error: d.error || undefined }));
 	return {
 		providers,
 		unavailable,
+		discovery: discovery.length ? discovery : undefined,
 		catalogFallback: fallbackToCatalog || undefined,
 		modelSource: providers.length === 0 ? "none" : origins.length === 1 ? origins[0] : origins.join("+"),
 		defaults: {
@@ -2060,8 +2068,19 @@ let piModelsStore = {};
 // the object ATOMICALLY (one assignment) so a run that reads it mid-refresh can never
 // see a half-built map (refreshModelsStore also runs on every GET /api/pi/config).
 let hubRef = null;
+// discovered[provider] = { ids, at, error } — kept OUTSIDE the (rebuilt) catalog so a
+// refreshModelsStore() (every /api/pi/config) re-applies them instead of dropping them
+const discoveredModels = new Map();
+function applyDiscovered(catalog) {
+	for (const [name, d] of discoveredModels) {
+		if (!d?.ids?.length || !catalog[name]) continue;
+		const { models, added } = mergeDiscoveredModels(name, catalog[name].models, d.ids);
+		if (added.length) { catalog[name].models = models; d.added = added.length; }
+	}
+	return catalog;
+}
 function refreshModelsStore() {
-	const next = buildCatalog().providers;
+	const next = applyDiscovered(buildCatalog().providers);
 	piModelsStore = next;
 	if (hubRef) hubRef.modelsStore = next;
 	dlog("[pi] catalog:", Object.entries(next).map(([n, p]) => `${n}(${p.models.length}${p.keyless ? ",keyless" : ""})`).join(" "));
@@ -2190,6 +2209,24 @@ const agentHub = new AgentHub({
 });
 hubRef = agentHub; // catalog refreshes (GET /api/pi/config) swap the map in place here
 
+// --- provider model discovery (boot + 30 min, off the request path) ------------------
+// For every provider the user can actually run (a resolved key + a baseUrl) ask the
+// endpoint for its model list and merge the ids. Fire-and-forget: a slow/blocked provider
+// must never delay boot, and `discovery` in /api/pi/config reports what happened.
+async function discoverProviderModels(reason) {
+	for (const p of Object.values(piModelsStore)) {
+		if (!p?.apiKey || !p.baseUrl || p.keyless) continue; // keyless endpoints rarely serve /models
+		const template = (p.models || []).find((m) => m?.headers && Object.keys(m.headers).length) || (p.models || [])[0];
+		const { ids, error } = await fetchProviderModelIds({ baseUrl: p.baseUrl, apiKey: p.apiKey, headers: template?.headers });
+		discoveredModels.set(p.name, { ids, at: Date.now(), error, added: 0 });
+		dlog(`[pi] discover ${p.name}: ${ids.length} models`, error ? `(${error})` : "");
+	}
+	refreshModelsStore(); // re-merge into the (possibly swapped) catalog + hub
+	dlog(`[pi] discovery done (${reason}) — ${Object.keys(piModelsStore).length} provider(s) in the catalog`);
+}
+void discoverProviderModels("boot");
+setInterval(() => { void discoverProviderModels("timer"); }, 30 * 60 * 1000).unref?.();
+
 // MEDIA GC at boot (review report.md M3, 2026-10-27): the disk store had no way back down. Age-based,
 // logged, and off with PI_WEB_MEDIA_TTL_DAYS=0. The bytes are content-addressed, so a purged blob can
 // always be re-uploaded by the device that still has it ("browser" retention) or re-read from a
@@ -2236,6 +2273,13 @@ const terminalHub = createTerminalHub({
 	dataDir: DATA_DIR,
 	killTree: killProcessTree,
 	originAllowed: TERM_ORIGIN_ALLOWED,
+	// ONE policy with /api/* (user report 2026-10-28: "terminal only works on localhost /
+	// 192.168.x.x, not from an external domain"): the Host/Origin name allowlist is a
+	// DNS-rebinding defense for the LOOPBACK TRUST EXEMPTION, so it applies to exactly the
+	// peers the API gate name-checks (PI_WEB_ORIGIN_GATE=auto → loopback only). A remote
+	// domain that already presented the API token is past the real boundary and used to be
+	// 403'd on /ws/terminal while every /api/* route worked.
+	originGateApplies,
 	isLoopback,
 	debug: dlog,
 	stripWs,

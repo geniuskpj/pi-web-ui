@@ -160,6 +160,18 @@ its model mid-refresh never sees a half-built catalog).
   silent anonymous request.
 - **Never leaked**: `clientProviders()` strips `apiKey`/`api_key` from every model record and never
   serializes the provider-level key (server-side only). Tests: `npm run test:catalog`, `npm run test:keyless`.
+- **PROVIDER MODEL DISCOVERY** (`lib/provider-models.mjs`, user request 2026-10-28: *“show other model with
+  user selected provider … you could get it when server is started”*): at boot (and every 30 min, fire and
+  forget) every usable provider with a baseUrl is asked `GET {baseUrl}/models` with its own key — the
+  OpenAI-compatible shape every endpoint (NIM, Ollama, vLLM, LM Studio, OpenRouter) serves. The ids are
+  merged into that provider's list: an id the user already wrote is left untouched, a new one inherits the
+  provider's `api`/`baseUrl` (template = the first existing model, headers included) with `reasoning: false`
+  and `discovered: true`. Discovered ids are kept in a module-level map, so a `refreshModelsStore()` (every
+  `/api/pi/config`) re-applies them instead of dropping them, and both the picker and the hub see them.
+  `/api/pi/config` reports `discovery: [{provider, found, added, at, error}]`; the picker labels the group
+  `· +N from provider` and each new row `new`. Live: nvidia's `/v1/models` = 85 ids in ~360 ms → +84 models
+  next to the user's curated ones. `maxAdd: 300` bounds a hostile/absurd list; a dead endpoint only sets
+  `error` (never blocks boot). Tests: `npm run test:provmodels`.
 
 ## System-prompt resolution (`/api/pi/system`)
 

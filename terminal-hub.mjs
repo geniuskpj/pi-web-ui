@@ -442,9 +442,15 @@ export function createTerminalHub({
 	dataDir,
 	killTree,
 	allowedOrigins, // legacy Set form (host:port) — kept for other embedders
-	originAllowed, // (origin) => boolean — PREFERRED: the same rule the API gate uses
+	originAllowed, // (origin, req) => boolean — PREFERRED: the same rule the API gate uses
 	//                 (scheme-default port + exact allowlist entry), so the terminal
 	//                 cannot drift from the /api/* origin check
+	originGateApplies, // (req) => boolean — WHEN the name allowlist applies at all.
+	//                 The /api/* gate skips it for peers that already proved themselves with
+	//                 the API token (PI_WEB_ORIGIN_GATE=auto → only loopback peers are name-
+	//                 checked). The terminal used to run the name check on EVERY peer, so a
+	//                 remote domain (DDNS/Tunnel) reached /api/* fine and got 403 on
+	//                 /ws/terminal (user report 2026-10-28). Same policy now.
 	isLoopback, // (req) => boolean
 	debug = () => {},
 	stripWs = (s) => s,
@@ -455,6 +461,8 @@ export function createTerminalHub({
 		? originAllowed
 		: (o) => { try { return origins.has(new URL(String(o)).host.toLowerCase()); } catch { return false; } };
 	const loopbackOf = typeof isLoopback === "function" ? isLoopback : () => false;
+	// default: gate every peer (pre-2026-10-28 behaviour) when the caller passes no rule
+	const gateApplies = typeof originGateApplies === "function" ? originGateApplies : () => true;
 
 	// dedicated WSS: the shared 25MB maxPayload would let one oversized frame
 	// allocate 25MB per socket; terminal frames are tiny.
@@ -1120,22 +1128,21 @@ export function createTerminalHub({
 	// The non-loopback token gate already ran in server.mjs before we get here.
 	function handleUpgrade(req, socket, head) {
 		const origin = req.headers.origin;
-		if (origin) {
-			let host = null;
-			try {
-				host = new URL(origin).host.toLowerCase();
-			} catch {
-				/* reject below */
-			}
+		// The name allowlist is a DNS-REBINDING defense for the loopback trust exemption; a
+		// peer that presented the API token is already past the real boundary, so the same
+		// `originGateApplies` rule the /api/* gate uses decides whether to name-check here.
+		const gated = gateApplies(req);
+		if (gated && origin) {
 			// ONE rule, shared with the /api/* gate: originAllowed() applies the scheme-default
 			// port and requires an exact allowlist entry (2026-10-23, grok review)
-			if (!originOk(origin)) {
+			if (!originOk(origin, req)) {
 				debug("[term] rejected cross-origin WS from", origin);
 				socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
 				socket.destroy();
 				return;
 			}
-		} else if (!loopbackOf(req)) {
+		} else if (gated && !loopbackOf(req)) {
+			// no Origin header at all from a gated (loopback) peer — refuse
 			socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
 			socket.destroy();
 			return;

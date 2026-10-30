@@ -113,7 +113,13 @@ Downloads a PINNED package (`util-linux-2.40.2-2` from repo.msys2.org, sha256-pi
 
 ## Security
 
-- Upgrade: server.mjs token-gates non-loopback; the hub then enforces a strict **Origin allowlist**
+- Upgrade: server.mjs token-gates non-loopback; the hub then enforces the **Origin allowlist**,
+  *when the gate applies* (`originGateApplies(req)` — user report 2026-10-28: the terminal
+  name-checked every peer, so a remote domain/DDNS name reached all of `/api/*` and got
+  `403` from `/ws/terminal`). Same policy as the API gate now: `PI_WEB_ORIGIN_GATE=auto`
+  name-checks LOOPBACK peers only (a remote peer already proved itself with the token),
+  `strict` name-checks everyone, `off` disables the check. The legacy sentence below
+  describes the name list itself: a strict **Origin allowlist**
   (localhost, 127.0.0.1, [::1], hostname, non-internal IPv4s, `PI_WEB_TERM_ORIGIN` extras) because WS
   has no CORS and DNS rebinding presents a mismatched Origin/Host pair; missing Origin is allowed only for
   loopback. Since 2026-10-23 the hub receives the SAME PREDICATE as the `/api/*` gate

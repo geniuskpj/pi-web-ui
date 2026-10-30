@@ -169,7 +169,9 @@ Reads `window.__PI_PROVIDERS` (pi-import.ts, `pi.modelsCache`) — the SERVER's 
 (`lib/pi-catalog.mjs`; see [server.md](server.md) §Provider catalog), which now includes providers added
 in `.pi/models.json` and providers that only exist in `auth.json`. Every OPEN re-fetches
 `/api/pi/config` (async, `cfgTick` bumps the memo) so a hand-edited models.json is visible without a
-reload, and the group header appends `· custom` (origin `models.json`) / `· no key` (keyless provider).
+reload, and the group header appends `· custom` (origin `models.json`) / `· no key` (keyless provider) /
+`· +N from provider` (ids discovered from the provider's own `/models` at server start, `discovered: true` →
+each row gets a `new` chip). A `hidden (no key)` footer lists providers the UI cannot run, with reasons.
 
 ## Data use: the image pipeline (2026-10-25 — model + wiring contract)
 

@@ -128,6 +128,10 @@ export function ModelSelector({
 								{g.name}
 								{g.origin === "models.json" ? <span class="pw-model-origin" title="Declared in .pi/models.json (your own endpoint)"> · custom</span> : null}
 								{g.keyless ? <span class="pw-model-origin" title="No API key is needed for this endpoint"> · no key</span> : null}
+								{(() => {
+									const n = g.models.filter((m) => (m as any).discovered).length;
+									return n ? <span class="pw-model-origin" title={`${n} model(s) discovered from ${g.name}'s /models endpoint at server start — no local metadata, so reasoning is off for them`}> · +{n} from provider</span> : null;
+								})()}
 							</div>
 							{g.models.map((m) => {
 								const isCurrent = current && m.id === current.id && (m.provider === current.provider || g.name === current.provider);
@@ -141,6 +145,7 @@ export function ModelSelector({
 										}}
 									>
 										<span class="pw-model-id">{m.name || m.id}</span>
+										{(m as any).discovered ? <span class="pw-model-origin" title="Discovered from the provider's /models endpoint">new</span> : null}
 										{isCurrent && <span class="pw-model-check">✓</span>}
 									</button>
 								);
