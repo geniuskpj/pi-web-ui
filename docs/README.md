@@ -25,6 +25,7 @@
 | You are touching… | Read first | Cross-seams with |
 |---|---|---|
 | `src/main.tsx`, `chat.tsx`, storage, sync | `client.md` | `server.md` (`/ws/sync` hub, exec bridge) |
+| `lib/pi-catalog.mjs`, `lib/provider-models.mjs`, `lib/session-search.mjs`, `lib/rg-json.mjs` | `server.md` §Provider catalog / §Find | `client.md` (picker, find bar) |
 | `server.mjs` routes, auth, builtin tools, proxy | `server.md` + `architecture.md` (trust model) | `client.md` (`pi-tools.ts` caller), `terminal.md` (upgrade gating) |
 | `terminal-hub.mjs`, `terminal.tsx`, wterm | `terminal.md` | `server.md` (`killTree`, upgrade handler) |
 | `build.mjs`, `vendor-wterm.mjs`, bundling | `architecture.md` (module map) + `.gitignore` (what's generated vs vendored) | — |

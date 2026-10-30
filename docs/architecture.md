@@ -35,6 +35,12 @@ Browser (any device)                 Node server (:8787)
 | `agent-hub.mjs` | **Server-side agent sessions — the DEFAULT chat path**: Agent per session with in-process tools (builtin+pi extensions), effective system prompt, settings.json default model; subscribe-first attach, debounced persist, per-session SSE subscriber sets; `retry()` resumes a failed run AT THE FAILURE POINT (drop the error message → `agent.continue()`; no duplicated user turn, completed tools not re-run) with auto-retry (3×3 s) for rate-limit/network errors |
 | `session-worker.mjs` (89 L) | Worker-thread JSONL session store (atomic tmp+rename writes) |
 | `session-id.mjs` (5 L) | Shared `SESSION_ID_RE` (`^[A-Za-z0-9_-]{1,80}$`) used on both sides of the worker seam |
+| `lib/pi-catalog.mjs` | merged provider catalog: builtin catalog ∪ `models-store.json` ∪ `.pi/models.json` ∪ `auth.json`; usable-only projection for the picker, keyless placeholder, `$ENV` keys |
+| `lib/provider-models.mjs` | provider `/models` discovery (boot + 30 min): parse + merge new ids into a provider's list |
+| `lib/session-search.mjs` | whole-session find: roles, turns, snippets with match offsets, caps |
+| `lib/rg-json.mjs` | `rg --json` argv + parser for the workspace search (grouped, per-file caps) |
+| `lib/display-gate.mjs` | which user turns a large session shows (seq-space gate) |
+| `lib/turn-timing.mjs` | opt-in `PI_WEB_TIMING=1` turn timeline (fetch headers/first chunk + hub stages) |
 | `build.mjs` (138 L) | esbuild bundle (`app-[hash].js`), hljs→lib/common alias, manifest.json, .br/.gz precompression, stale-bundle pruning |
 | `vendor-wterm.mjs` (136 L) | Downloads prebuilt `@wterm/dom`+`@wterm/core` npm tarballs, esbuild-bundles one ESM file into `public/vendor/wterm/` |
 | `src/main.tsx` (675 L) | Boot: storage init, token-aware fetch/WS monkeypatch, system-prompt resolve, tools prefetch, Agent creation, session load/save/delete, App shell |
@@ -163,20 +169,27 @@ pi's file and is not read here); `.pi/auth.json` etc. stay
 
 | Env | Default | Purpose |
 |---|---|---|
-| `PI_DIR` | `C:/pi-windows-x64/.pi` | pi config dir (auth.json, models-store.json, extensions/) |
-| `PI_WS` | parent of PI_DIR | workspace root (cwd for bash + fs containment root) |
-| `PI_WEB_DATA_DIR` | `<repo>/data` | sessions mirror, auth-token.txt, pty bridge, ext stage |
-| `PORT`/`PI_WEB_PORT`, `HOST`/`PI_WEB_HOST` | 8787 / 0.0.0.0 | listener |
-| `PI_WEB_TOKEN` | auto-generated | API token (persisted to data/auth-token.txt) |
-| `PI_WEB_TOOLS` | all | comma allowlist for exec-bridge tools |
+| `PI_DIR` | `C:/pi-windows-x64/.pi` | pi config dir (`auth.json`, `models-store.json`, `models.json`, `extensions/`) |
+| `PI_WS` | parent of `PI_DIR` | workspace root — bash cwd + fs containment root |
+| `PI_WEB_DATA_DIR` | `<repo>/data` | sessions mirror, `auth-token.txt`, logs, media, pty bridge, ext-loader stage |
+| `PORT` / `PI_WEB_PORT` | `8787` | HTTP port |
+| `HOST` / `PI_WEB_HOST` | `0.0.0.0` | listen address |
+| `PI_WEB_TOKEN` | auto-generated | blanket gate for every `/api/*` + `/ws/*` call from non-loopback peers; generated on first boot, persisted to `data/auth-token.txt` |
+| `PI_WEB_TOOLS` | all | comma-separated allowlist for exec-bridge tools |
 | `PI_WEB_BASH` / `PI_WEB_BASH_SHELL` | on / `C:\Git\usr\bin\bash.exe` | bash tool on/off + shell path |
-| `PI_WEB_TERM_COLS/LINES` | 110/32 | terminal grid clamp (40–240 / 10–120) |
-| `PI_WEB_TERM_BRIDGE` | auto | `0`/`pipes` forces pipe tier; path uses that bridge exe |
-| `PI_WEB_TERM_ORIGIN` | — | extra names for the GLOBAL Host/Origin allowlist (every `/api/*` route + all three WS endpoints, not just the terminal); exact `host:port` matching — spell the public form for a proxy (`name:443`) |
-| `PI_WEB_ORIGIN_GATE` | `auto` | origin-gate strictness: `auto` = loopback peers only (a valid token is enough for remote peers — this is what lets any domain work), `strict` = every peer, `off` = disabled (warns at boot) |
-| `PI_GIT_HOME` | — | override the Git root (terminal shell env; tar fallback in bridge provisioning) |
-| `PROXY_IDLE_MS` | 150000 | LLM proxy stall watchdog |
 | `PI_WEB_DEBUG` | off | verbose server logging |
+| `PI_WEB_LOG_DIR` | `<PI_WEB_DATA_DIR>/logs` | console tee target: daily `server-YYYYMMDD.log` (ISO timestamps + info/warn/error); a broken dir falls back to console-only |
+| `PI_WEB_EXIT_ON_STDIN_CLOSE` | off | run the graceful-shutdown sequence when the parent closes stdin (pipe-friendly Ctrl+C; used by tests) |
+| `PI_WEB_WS_DEFLATE` | on | `off` disables permessage-deflate on ALL WebSockets (agent, sync, terminal) |
+| `PI_WEB_MEDIA_TTL_DAYS` | `30` | age-based GC for the image store (`data/media`); `0` keeps everything |
+| `PI_WEB_MEDIA_CACHE_MB` | `64` | in-memory read cache in front of the media disk store |
+| `PI_WEB_DATA_REDUCTION_DEBUG` | off | `1` logs one `[data-reduction]` line per block (modes · forwarded · dropped bytes · flushes) |
+| `PI_WEB_TERM_COLS` / `PI_WEB_TERM_LINES` | `110` / `32` | terminal grid (stty in the pty tier, `COLUMNS`/`LINES` in the pipe tier) |
+| `PI_WEB_TERM_BRIDGE` | auto | `conhost` forces Windows ConPTY, `0`/`pipes` forces the pipe tier, a path uses that exe as an msys-pty bridge; unset → auto-provision msys2 `script.exe` into `data/bin/script/` (sha256-pinned, proven by running it) |
+| `PI_WEB_TERM_ORIGIN` | auto | extra `host[:port]` names for the GLOBAL Host/Origin allowlist (every `/api/*` route and all three WS endpoints). Exact `host:port` matching — a TLS reverse proxy needs its public form (`name:443`). Localhost, `os.hostname()` and interface IPs are always allowed |
+| `PI_WEB_ORIGIN_GATE` | `auto` | how strictly that allowlist applies: `auto` = loopback peers only (a remote peer must present the token — this is what lets any domain/DDNS name work), `strict` = every peer, `off` = no check (**foot-gun**) |
+| `PI_GIT_HOME` | — | override the Git root (terminal shell env + bridge-provisioning tar fallback) |
+| `PROXY_IDLE_MS` | `150000` | LLM proxy stall watchdog |
 
 ## Known quirks (factual, noticed while documenting — for the reviewer to verify)
 

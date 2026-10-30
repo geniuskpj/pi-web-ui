@@ -44,7 +44,7 @@
     "test:toolcall": "node tests/restore-toolcall.test.mjs",
     "test:sysprompt": "node tests/system-prompt.test.mjs",
     "test:data": "node tests/data-reduction.test.mjs",
-    "bench:data": "node tests/data-reduction.bench.mjs",
+    "bench:data": "node ws-diag/data-reduction.bench.mjs",
     "test:thinking": "node tests/thinking-flush.test.mjs",
     "test:deflate": "node tests/ws-deflate.test.mjs",
     "test:reduce": "node tests/stream-reduce.test.mjs",

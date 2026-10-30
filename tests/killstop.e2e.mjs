@@ -13,6 +13,7 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import WebSocket from "ws";
+import { MODEL_WAIT_MS } from "./_wait.mjs"; // a real model turn is bounded by the provider, not by us
 const TOKEN = fs.readFileSync("data/auth-token.txt", "utf8").trim();
 const BASE = "http://127.0.0.1:8798";
 
@@ -55,7 +56,7 @@ console.log("[1] entry created");
 // 1. LONG generation — fire-and-forget: the HTTP prompt endpoint resolves at
 // RUN END (promptLock holds through the stream), so awaiting it hangs the test
 void api("/api/agent/prompt", { sessionId: ID, content: "Count from 1 to 5000, one number per line, no commentary, no summarizing. Start now." }).catch(() => {});
-const started = await waitUntil(async () => (await state())?.isStreaming === true, 20000);
+const started = await waitUntil(async () => (await state())?.isStreaming === true, MODEL_WAIT_MS);
 check("run started (isStreaming)", started);
 if (!started) { console.log("[killstop] cannot continue without a running run"); process.exit(1); }
 

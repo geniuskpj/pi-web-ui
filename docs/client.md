@@ -288,6 +288,43 @@ Notes worth keeping:
 7. Encode **on add**, not on send (≤4 images, bounded work; the send stays instant) and revoke the object
    URL on remove/clear so the preview cannot leak memory.
 
+## Session loading (tail-first) + IndexedDB cache
+
+The server decides TRANSFER sizes, the client decides DISPLAY granularity.
+
+- **Wire compression**: the full session `GET` gzips bodies >2KB; WS state frames use permessage-deflate
+  (`PI_WEB_WS_DEFLATE=off` disables).
+- **Tail-first attach**: a client advertising `tailFirst` gets only the last ~1MB of serialized messages
+  plus a sparse envelope (`{fromSeq, messageCount, rewriteSeq, rewrittenFrom}`); small chats attach fully.
+- **`GET /api/agent/session/:id/range`** serves a seq window (`fromSeq`/`toSeq`, or `tailBytes=`) as raw
+  `application/gzip` NDJSON — the same bytes go into IndexedDB and through `DecompressionStream` on read.
+  The 1MB cap keeps the HIGH end (windows stay adjacent to the loaded tail) and aligns the start down to a
+  user turn. Identity headers: `X-Session-Mutate-Epoch`, `X-Session-Message-Count`, `X-Range-From/To-Seq`,
+  `X-Rewritten-From` (chunks strictly below it survive rewrites).
+- **Aligned windows**: `/range` windows and live-written chunks share one 64-message boundary
+  (`lib/chunk-window.mjs`, imported by both sides), and the attach takes the client's cached reach (`haveTo`)
+  so a covered tail is not re-sent (measured: 1.49MB → 0 bytes, the prefix comes from IndexedDB; a miss falls
+  back to `/range`).
+- **IndexedDB cache** (`pi-session-cache`, schema v2): per-chunk gzip blobs keyed
+  `[sessionId, rewriteSeq, fromSeq]` + a coverage record per generation. Miss-set = interval diff. LRU 200MB
+  (superseded generations first). A rewrite never erases: the new generation is a fresh key space, the old one
+  is collected by `sweepStale()` (5-minute grace, 30-day hard TTL) on attach and tab focus. Live
+  write-through: the attached tail and every later turn are stored as they arrive, the remnant rewritten in
+  place on `agent_end`/idle/tab-hide. Wedge-proof: lazy open, 2s timeout per op (timeout = MISS), 3-failure
+  circuit breaker, per-session serialized writes, server fallback always available.
+- **Rewrite invalidation**: every rewrite (✎ edit / 🕘 restore / retry tail-drop / compact) bumps
+  `rewriteSeq` and records `rewrittenFrom`; cached chunks below it survive and the client validates the
+  generation on every read.
+- **Display by user turn**: sparse sessions render the last N turns (Settings → Composer → *Turns visible*,
+  `pi.turnWindow`, default 3); ⤒ reveals one more per click (memory or `/range`). Small chats render fully.
+- **Transfer policy**: `navigator.connection` (saveData/effectiveType/type) decides — fast links warm the
+  whole body into IDB in the background, metered links stay manual. Server fallback: `/api/health.netClass`.
+- **UI**: the session list shows each session's IDB footprint; the alive-sessions dialog has 🧹 clear (safe
+  during a live run — the cache is read-only data, in-flight writes are dropped by a generation guard).
+
+Measured: gzip chunk-ratio penalty nil; per-chunk decompress 3.4–5ms; a warm 7.3MB reopen = zero network.
+Full analysis in `pr-idb.md`.
+
 ## Storage (`storage.ts` + `local-storage-backend.js`)
 
 - `LocalStorageBackend`: synchronous localStorage replacement for a wedged-IDB history. Layout:

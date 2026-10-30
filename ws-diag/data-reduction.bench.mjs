@@ -17,7 +17,7 @@
 import { resolveDataReduction, planImageTransform, frameBytes } from "../lib/data-reduction.mjs";
 import { resolveThinkingPolicy, simulateThinking, simulateStream } from "../lib/thinking-flush.mjs";
 import { redactImageData, createMediaStore } from "../lib/media-egress.mjs";
-import { WS_DEFLATE, wireBytes, size, pct } from "./_wire-bytes.mjs";
+import { WS_DEFLATE, wireBytes, size, pct } from "../tests/_wire-bytes.mjs";
 
 // ── fixtures ────────────────────────────────────────────────────────────────────────────────
 /** A reasoning turn: 6 paragraphs of prose, delivered as ~25-char thinking_delta frames. */

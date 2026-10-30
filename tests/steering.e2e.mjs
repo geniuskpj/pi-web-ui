@@ -11,6 +11,7 @@
 // Usage: node tests/steering.e2e.mjs
 import WebSocket from "ws";
 import { startScratchServer } from "./_scratch-server.mjs";
+import { MODEL_WAIT_MS } from "./_wait.mjs"; // provider latency can exceed 90s; the wait is env-tunable
 
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -21,12 +22,12 @@ const ws = new WebSocket(`ws://127.0.0.1:${srv.port}/ws/agent?session=${SESSION}
 
 const state = { messages: [], isStreaming: false, agentEnds: 0, pending: null, pendingFrames: 0, userTexts: [], accepts: [] };
 let pendingWaiters = [];
-const waitPending = (pred, timeoutMs = 30000) => new Promise((resolve, reject) => {
+const waitPending = (pred, timeoutMs = MODEL_WAIT_MS) => new Promise((resolve, reject) => {
 	const timer = setTimeout(() => { const i = pendingWaiters.indexOf(w); if (i >= 0) pendingWaiters.splice(i, 1); reject(new Error("pending-wait timeout")); }, timeoutMs);
 	const w = { pred, resolve: (v) => { clearTimeout(timer); resolve(v); } };
 	pendingWaiters.push(w);
 });
-const waitEvent = (pred, timeoutMs = 90000, label = "event") => new Promise((resolve, reject) => {
+const waitEvent = (pred, timeoutMs = MODEL_WAIT_MS, label = "event") => new Promise((resolve, reject) => {
 	const t0 = Date.now();
 	const check = () => {
 		if (pred()) { clearInterval(iv); resolve(true); return; }

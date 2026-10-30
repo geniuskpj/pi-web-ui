@@ -13,6 +13,7 @@ import WebSocket from "ws";
 import fs from "node:fs";
 import path from "node:path";
 import { startScratchServer } from "./_scratch-server.mjs";
+import { MODEL_WAIT_MS } from "./_wait.mjs"; // provider latency can exceed 15s; the wait is env-tunable
 
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -66,7 +67,7 @@ const A = client("A-pc");
 	A.ws.send(JSON.stringify({ type: "prompt", content: "Run the bash command `sleep 3 && echo pi-web-server-agent-test` and tell me its exit code. Be brief." }));
 	// disconnect as soon as the run is OBSERVED streaming
 	const d0 = Date.now();
-	while (Date.now() - d0 < 15000 && !A.state.isStreaming) await sleep(100);
+	while (Date.now() - d0 < MODEL_WAIT_MS && !A.state.isStreaming) await sleep(100);
 	await sleep(300);
 	log("--- A DISCONNECTS mid-run (simulated browser close) ---");
 	const aStreamingAtDisconnect = A.state.isStreaming;
@@ -77,7 +78,7 @@ const A = client("A-pc");
 	const B = client("B-phone");
 	await new Promise((r) => B.ws.on("open", r));
 	B.ws.send(JSON.stringify({ type: "attach", sessionId: SESSION }));
-	const deadline = Date.now() + 100000;
+	const deadline = Date.now() + MODEL_WAIT_MS;
 	while (Date.now() < deadline && !B.state.events.includes("agent_end")) await sleep(500);
 	log("--- C re-attaches AFTER completion (fresh device) ---");
 	const C = client("C-reconnect");

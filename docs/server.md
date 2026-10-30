@@ -532,7 +532,8 @@ back to `off`, never to a stronger reduction.
    | `paragraph` (level `paragraph`, wan) | 1.4 KB | 9 | +1.6 s |
    | turn end (level `turnEnd`) | 0.2 KB | 1 | +13.8 s |
 
-   (`npm run bench:data` prints the full table: images, streams, tool output, resize budget.)
+   (`npm run bench:data` — now `ws-diag/data-reduction.bench.mjs`, i.e. a diagnostic, not a test —
+   prints the full table: images, streams, tool output, resize budget.)
 5. **Steering while buffering**: a steer that arrives mid-block must still be accepted (it is injected
    after the current thinking/tool call completes). Hide nothing, drop nothing — the buffered text is
    flushed first.
