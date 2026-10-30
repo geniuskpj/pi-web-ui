@@ -56,6 +56,13 @@ credentials*.json
 *.orig
 *~
 
+# --- keeper, untracked on purpose ---------------------------------------------
+# lib/turn-timing.mjs: opt-in (PI_WEB_TIMING=1) in-server turn timeline. It is NOT wired
+# into server.mjs (measurements are taken with the standalone tools in ws-diag/ instead),
+# so it stays out of the tree until it earns a caller — ignore it so `git add -A` cannot
+# sweep it in by accident.
+lib/turn-timing.mjs
+
 # --- editor / OS junk ---------------------------------------------------------
 .vscode/
 .idea/
