@@ -494,6 +494,33 @@ s→c { type: "data-reduction", id, ok: true, enabled, streamMode, kinds: { thin
 (Settings → Data use); a connection that never sends it stays LIVE, and an unrecognised mode falls
 back to `off`, never to a stronger reduction.
 
+### Image retention (`imageRetention` in the same frame, 2026-10-28)
+
+`"server"` (default) writes the encoded blob under `data/media/<hash[0..1]>/<hash>`; `"browser"` keeps
+it in the in-memory LRU only, so the owning device re-uploads after a restart (the composer then shows
+the `type: "note"` frame "N image(s) are no longer on the server — re-attach them to resend").
+
+It is **per session, per attached requester** — `agentHub.setMediaRetention(sessionId, socketId, mode)`
+(the socket id comes from `socketId(ws)`, cleared on close via `clearMediaRetention`):
+
+* "browser" wins while ANY attached device asks for it (strictest first — the bytes are never written);
+* the session's last explicit choice is STICKY on the entry, so a phone that said "browser" is not
+  undone by its own disconnect;
+* a session nobody has an opinion about follows the process default (`setMediaPersist`, used by
+  `PI_WEB_*` setups and the POST route).
+
+Before this the flag was ONE process-wide boolean assigned from a per-connection frame: the last device
+to attach decided for every session on the server, and the value stuck after it left (external review
+I3). The upload route keeps its per-request `x-pi-media-retention` header, so the bytes and the hub's
+bookkeeping agree.
+
+**Persistence is redacted too** (external review I2): `_writeSession()` stores
+`{type:"image", mimeType, hash, bytes}` in the session file (bytes → the media store, honoured
+retention) and `_ensureEntry()` hydrates the hashes back to base64 at load, so the model path is
+unchanged. A session file therefore never carries image base64 — the old shape wrote ~0.75 bytes of
+base64 per image byte to disk (526 KB measured in one real session), whatever the retention said.
+`hub._writeSession`/`hydrateImages()` are covered by `tests/hub-hydration.test.mjs` §I2.
+
 ### What the reducer does (`lib/stream-reduce.mjs`, one instance per connecting socket)
 
 * per kind (`thinking` | `text` | `tool`) keep ONE `createThinkingGate(policy)` per streaming block,

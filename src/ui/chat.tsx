@@ -40,6 +40,9 @@ import { TerminalPanel, termBus } from "./terminal.js";
 import { renderMarkdown } from "./markdown.js";
 // egress media (plan §2.2b): a transcript image part may carry only a hash → hydrate before re-sending
 import { hydrateImageParts, currentSessionId } from "./media.js";
+// the browser half of the image policy: resize/re-encode per Settings → Data use, then upload the
+// BYTES and send a hash (no base64 up, none in the transcript, none in the session file)
+import { base64ToBlob, blobToBase64, encodeForModel, uploadImage } from "../image-encode.js";
 const ARG_PREVIEW_MAX = 160;
 const OUTPUT_TAIL_MAX = 2000;
 const PARTIAL_STORE_MAX = 4096; // cap UI-only partial strings (bash can stream MBs)
@@ -763,7 +766,9 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 	// attachment state lives here so composer chips AND sent-message file chips
 	// can open the explorer at that file (user request)
 	const [textFiles, setTextFiles] = useState<Array<{ path: string; content: string }>>([]);
-	const [images, setImages] = useState<Array<{ name: string; data: string; mimeType: string; preview: string }>>([]);
+	// `hash` = the bytes are on the server (the composer then sends a hash, not base64); `data` stays as
+	// the chip preview AND as the fallback when the upload did not go through
+	const [images, setImages] = useState<Array<{ name: string; data: string; mimeType: string; preview: string; hash?: string; bytes?: number }>>([]);
 	const [attachNote, setAttachNote] = useState("");
 	const [picker, setPicker] = useState<{ open: boolean; initialFile: string | null }>({ open: false, initialFile: null });
 	// terminal dock state (panel itself is src/ui/terminal.tsx; opened from the
@@ -789,12 +794,13 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 			void (async () => {
 				try {
 					const filled = await hydrateImageParts(steerImages.filter((im: any) => im?.type === "image"), currentSessionId(agent));
-					setImages((prev) => [
-						...prev,
-						...filled
-							.filter((im: any) => im?.data && im?.mimeType)
-							.map((im: any, k: number) => ({ name: `steered-${k + 1}`, data: im.data, mimeType: im.mimeType, preview: `data:${im.mimeType};base64,${im.data}` })),
-					]);
+					let k = 0;
+					for (const im of filled) {
+						if (!im?.data || !im?.mimeType) continue;
+						k += 1;
+						// the hash travels along: the bytes are on the server already, so nothing is re-encoded
+						await addAttachment(`steered-${k}`, { base64: im.data, mimeType: im.mimeType, hash: im.hash, bytes: im.bytes }, { encode: false });
+					}
 				} catch { /* offline: the text still comes back */ }
 			})();
 		}
@@ -872,15 +878,48 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 		a.onNote = (m: string) => note(m);
 		return () => { try { delete a.onNote; } catch { /* frozen */ } };
 	}, [agent]);
+	/**
+	 * ONE funnel for every attachment (paste · picker · forwarded import · steer recall): apply the
+	 * image policy, upload the bytes, keep the content address. `encode: false` is for images that
+	 * already exist on the server (a recalled steer carries its hash) — never re-encode those.
+	 * A failed upload keeps the base64, so a slow or older server degrades to the inline path.
+	 */
+	const addAttachment = async (name: string, src: { base64?: string; blob?: Blob; hash?: string; bytes?: number; mimeType?: string }, opts: { encode?: boolean } = {}) => {
+		const { encode = true } = opts;
+		let mimeType = src.mimeType || src.blob?.type || "image/png";
+		try {
+			let blob: Blob | null = src.blob ?? (src.base64 ? base64ToBlob(src.base64, mimeType) : null);
+			let noteText: string | null = null;
+			let bytes = src.bytes ?? blob?.size ?? 0;
+			if (blob && encode) {
+				const enc = await encodeForModel(blob);
+				blob = enc.blob;
+				mimeType = enc.mimeType;
+				bytes = enc.bytes;
+				if (enc.note) noteText = enc.note;
+			}
+			let hash = src.hash;
+			if (blob && !hash) {
+				const up = await uploadImage(blob, mimeType, currentSessionId(agent));
+				if (up) { hash = up.hash; bytes = up.bytes; mimeType = up.mimeType || mimeType; }
+			}
+			const data = blob ? await blobToBase64(blob) : (src.base64 || "");
+			if (!data && !hash) { note("could not read that image"); return; }
+			let full = false;
+			setImages((prev) => {
+				if (prev.length >= MAX_IMAGE_ATTACH) { full = true; return prev; }
+				return [...prev, { name, mimeType, data, preview: data ? `data:${mimeType};base64,${data}` : "", hash, bytes }];
+			});
+			if (full) note(`max ${MAX_IMAGE_ATTACH} images`);
+			if (noteText) note(`image: ${noteText}`);
+		} catch (err: any) {
+			note(`could not attach that image (${err?.message || "unknown"})`);
+		}
+	};
+
 	const addPicked = (f: PickedFile) => {
 		if (f.kind === "image") {
-			setImages((prev) => {
-				if (prev.length >= MAX_IMAGE_ATTACH) {
-					note(`max ${MAX_IMAGE_ATTACH} images`);
-					return prev;
-				}
-				return [...prev, { name: f.name, data: f.base64 || "", mimeType: f.mimeType || "image/png", preview: `data:${f.mimeType};base64,${f.base64}` }];
-			});
+			void addAttachment(f.name, { base64: f.base64 || "", mimeType: f.mimeType || "image/png" });
 		} else {
 			setTextFiles((prev) => {
 				if (prev.some((x) => x.path === f.path)) {
@@ -1072,8 +1111,12 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 		// have no `data`, so a silent retry would send a text-only turn.
 		void (async () => {
 			try {
-				const imgs = rawImgs.length ? await hydrateImageParts(rawImgs, currentSessionId(agent)) : [];
-				const sendable = imgs.filter((im: any) => typeof im?.data === "string" && im.data);
+				// a server-side agent takes the hashes as they are (the hub hydrates them from its media store);
+				// a browser-local one needs bytes, so only THAT path fetches them back through the media route
+				const imgs = !rawImgs.length ? [] : (agent as any).serverSide
+					? rawImgs.map((im: any) => (im?.hash ? { type: "image", mimeType: im.mimeType, hash: im.hash } : im))
+					: await hydrateImageParts(rawImgs, currentSessionId(agent));
+				const sendable = imgs.filter((im: any) => im?.hash || (typeof im?.data === "string" && im.data));
 				if (rawImgs.length && !sendable.length) console.warn(`[chat] retry: could not reload ${rawImgs.length} image(s) — sending text only`);
 				await (sendable.length ? agent.prompt(text, sendable) : agent.prompt(text));
 			} catch (err: any) { console.error("[chat] retry failed:", err); }
@@ -1519,14 +1562,10 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 				attachNote={attachNote}
 				onRemoveTextFile={(p) => setTextFiles((prev) => prev.filter((x) => x.path !== p))}
 				onRemoveImage={(idx) => setImages((prev) => prev.filter((_, j) => j !== idx))}
-				onAddImage={(name, data, mimeType) => {
-					setImages((prev) => {
-						if (prev.length >= MAX_IMAGE_ATTACH) {
-							note(`max ${MAX_IMAGE_ATTACH} images`);
-							return prev;
-						}
-						return [...prev, { name, data, mimeType, preview: `data:${mimeType};base64,${data}` }];
-					});
+				onAddImage={(name, data, mimeType, hash) => {
+					// data is base64 (a forwarded or recalled image) or a Blob (a paste); a hash means the bytes
+					// are on the server already, so nothing is re-encoded and nothing is re-uploaded
+					void addAttachment(name, typeof data === "string" ? { base64: data, mimeType, hash } : { blob: data, mimeType, hash }, { encode: !hash });
 				}}
 				onNote={note}
 				onOpenPicker={() => setPicker({ open: true, initialFile: null })}
@@ -1643,11 +1682,11 @@ export function Editor({
 	onPickModel?: () => void;
 	steerDraft?: { text: string; seq: number } | null;
 	textFiles: Array<{ path: string; content: string }>;
-	images: Array<{ name: string; data: string; mimeType: string; preview: string }>;
+	images: Array<{ name: string; data: string; mimeType: string; preview: string; hash?: string; bytes?: number }>;
 	attachNote: string;
 	onRemoveTextFile: (path: string) => void;
 	onRemoveImage: (idx: number) => void;
-	onAddImage: (name: string, data: string, mimeType: string) => void;
+	onAddImage: (name: string, data: string | Blob, mimeType: string, hash?: string) => void;
 	onNote: (msg: string) => void;
 	onOpenPicker: () => void;
 	onOpenFile: (path: string) => void;
@@ -1750,13 +1789,9 @@ export function Editor({
 					continue;
 				}
 				e.preventDefault(); // image wins over any text representation
-				const reader = new FileReader();
-				reader.onload = () => {
-					const dataUrl = String(reader.result || "");
-					const base64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
-					onAddImage(file.name || "pasted-image", base64, file.type || "image/png");
-				};
-				reader.readAsDataURL(file);
+				// the Blob travels as-is: the encode+upload funnel (ChatView.addAttachment) decodes it once,
+				// capped, so a 12MP pasted photo is never materialised here
+				onAddImage(file.name || "pasted-image", file, file.type || "image/png");
 			}
 		}
 	};
@@ -1781,7 +1816,7 @@ export function Editor({
 		}
 		// WS payload cap: /ws/agent frames over 25MB kill the socket — cap total
 		// image bytes (raw ≈ base64×0.75) at 12MB (grok r3: 4×8MB ≈ 42MB base64)
-		const imageBytes = images.reduce((n, im) => n + Math.floor((im.data?.length || 0) * 0.75), 0);
+		const imageBytes = images.reduce((n, im) => n + (im.bytes ?? Math.floor((im.data?.length || 0) * 0.75)), 0);
 		if (imageBytes > 12 * 1024 * 1024) {
 			onNote("attachments too large (>12MB total) — remove an image");
 			return;
@@ -1809,7 +1844,13 @@ export function Editor({
 				const fence = "`".repeat(longest + 1);
 				fullText += `\n\n--- file: ${f.path} ---\n\n${fence}${fenceLang(f.path)}\n${f.content}\n${fence}`;
 			}
-			const imgs = images.map((im) => ({ type: "image" as const, data: im.data, mimeType: im.mimeType }));
+			// a hash is enough: the server owns the bytes (it hydrates them for the model), so the frame stays
+			// kilobytes instead of megabytes. `data` is the fallback when the upload did not go through.
+			// `hash`/`bytes` are WIRE fields (pi-agent-core's ImageContent has no hash) — the hub replaces them
+			// with the bytes it stores before the model call, so the cast is deliberate
+			const imgs: any[] = images.map((im) => (im.hash
+				? { type: "image", mimeType: im.mimeType, hash: im.hash, bytes: im.bytes }
+				: { type: "image", mimeType: im.mimeType, data: im.data }));
 			// empty text + images → a single space: Anthropic rejects empty text blocks
 			const outText = fullText || (imgs.length ? " " : "");
 			const restoreRaw = value; // untrimmed pre-send value
@@ -1873,7 +1914,7 @@ export function Editor({
 					try {
 						const filled = await hydrateImageParts(steerImages.filter((im: any) => im?.type === "image"), currentSessionId(agent));
 						for (const im of filled) {
-							if (im?.data && im.mimeType) onAddImage(`stopped-${Date.now().toString(36)}`, im.data, im.mimeType);
+							if (im?.data && im.mimeType) onAddImage(`stopped-${Date.now().toString(36)}`, im.data, im.mimeType, im.hash);
 						}
 					} catch { /* offline: the text still comes back */ }
 				})();

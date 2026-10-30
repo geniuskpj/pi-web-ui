@@ -9,7 +9,7 @@
 import { Agent } from "@earendil-works/pi-agent-core";
 import { alignDown } from "./lib/chunk-window.mjs";
 // egress redaction (plan §2.2b): inline base64 → content hash + the /media route
-import { createMediaStore, redactImageData, hydrateImageData } from "./lib/media-egress.mjs";
+import { createMediaStore, redactImageData, hydrateImageData, missingImageHashes } from "./lib/media-egress.mjs";
 // pi-ai 1.4.0: AgentOptions.streamFn is REQUIRED — the compat subpath exports the
 // generic streamSimple dispatcher (routes on model.api) and auto-registers the
 // builtin api providers on import
@@ -145,7 +145,16 @@ export class AgentHub {
 			dir: mediaDir || null,
 		});
 		this._redactedMsg = new WeakMap(); // message object → its redacted twin (once per object)
-		this.mediaPersist = true;          // retention: "server" (default) = persist to disk
+		// RETENTION (Settings → Data use → Image storage). PER SESSION, per attached requester
+		// (external review I3, 2026-10-28): this used to be ONE process-wide boolean assigned from a
+		// per-connection frame, so the last device to attach decided for every session on the server.
+		//   mediaRetention : sessionId → Map<requesterId, "server" | "browser">   (attached devices)
+		//   entry.retention: the last explicit choice for that session — STICKY, so a phone that said
+		//                    "browser" keeps that session off the disk after it disconnects
+		// Effective value: "browser" if ANY attached requester asked for it, else the sticky choice,
+		// else the default (".mediaDefaultPersist").
+		this.mediaDefaultPersist = true;   // "server" (default) = persist to disk
+		this.mediaRetention = new Map();   // sessionId → Map<requesterId, mode>
 		// server-side toolset (2026-10-21): the SAME builtin+extension tools the exec
 		// bridge exposes — executed IN THIS PROCESS by the server-side agent loop, so
 		// a run survives browser closes and every device sees live progress
@@ -199,7 +208,8 @@ export class AgentHub {
 					thinkingLevel: level,
 					// re-link toolResults that lost toolCallId in an old mirror (2026-10-22:
 					// nvidia NIM 400s on tool messages without tool_call_id after restart)
-					messages: messages ? normalizeRestoredMessages(messages) : [],
+					// a session file holds hash-only image parts (see _writeSession) → back to bytes for the model
+					messages: messages ? normalizeRestoredMessages(hydrateImageData(messages, this.media)) : [],
 					...(systemPrompt ? { systemPrompt } : {}),
 					tools: this.getTools(), // read/write/edit/bash + pi extensions — in-process
 				},
@@ -429,15 +439,23 @@ export class AgentHub {
 		const firstUser = state.messages.find((m) => m.role === "user");
 		const title = firstUser ? extractPreviewText(firstUser.content) || "Session" : "Session";
 				const metadata = this._buildMetadata(sessionId);
-		if (!entry.createdAt) entry.createdAt = now;
-		const lines = [JSON.stringify(metadata)];
+				if (!entry.createdAt) entry.createdAt = now;
+				// PERSIST REDACTED (external review I2, 2026-10-28): the file used to receive `state.messages`
+				// verbatim, so an inline image wrote ~0.75 bytes of base64 per image byte ON DISK — measured at
+				// 526 KB of base64 inside one session file — and the "browser keeps its images" retention was a
+				// lie, because the file is written either way. The file now holds `{type:"image", mimeType,
+				// hash, bytes}` and the bytes live in the media store (disk when this session's retention is
+				// "server", memory only otherwise). `_ensureEntry` hydrates them back at load; a session whose
+				// bytes are gone is re-attachable from the device that still holds them.
+				const { messages: toWrite } = redactImageData(state.messages, { store: this.media, persist: this.mediaPersistFor(sessionId) });
+				const lines = [JSON.stringify(metadata)];
 		// FULL message objects (2026-10-22): the old {role, content, timestamp}
 		// projection stripped toolResult.toolCallId/toolName — after a restart the
 		// rehydrated history produced tool messages without tool_call_id → provider
 		// 400 on the first prompt ("missing field tool_call_id", nvidia NIM).
 		// stopReason/errorMessage/usage also survive now, so the UI renders errors
 		// and tool rows correctly after reload.
-		for (const m of state.messages) {
+		for (const m of toWrite) {
 			const out = { ...m };
 			if (!out.timestamp) out.timestamp = Date.now();
 			lines.push(JSON.stringify(out));
@@ -745,9 +763,12 @@ export class AgentHub {
 			if (uIdx < 0) return { ok: false, reason: "nothing to retry" };
 			const u = msgs[uIdx];
 			const text = typeof u.content === "string" ? u.content : u.content.filter((b) => b?.type === "text").map((b) => b.text || "").join("\n");
-			const images = Array.isArray(u.content) ? u.content.filter((b) => b?.type === "image") : undefined;
+			// the transcript may hold hash-only image parts (persisted redacted) — hydrate for the model,
+			// and never send a data-less part (external review I2: the bytes may be gone under browser retention)
+			const { images, missing } = this.hydrateImages(Array.isArray(u.content) ? u.content.filter((b) => b?.type === "image") : []);
+			if (missing.length) console.warn(`[agent-hub] retry ${sessionId.slice(0, 8)}: ${missing.length} image(s) have no bytes — resending the text turn only`);
 			entry.agent.state.messages = msgs.slice(0, uIdx);
-			await entry.agent.prompt(text, images?.length ? images : undefined);
+			await entry.agent.prompt(text, images.length ? images : undefined);
 			return { ok: true, mode: "resend", dropped };
 		};
 		const prev = entry.promptLock || Promise.resolve();
@@ -851,7 +872,7 @@ export class AgentHub {
 	 * the WeakMap makes it once per message object (a live turn re-sends whole state frames, and
 	 * re-redacting the same object must not re-decode 8 photos).
 	 */
-	redactMessages(messages) {
+	redactMessages(messages, sessionId = null) {
 		if (!Array.isArray(messages) || !messages.length) return messages;
 		// CACHE PER MESSAGE OBJECT, never per array (grok review 2026-10-25, blocker 4):
 		// `state.messages` is one long-lived array that the agent PUSHES into — caching the container
@@ -865,7 +886,7 @@ export class AgentHub {
 			// once would be returned as the ORIGINAL array (with the inline base64 back) on every later
 			// egress — the leak this whole file exists to prevent (caught by L14 in the suite).
 			if (hit) { changed ||= hit !== m; return hit; }
-			const redacted = redactImageData([m], { store: this.media, persist: this.mediaPersist }).messages[0];
+			const redacted = redactImageData([m], { store: this.media, persist: this.mediaPersistFor(sessionId) }).messages[0];
 			if (redacted !== m) this._redactedMsg.set(m, redacted);
 			changed ||= redacted !== m;
 			return redacted;
@@ -873,10 +894,61 @@ export class AgentHub {
 		return changed ? out : messages;
 	}
 
-	/** RETENTION (Settings → Data use → Image storage): false = keep bytes in memory only. */
+	/**
+	 * RETENTION (Settings → Data use → Image storage): false = keep bytes in memory only.
+	 * Sets the DEFAULT for sessions nobody has expressed an opinion about (the Settings dialog and
+	 * the media POST route use it); a per-session choice goes through `setMediaRetention`.
+	 */
 	setMediaPersist(persist) {
-		this.mediaPersist = persist !== false;
-		return this.mediaPersist;
+		this.mediaDefaultPersist = persist !== false;
+		return this.mediaDefaultPersist;
+	}
+
+	/** One attached device's retention choice for one session (called from the WS frame). */
+	setMediaRetention(sessionId, requesterId, mode) {
+		if (!sessionId) return this.mediaDefaultPersist;
+		const key = String(requesterId || "default");
+		let byRequester = this.mediaRetention.get(sessionId);
+		if (!byRequester) { byRequester = new Map(); this.mediaRetention.set(sessionId, byRequester); }
+		byRequester.set(key, mode === "browser" ? "browser" : "server");
+		const entry = this.sessions.get(sessionId);
+		if (entry) entry.retention = mode === "browser" ? "browser" : "server"; // sticky for the session
+		return this.mediaPersistFor(sessionId);
+	}
+
+	/** A requester went away (socket closed): its vote no longer counts, the sticky choice stays. */
+	clearMediaRetention(requesterId) {
+		const key = String(requesterId || "default");
+		for (const [sessionId, byRequester] of this.mediaRetention) {
+			byRequester.delete(key);
+			if (!byRequester.size) this.mediaRetention.delete(sessionId);
+		}
+	}
+
+	/** The retention in force for ONE session — "browser" wins (strictest: never write the bytes). */
+	mediaPersistFor(sessionId) {
+		const byRequester = sessionId ? this.mediaRetention.get(sessionId) : null;
+		if (byRequester) for (const mode of byRequester.values()) if (mode === "browser") return false;
+		const entry = sessionId ? this.sessions.get(sessionId) : null;
+		if (entry?.retention) return entry.retention !== "browser";
+		return this.mediaDefaultPersist;
+	}
+
+	/**
+	 * User-turn images for a MODEL call: hydrate hashes from the store and DROP parts whose bytes are
+	 * gone — a data-less image part reaches the provider as a broken block. `missing` lets the caller
+	 * tell the user to re-attach instead of silently sending a text-only turn.
+	 */
+	hydrateImages(images) {
+		const list = Array.isArray(images) ? images.filter((im) => im?.type === "image") : [];
+		const out = [], missing = [];
+		for (const part of list) {
+			if (typeof part.data === "string" && part.data) { out.push({ type: "image", mimeType: part.mimeType || "image/png", data: part.data }); continue; }
+			const hit = part.hash ? this.media.get(part.hash) : null;
+			if (!hit?.bytes) { missing.push(part.hash || "?"); continue; }
+			out.push({ type: "image", mimeType: part.mimeType || hit.mimeType || "image/png", data: Buffer.from(hit.bytes).toString("base64") });
+		}
+		return { images: out, missing };
 	}
 
 	/** One egress FRAME (state or agent-event) with every inline image replaced by its hash. */
@@ -885,10 +957,11 @@ export class AgentHub {
 		const out = { ...msg };
 		let changed = false;
 
+		const sessionId = msg.sessionId || null;
 		if (Array.isArray(msg.messages)) {
-			const messages = this.redactMessages(msg.messages);
+			const messages = this.redactMessages(msg.messages, sessionId);
 			// the in-flight snapshot is its own message object → the same per-message cache applies
-			const streaming = msg.streamingMessage ? this.redactMessages([msg.streamingMessage])[0] : msg.streamingMessage;
+			const streaming = msg.streamingMessage ? this.redactMessages([msg.streamingMessage], sessionId)[0] : msg.streamingMessage;
 			if (messages !== msg.messages) { out.messages = messages; changed = true; }
 			if (streaming !== msg.streamingMessage) { out.streamingMessage = streaming ?? null; changed = true; }
 		}
@@ -902,7 +975,7 @@ export class AgentHub {
 
 		const event = msg.event;
 		if (event?.message && Array.isArray(event.message.content)) {
-			const message = this.redactMessages([event.message])[0];
+			const message = this.redactMessages([event.message], sessionId)[0];
 			if (message !== event.message) { out.event = { ...event, message }; changed = true; }
 		}
 
@@ -1004,7 +1077,9 @@ export class AgentHub {
 						// An entry with NO real messages is safe to fill — that is the
 						// poisoned case (created by an attach/prompt that raced the store).
 						// One with messages is a LIVE transcript: never overwrite it.
-						entry.agent.state.messages = normalizeRestoredMessages(stored.messages);
+						entry.agent.state.messages = normalizeRestoredMessages(hydrateImageData(stored.messages, this.media));
+						const gone = missingImageHashes(entry.agent.state.messages);
+						if (gone.length) console.warn(`[agent-hub] ${sessionId.slice(0, 8)}: ${gone.length} image(s) have no bytes on the server (browser retention or media GC) — the owning device must re-attach them`);
 						entry.hydrated = true;
 						if (stored.metadata?.modelId) { const m = this._getModel(stored.metadata.modelId); if (m) entry.agent.state.model = m; }
 						if (stored.metadata?.thinkingLevel) entry.agent.state.thinkingLevel = stored.metadata.thinkingLevel;
@@ -1462,6 +1537,7 @@ export class AgentHub {
 		if (entry.previewTimer) { clearTimeout(entry.previewTimer); entry.previewTimer = null; }
 		this.sessions.delete(sessionId);
 		this.subscribers.delete(sessionId);
+		this.mediaRetention.delete(sessionId); // no session → no retention votes to keep
 		// idle delta with a MAX seq — passes the client's stale-frame guard so the
 		// runtime entry is removed everywhere immediately
 		try { this.onRuntimeChange?.(sessionId, { sessionId, status: "idle", seq: Number.MAX_SAFE_INTEGER }); } catch { /* ignore */ }
@@ -1497,6 +1573,7 @@ export class AgentHub {
 				this._writeSession(id); // force-flush pending debounce
 				this.sessions.delete(id);
 				this.subscribers.delete(id); // SSE subscribers die with the session
+				this.mediaRetention.delete(id); // (the sticky choice went to disk with the session file)
 				console.info(`[agent-hub] evicted idle session ${id.slice(0, 8)}`);
 			}
 		}

@@ -2100,21 +2100,24 @@ function piDefaultModelId() {
  * (grok review 2026-10-25, blocker 5).
  */
 function hydratePromptImages(raw) {
+	// the messy input shape is validated here (at most 4 parts, mimeType required); the bytes come from
+	// agentHub.hydrateImages so the prompt, steer and retry paths share ONE hydration rule
 	const parts = Array.isArray(raw) ? raw.filter((im) => im && im.type === "image" && typeof im.mimeType === "string").slice(0, 4) : [];
-	const images = [], missing = [];
-	for (const im of parts) {
-		if (typeof im.data === "string" && im.data) { images.push({ type: "image", data: im.data, mimeType: im.mimeType || "image/png" }); continue; }
-		if (!isMediaHash(im.hash)) continue;
-		const hit = agentHub.getMedia(im.hash);
-		if (!hit?.bytes) { missing.push(im.hash); continue; }
-		images.push({ type: "image", data: Buffer.from(hit.bytes).toString("base64"), mimeType: im.mimeType || hit.mimeType || "image/png" });
-	}
-	return { images, missing };
+	return agentHub.hydrateImages(parts);
 }
 
 /** Data-reduction debug trace (PI_WEB_DATA_REDUCTION_DEBUG=1): one line per block, so the user can
  *  watch a live turn shrink. Off by default — this is the "let me test it on a debug server" switch. */
 const DR_DEBUG = process.env.PI_WEB_DATA_REDUCTION_DEBUG === "1";
+
+/** A stable id for one agent socket (retention votes and other per-connection state are keyed by it). */
+const socketIds = new WeakMap();
+let socketSeq = 0;
+function socketId(ws) {
+	let id = socketIds.get(ws);
+	if (!id) { id = `ws${++socketSeq}`; socketIds.set(ws, id); }
+	return id;
+}
 
 const agentHub = new AgentHub({
 	modelsStore: piModelsStore,
@@ -2338,7 +2341,7 @@ async function pushWatched(id) {
 	// same shape as the explicit "get" branch: the worker returns
 	// {jsonl, metadata, messages} — the old `data: j.data` was undefined, so
 	// watched-session notifications carried NO body (P2 fix)
-	const payload = JSON.stringify({ type: "session", id, data: { messages: agentHub.redactMessages(j.messages) }, metadata: j.metadata });
+	const payload = JSON.stringify({ type: "session", id, data: { messages: agentHub.redactMessages(j.messages, id) }, metadata: j.metadata });
 	for (const c of syncClients) {
 		if (c.watch.has(id) && c.ws.readyState === 1 && c.ws.bufferedAmount <= MAX_BUFFERED) c.ws.send(payload);
 	}
@@ -2436,7 +2439,7 @@ function syncConn(ws) {
 				// worker returns {jsonl, metadata, messages} — expose as data:{messages} for clients.
 				// jsonl is NOT sent: the client only reads data/metadata, and it carried a second, raw
 				// copy of every inline image — the biggest egress leak in the app (2026-10-25).
-				if (j) safeSend(ws, { type: "session", id, data: { messages: agentHub.redactMessages(j.messages) }, metadata: j.metadata });
+				if (j) safeSend(ws, { type: "session", id, data: { messages: agentHub.redactMessages(j.messages, id) }, metadata: j.metadata });
 			} else if (m.type === "watch" && SESSION_ID_RE.test(id)) {
 				client.watch.add(id);
 				pushWatched(id).catch(() => {});
@@ -2498,6 +2501,8 @@ function agentConn(ws) {
 					// attach() now hydrates the entry itself before snapshotting (2026-10-24) —
 					// await it so the first frame can never be an empty pre-hydration state
 					await agentHub.attach(currentSession, (msg) => safeSend(ws, msg), { tailFirst: !!m.tailFirst, haveTo: Number(m.haveTo) || 0 });
+					// a socket that already told us its image retention applies it to the session it just attached
+					if (ws.__mediaRetention) agentHub.setMediaRetention(currentSession, socketId(ws), ws.__mediaRetention);
 					break;
 				}
 				case "prompt": {
@@ -2573,8 +2578,12 @@ function agentConn(ws) {
 						}, 250);
 						ws.__reducerTimer.unref?.();
 					}
-					// RETENTION rides along with the same setting: "browser" must not write images to disk
-					agentHub.setMediaPersist(m?.imageRetention !== "browser");
+					// RETENTION rides along with the same setting, but it is PER SESSION and PER SOCKET
+					// (external review I3, 2026-10-28): the old code assigned the hub-wide flag here, so the
+					// last device to attach decided for every session and the value stuck after it left. The
+					// vote is remembered on the socket and re-applied on attach; "browser" wins while present.
+					ws.__mediaRetention = m?.imageRetention === "browser" ? "browser" : "server";
+					if (currentSession) agentHub.setMediaRetention(currentSession, socketId(ws), ws.__mediaRetention);
 					safeSend(ws, {
 						type: "data-reduction", id: m.id, ok: true, enabled: reduction.reducer.enabled,
 						streamMode: reduction.cfg?.streamMode ?? "live",
@@ -2677,8 +2686,13 @@ function agentConn(ws) {
 			safeSend(ws, { type: "error", id: m.id, error: err.message });
 		}
 	});
-	ws.on("close", () => { clearInterval(ws.__reducerTimer); ws.__reducerTimer = null; if (currentSession) { detachAgentClient(currentSession, ws); agentHub.emitRuntime(currentSession); } });
-	ws.on("error", () => { clearInterval(ws.__reducerTimer); ws.__reducerTimer = null; if (currentSession) { detachAgentClient(currentSession, ws); agentHub.emitRuntime(currentSession); } });
+	const dropSocket = () => {
+		clearInterval(ws.__reducerTimer); ws.__reducerTimer = null;
+		agentHub.clearMediaRetention(socketId(ws)); // this device's image-retention vote dies with it
+		if (currentSession) { detachAgentClient(currentSession, ws); agentHub.emitRuntime(currentSession); }
+	};
+	ws.on("close", dropSocket);
+	ws.on("error", dropSocket);
 }
 
 function attachAgentClient(sessionId, ws) {
@@ -2914,7 +2928,7 @@ app.get("/api/agent/session/:id/range", async (c) => {
 		// to fill its prefix (fillWindow -> IDB), so the image win was not achieved end-to-end. Redacting
 		// after the window is computed keeps the seq accounting intact (ids/seqs are untouched).
 		const rawSlice = start >= end ? [] : range.messages.slice(start - range.fromSeq, end - range.fromSeq);
-		const slice = rawSlice.length ? agentHub.redactMessages(rawSlice) : rawSlice;
+		const slice = rawSlice.length ? agentHub.redactMessages(rawSlice, id) : rawSlice;
 		const ndjson = slice.map((m) => JSON.stringify(m)).join("\n");
 		// 204 MUST NOT carry a body (RFC 9110) — the headers alone describe the empty
 		// window, and the client keys its "nothing more to load" decision off re <= rs.

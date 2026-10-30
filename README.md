@@ -67,7 +67,9 @@ From another device (phone, LAN, DDNS): non-loopback peers need the API token, w
 - Steering: sending mid-run holds the message as a chip (✎ pull back, ✕ cancel) and injects it at the next step boundary.
 - Retry resumes at the failed call; auto-retry covers rate-limit, network and transient 5xx errors (3×3s, configurable).
 - Thinking blocks collapse; thinking level is switchable from the composer or Settings.
-- Attachments: workspace text files inlined as fenced blocks, images as `ImageContent`, both as clickable chips.
+- Attachments: workspace text files inlined as fenced blocks, images encoded to the *Images* level
+  (resize + webp) and uploaded as binary — the prompt carries a content hash, and the model gets the
+  bytes back server-side.
 - Compact summarizes older history in place and keeps the recent tail; every ✎ edit parks a restorable version.
 
 **Sessions**
@@ -89,7 +91,8 @@ From another device (phone, LAN, DDNS): non-loopback peers need the API token, w
 - Keyless OpenAI-compatible endpoints work as-is, so local llama.cpp/vLLM/Ollama servers need no credentials.
 
 **Settings**
-- Model and thinking level, turns visible, API keys (import from pi or add), Data use (image level, stream level, image retention), theme, server token, auto-retry.
+- Model and thinking level, turns visible, API keys (import from pi or add), Data use (image level,
+  stream level, image retention per device), theme, server token, auto-retry.
 
 ## Source
 

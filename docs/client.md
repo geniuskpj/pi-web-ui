@@ -228,48 +228,50 @@ hub through the optional `agent.setDataReduction()`).
 Every DECISION is pure and tested (`lib/data-reduction.mjs` → `resolveDataReduction()` /
 `planImageTransform()` / `planResizeTarget()`; `lib/thinking-flush.mjs` → `resolveThinkingPolicy()` /
 `resolveStreamPolicy()`; pinned by `tests/data-reduction.test.mjs` and `tests/thinking-flush.test.mjs`).
-The IMAGE half is enforced in the composer — **not wired yet**, and this is the contract for it.
+The IMAGE half is enforced in the composer: `src/image-encode.ts` (the pixels) + the pure planner
+(the decisions). `tests/data-reduction.test.mjs` §I1 pins the wiring.
 
 ### Where the bytes are born (`src/ui/chat.tsx`)
 
-| step | code (names are the anchors — line numbers drift) | today | after wiring |
-|---|---|---|---|
-| file/folder picker | `addPicked(f)` — `GET /api/ws/file?path=…` returns `{kind:"image", base64, mimeType}` (8MB cap, token always required; `src/ui/file-picker.tsx` fetches it) | pushes `{name, data, mimeType, preview}` (base64) into `images` | `base64 → Blob → encodeForModel()` → `POST …/media` → push `{hash, mimeType, bytes, previewUrl}` |
-| clipboard paste | `onAddImage(name, data, mimeType)` (Editor paste handler, data URL) | same shape | decode the data URL to a Blob → the same path |
-| steer/stop recall | `onAddImage(...)` from the recalled `pendingPrompt.images` | inline base64 re-attached | hash parts → `media.ts` hydration (`hydrateImageParts`) |
-| restored message attachments | `onRestoreAttachments(files, imgs)` (edit/regenerate an old turn) | inline base64 from the transcript | hydration only — **never re-encode** |
-| chip render | `<img src={im.preview}>` | `preview` = full `data:` URL (a second copy of the base64 in memory) | `URL.createObjectURL(encodedBlob)` (revoked on remove/clear) or the media URL |
-| pre-send guard | `imageBytes > 12MB → note(...)` | sums `data.length * 0.75` | the encoded size returned by the POST — should never fire |
-| send | `images.map((im) => ({ type: "image", data, mimeType }))` → `agent.prompt(text, imgs)` | base64 in the frame | `{type:"image", mimeType, hash, bytes}` — no base64 up, none in the session file |
+Every add path funnels through **`addAttachment(name, src, { encode })`** — one place that decides,
+encodes, uploads and pushes the chip:
 
-The composer still sends inline base64 today; the server redacts it on egress (attach/`/range`/history)
-and stores the bytes. Wiring the composer is the step that removes the LAST base64 from the upload path.
+| step | code (names are the anchors — line numbers drift) | what happens now |
+|---|---|---|
+| file/folder picker | `addPicked(f)` — the picker fetches `{kind:"image", base64, mimeType}` (8MB cap, token always required) | `base64 → Blob → encodeForModel()` → `POST …/media` → `{hash, mimeType, bytes}` |
+| clipboard paste | `onAddImage(name, file, mimeType)` — the paste handler hands over the **Blob** | same funnel; a 12MP paste is never materialised as base64 in the handler |
+| steer/stop recall | `onAddImage(..., im.data, im.mimeType, im.hash)` | the hash travels along, `encode: false` — the bytes are already on the server, nothing is re-encoded or re-uploaded |
+| restored message attachments | `onRestoreAttachments(files, imgs)` (edit/regenerate) | hydration only — **never re-encode** (same rule as above) |
+| chip render | `<img src={im.preview}>` | `preview` = `data:` URL of the **encoded** bytes (≤ the level's byte cap, not the original) |
+| pre-send guard | `imageBytes > 12MB → note(...)` | sums `im.bytes` (the encoded size) with a `data.length * 0.75` fallback |
+| send | `images.map(...)` → `agent.prompt(text, imgs)` | `{type:"image", mimeType, hash, bytes}` when uploaded, else `{data}` — so no base64 travels up, none is in the transcript, none is in the session file |
 
-### The one function to add (`src/image-encode.ts`)
+A failed upload (offline, older server) keeps the base64 and the inline path still works — the composer
+never loses an image because of the transport.
 
-```ts
-// pure decision (tested) + browser bytes (not testable in CI)
-export async function encodeForModel(file: Blob & { name?: string }, policy = resolvedImagePolicy()) {
-  const plan = planImageTransform({ mimeType: file.type, bytes: file.size, width: 0, height: 0 }, policy);
-  if (plan.action === "passthrough") return { blob: file, mimeType: file.type, note: plan.reason, resized: false };
-  // ✔ downscale AT DECODE: 12MP is never fully materialized (the low-end-iOS OOM trap)
-  const bmp = await createImageBitmap(file, {
-    imageOrientation: "from-image",                       // EXIF is applied for us
-    resizeWidth: plan.target.width, resizeHeight: plan.target.height, resizeQuality: "high",
-  }).catch(() => null);
-  if (!bmp) return { blob: file, mimeType: file.type, note: "couldn't recompress — sending original", resized: false };
-  const canvas = typeof OffscreenCanvas === "function"
-    ? new OffscreenCanvas(bmp.width, bmp.height)
-    : Object.assign(document.createElement("canvas"), { width: bmp.width, height: bmp.height });
-  canvas.getContext("2d").drawImage(bmp, 0, 0); bmp.close?.();   // one scale factor, both axes
-  const blob = await toBlobWebpThenJpeg(canvas, plan.quality);    // OffscreenCanvas.convertToBlob | canvas.toBlob
-  if (!blob || blob.size >= file.size) return { blob: file, mimeType: file.type, note: null, resized: false };
-  return { blob, mimeType: blob.type, note: `${plan.reason} → ${plan.target.width}×${plan.target.height}`, resized: true };
-}
-```
+### `src/image-encode.ts` (the browser half)
 
-Then `blob → base64` (FileReader/`arrayBuffer()`) **once**, and the four add/restore call sites above pass
-through it.
+`encodeForModel(file, policy = resolvedImagePolicy())` → `{ blob, mimeType, bytes, width, height, resized, note }`
+and `uploadImage(blob, mimeType, sessionId)` → `{ hash, mimeType, bytes } | null`. Order matters:
+
+1. **Decide before decoding.** `mode: "original"`, a `PASSTHROUGH_MIME` format (svg/gif/heic…), or a file
+   already inside the level's byte budget returns the original **without touching a decoder** — a
+   screenshot never materialises.
+2. **One capped decode.** `createImageBitmap(file, { imageOrientation: "from-image", resizeWidth: cap })`:
+   a single axis preserves the aspect ratio, so a 12MP photo is never fully materialized (the
+   low-end-iOS OOM trap). EXIF orientation is applied by the decoder, so the bitmap's dims are the
+   oriented ones and `planImageTransform` gets them with `orientation: 1`.
+3. **Plan, then draw.** `planImageTransform({ mimeType, bytes, width: bmp.width, height: bmp.height }, policy)`
+   returns the exact target + quality (`planResizeTarget`, byte cap + resolution cap + floor, quality
+   ladder). The canvas draws the bitmap into that target (one scale factor, both axes).
+4. **webp, then jpeg.** `convertToBlob`/`toBlob("image/webp")` first; a browser that answers with a
+   non-webp type (Safari, old Chrome) gets the jpeg retry. JPEG is only the fallback — it flattens alpha.
+5. **Keep it only if it is smaller** (`blob.size < file.size`) and ≤ the 8MB upload cap, otherwise the
+   original is sent unchanged. Every failure path returns the ORIGINAL blob: the composer never loses an
+   image, and `note` (the plan's reason, or "couldn't decode…") is surfaced in the attach note.
+6. **Upload binary.** `POST /api/agent/session/:id/media` with `mediaUploadHeaders()` (`Content-Type` +
+   `x-pi-media-retention` from the localStorage setting) and the token for non-loopback peers. `null` on
+   any failure, and the caller keeps the base64 fallback.
 
 Notes worth keeping:
 
@@ -285,8 +287,12 @@ Notes worth keeping:
    orientation (the pure layer swaps the axes for 5–8).
 6. Alpha: WebP keeps it, JPEG flattens onto white — that is why JPEG is only the runtime fallback
    (Safari / old Chrome return a non-webp blob).
-7. Encode **on add**, not on send (≤4 images, bounded work; the send stays instant) and revoke the object
-   URL on remove/clear so the preview cannot leak memory.
+7. Encode **on add**, not on send (≤4 images, bounded work; the send stays instant). The chip preview is
+   the `data:` URL of the ENCODED bytes — one extra in-memory copy, rooted out when the attachment is
+   removed or sent (`URL.createObjectURL` was the alternative, but every drop path would have to revoke).
+8. The upload knows nothing about the session policy: the retention HEADER is what makes the POST
+   memory-only, and the same choice is pushed over the WS so the hub's own writes agree (see `server.md`
+   §Retention).
 
 ## Session loading (tail-first) + IndexedDB cache
 

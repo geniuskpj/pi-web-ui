@@ -226,9 +226,48 @@ const msg = (text, parts = []) => ({ role: "user", content: [{ type: "text", tex
 		/pushDataReduction\(agent\)/.test(fs.readFileSync(path.join(ROOT, "src/ui/settings.tsx"), "utf8")));
 }
 
+// ─── I1: the COMPOSER applies the policy and sends hashes (external review I1, 2026-10-28)
+// The level used to be decoration: `planImageTransform` had no production caller, every add path
+// pasted the file's own base64, and the Settings text ("≤1024 px · 256 KB · webp q0.65") described
+// work that never happened. Now one funnel encodes, uploads, and keeps the content address.
+{
+	const chat = fs.readFileSync(path.join(ROOT, "src/ui/chat.tsx"), "utf8");
+	const enc = fs.readFileSync(path.join(ROOT, "src/image-encode.ts"), "utf8");
+	check("I1a ONE funnel encodes with the pure planner and uploads the bytes",
+		/import \{ base64ToBlob, blobToBase64, encodeForModel, uploadImage \} from "\.\.\/image-encode\.js";/.test(chat) &&
+		/await encodeForModel\(blob\)/.test(chat) && /await uploadImage\(blob, mimeType, currentSessionId\(agent\)\)/.test(chat));
+	check("I1b a pasted photo is handed over as a BLOB (no base64 round trip in the paste handler)",
+		/onAddImage\(file\.name \|\| "pasted-image", file, file\.type/.test(chat) && !/readAsDataURL\(/.test(chat));
+	check("I1c the send frame carries a HASH when the upload succeeded (base64 only as the fallback)",
+		/im\.hash\n\s*\? \{ type: "image", mimeType: im\.mimeType, hash: im\.hash, bytes: im\.bytes \}/.test(chat) &&
+		/: \{ type: "image", mimeType: im\.mimeType, data: im\.data \}\)\)/.test(chat));
+	check("I1d the pre-send size guard counts the ENCODED size, not the original",
+		/images\.reduce\(\(n, im\) => n \+ \(im\.bytes \?\?/.test(chat));
+	check("I1e a recalled steer keeps its hash and is NOT re-encoded or re-uploaded",
+		/\{ encode: !hash \}/.test(chat) && /hash: im\.hash, bytes: im\.bytes \}, \{ encode: false \}/.test(chat));
+	check("I1f a server-side retry sends the hashes back (the hub hydrates them)",
+		/serverSide[\s\S]{0,160}\? rawImgs\.map/.test(chat) && /hash: im\.hash \}/.test(chat));
+	check("I1g the encoder decides BEFORE it decodes (a file inside the byte budget is never materialised)",
+		enc.includes("if (bytes <= budget") && enc.indexOf("if (bytes <= budget") < enc.indexOf("createImageBitmap("));
+	check("I1h …and the single decode is capped on ONE axis, so the aspect ratio survives",
+		/resizeWidth: cap/.test(enc) && !/resizeHeight:/.test(enc));
+	check("I1i a failed upload/decode leaves the ORIGINAL bytes in place (no image is ever lost)",
+		/if \(!r\.ok\) return null;/.test(enc) && (enc.match(/return original;/g) || []).length >= 3);
+	check("I1j the upload posts BINARY with the retention header (never a base64 body)",
+		/mediaUploadHeaders\(mimeType \|\| blob\.type \|\| "image\/png"\)/.test(enc) && /method: "POST"/.test(enc) && /body: blob,/.test(enc));
+	check("I1k the numbers the UI shows and the numbers the encoder uses come from ONE resolver",
+		/planImageTransform\(\{ mimeType, bytes, width: bmp\.width, height: bmp\.height \}, policy\)/.test(enc) &&
+		/policy: ImagePolicy = resolvedImagePolicy\(\)/.test(enc));
+}
+
 // ─── L3: the HUB's egress cache and retention (grok review 2026-10-25, blocker 4 + should-fix)
 {
-	const hubStub = (store) => ({ media: store, mediaPersist: true, _redactedMsg: new WeakMap() });
+	// the retention API is per SESSION now (external review I3): the stub carries the real rules
+	const hubStub = (store) => ({
+		media: store, mediaDefaultPersist: true, mediaRetention: new Map(), sessions: new Map(),
+		_redactedMsg: new WeakMap(),
+		mediaPersistFor: AgentHub.prototype.mediaPersistFor,
+	});
 	const redactWith = (hub, msgs) => AgentHub.prototype.redactMessages.call(hub, msgs);
 
 	const hub = hubStub(createMediaStore());
@@ -251,7 +290,7 @@ const msg = (text, parts = []) => ({ role: "user", content: [{ type: "text", tex
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-hub-media-"));
 	try {
 		const browserish = hubStub(createMediaStore({ dir }));
-		browserish.mediaPersist = false;
+		browserish.mediaDefaultPersist = false;
 		const shrunk = redactWith(browserish, [msg("keep it local", [imagePart(60, "image/png", 0x41)])]);
 		const h = shrunk[0].content[1].hash;
 		check("L15 retention 'browser' also applies to egress redaction (no disk write)",
@@ -262,6 +301,28 @@ const msg = (text, parts = []) => ({ role: "user", content: [{ type: "text", tex
 		check("L15b retention 'server' (default) writes the blob to disk",
 			fs.existsSync(path.join(dir, h2.slice(0, 2), h2)) && serverish.media.get(h2)?.persisted === true);
 	} finally { fs.rmSync(dir, { recursive: true, force: true }); }
+
+	// PER-SESSION retention (external review I3, 2026-10-28): it used to be ONE hub-wide boolean, so
+	// the last device to attach decided for every session on the server — and stuck after it left.
+	const rr = { mediaDefaultPersist: true, mediaRetention: new Map(), sessions: new Map(), mediaPersistFor: AgentHub.prototype.mediaPersistFor };
+	const setRet = (sid, req, mode) => AgentHub.prototype.setMediaRetention.call(rr, sid, req, mode);
+	const eff = (sid) => AgentHub.prototype.mediaPersistFor.call(rr, sid);
+	const A = "aaaa0000000000000000000000000001", B = "bbbb0000000000000000000000000002";
+	check("I3a a session nobody spoke about keeps the default (server)", eff(A) === true && eff(B) === true);
+	setRet(A, "phone", "browser");
+	check("I3b 'browser' applies to THAT session only", eff(A) === false && eff(B) === true, `A=${eff(A)} B=${eff(B)}`);
+	setRet(B, "laptop", "server");
+	check("I3c a second device on another session cannot leak its choice across", eff(A) === false && eff(B) === true);
+	setRet(A, "laptop", "server");
+	check("I3d on ONE session the strictest wins (one 'browser' vote is enough)",
+		eff(A) === false, `A=${eff(A)} (votes: phone=browser, laptop=server)`);
+	AgentHub.prototype.clearMediaRetention.call(rr, "phone");
+	check("I3e a disconnected device stops voting…", eff(A) === true, `A=${eff(A)} (laptop=server remains)`);
+	// …but the session's last explicit choice stays on the ENTRY (sticky), so a phone that said
+	// "browser" cannot be undone by its own disconnect
+	rr.sessions.set(B, { retention: "browser" });
+	AgentHub.prototype.clearMediaRetention.call(rr, "laptop");
+	check("I3f …and the session's last explicit choice stays sticky after every device leaves", eff(B) === false);
 }
 
 // ─────────────────────────────────────── I: what happens to one image (§2.2a, §6.2)
