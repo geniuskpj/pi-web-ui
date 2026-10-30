@@ -63,6 +63,14 @@ handler with a `setTimeout`/`AbortController` held in a ref (`onSearchQuery` in 
 that found it: a throwaway `window.__probe = (window.__probe||0)+1` / `window.__probeDeps = [q]` inside the
 effect, then read it over `cdp_eval` after driving the UI (cheaper than reasoning about the framework).
 
+### Diagnostic tools in `ws-diag/` (kept, not tests)
+`npm run bench:data` → `data-reduction.bench.mjs` (measured frame/byte table), `simple-llm-timing.mjs`
+(per-stage provider timing over raw sockets: socket → tls → ttfb → firstByte, alone vs N in parallel — the
+way to tell an endpoint queue from a local stall), `log-proxy.mjs` (transparent proxy that records any
+client's request body, e.g. the pi CLI's, for field-by-field comparison), `dump-model.mjs` (what the merged
+catalog actually resolves for one model id), `web-vs-tui-ab.mjs` (interleaved CLI vs web comparison in the
+same minute — absolute timings swing 2s→100s, so only paired numbers mean anything).
+
 ### Boot breadcrumbs (compile-time gated)
 ```ts
 dlog.debug("[init]", since(), "boot model:", bootModel.id);
