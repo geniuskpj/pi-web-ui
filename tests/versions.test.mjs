@@ -52,6 +52,21 @@ const base = [user("q1"), asst("a1"), user("q2"), asst("a2"), user("q3"), asst("
 hub.getSession(S, { messages: base.map((m) => structuredClone(m)) });
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
+// --- 0) CONCURRENT appends (review 2026-10-28): append() is a read-modify-write, so
+// simultaneous parks for ONE session used to compute the same next vid — get() then
+// reached only the first of the collided records and the other was unrestorable.
+// Measured before the per-id chain: 6 appends → vids [1,1,1,1,1,1].
+const RACE = "versionsrace0000000000000000000";
+const raced = await Promise.all([0, 1, 2, 3, 4, 5].map((i) => versions.append(RACE, { turn: i, messages: [user(`race${i}`)] })));
+const racedVids = raced.map((r) => r.vid);
+const racedRows = await versions.list(RACE);
+const racedReachable = (await Promise.all(racedVids.map((v) => versions.get(RACE, v)))).filter(Boolean);
+check(
+	"concurrent appends get DISTINCT, reachable vids",
+	new Set(racedVids).size === racedVids.length && racedRows.length === racedVids.length && racedReachable.length === racedVids.length,
+	`vids=${JSON.stringify(racedVids)} rows=${racedRows.length} reachable=${racedReachable.length}`,
+);
+
 // --- 1) edit an OLDER message (turn 2): delta captured, active truncated ------
 const r1 = await hub.rewriteSession(S, 2);
 check("rewrite captures a version delta", r1?.ok && r1.version?.vid === 1 && r1.version?.turn === 2 && r1.version?.count === 4, JSON.stringify(r1?.version && { vid: r1.version.vid, turn: r1.version.turn, count: r1.version.count }));
