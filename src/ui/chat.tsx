@@ -49,6 +49,10 @@ const PARTIAL_STORE_MAX = 4096; // cap UI-only partial strings (bash can stream 
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 const HLJS_MAX_INPUT = 20000; // ReDoS guard: hljs grammars don't throw on pathological input
 
+// one attachment in the composer: `hash` = the bytes live on the server (so the send carries a
+// reference), `data` = the encoded base64, used for the chip preview and as the offline fallback
+type ComposerImage = { name: string; data: string; mimeType: string; preview: string; hash?: string; bytes?: number };
+
 // stable message keys: retry/edit/injected messages (P2) shift indices, which
 // would remount every later bubble and collapse all <details>. WeakMap ids are
 // assigned on first sight and live as long as the message object.
@@ -768,7 +772,13 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 	const [textFiles, setTextFiles] = useState<Array<{ path: string; content: string }>>([]);
 	// `hash` = the bytes are on the server (the composer then sends a hash, not base64); `data` stays as
 	// the chip preview AND as the fallback when the upload did not go through
-	const [images, setImages] = useState<Array<{ name: string; data: string; mimeType: string; preview: string; hash?: string; bytes?: number }>>([]);
+	const [images, setImages] = useState<ComposerImage[]>([]);
+	// how many attachments are still encoding/uploading — send() waits for them (see addAttachment)
+	const pendingAttach = useRef(0);
+	// the composer reads the CURRENT images at send time: after waiting for an in-flight attach, the
+	// props it renders with are already stale, and the photo would be left behind
+	const imagesRef = useRef<ComposerImage[]>([]);
+	imagesRef.current = images;
 	const [attachNote, setAttachNote] = useState("");
 	const [picker, setPicker] = useState<{ open: boolean; initialFile: string | null }>({ open: false, initialFile: null });
 	// terminal dock state (panel itself is src/ui/terminal.tsx; opened from the
@@ -887,6 +897,9 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 	const addAttachment = async (name: string, src: { base64?: string; blob?: Blob; hash?: string; bytes?: number; mimeType?: string }, opts: { encode?: boolean } = {}) => {
 		const { encode = true } = opts;
 		let mimeType = src.mimeType || src.blob?.type || "image/png";
+		// a paste encodes + uploads asynchronously: count it as in flight so a fast Send can WAIT for it
+		// instead of silently dropping the photo, and so the 4-image cap counts it (grok review 2026-10-28)
+		pendingAttach.current += 1;
 		try {
 			let blob: Blob | null = src.blob ?? (src.base64 ? base64ToBlob(src.base64, mimeType) : null);
 			let noteText: string | null = null;
@@ -907,13 +920,15 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 			if (!data && !hash) { note("could not read that image"); return; }
 			let full = false;
 			setImages((prev) => {
-				if (prev.length >= MAX_IMAGE_ATTACH) { full = true; return prev; }
+				if (prev.length + pendingAttach.current > MAX_IMAGE_ATTACH) { full = true; return prev; }
 				return [...prev, { name, mimeType, data, preview: data ? `data:${mimeType};base64,${data}` : "", hash, bytes }];
 			});
 			if (full) note(`max ${MAX_IMAGE_ATTACH} images`);
 			if (noteText) note(`image: ${noteText}`);
 		} catch (err: any) {
 			note(`could not attach that image (${err?.message || "unknown"})`);
+		} finally {
+			pendingAttach.current -= 1;
 		}
 	};
 
@@ -1559,6 +1574,8 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 					onPickModel={() => window.dispatchEvent(new CustomEvent("pi-open-model-selector"))}
 				textFiles={textFiles}
 				images={images}
+				getImages={() => imagesRef.current}
+				pendingAttach={pendingAttach}
 				attachNote={attachNote}
 				onRemoveTextFile={(p) => setTextFiles((prev) => prev.filter((x) => x.path !== p))}
 				onRemoveImage={(idx) => setImages((prev) => prev.filter((_, j) => j !== idx))}
@@ -1667,6 +1684,8 @@ export function Editor({
 	steerDraft,
 	textFiles,
 	images,
+	getImages,
+	pendingAttach,
 	attachNote,
 	onRemoveTextFile,
 	onRemoveImage,
@@ -1682,7 +1701,11 @@ export function Editor({
 	onPickModel?: () => void;
 	steerDraft?: { text: string; seq: number } | null;
 	textFiles: Array<{ path: string; content: string }>;
-	images: Array<{ name: string; data: string; mimeType: string; preview: string; hash?: string; bytes?: number }>;
+	images: ComposerImage[];
+	/** The composer reads the CURRENT list at send time (an in-flight attach must not be dropped). */
+	getImages: () => ComposerImage[];
+	/** In-flight encodes/uploads; send() waits for this to reach 0 before it reads the list. */
+	pendingAttach: { current: number };
 	attachNote: string;
 	onRemoveTextFile: (path: string) => void;
 	onRemoveImage: (idx: number) => void;
@@ -1803,7 +1826,12 @@ export function Editor({
 
 	const send = async () => {
 		const text = value.trim();
-		const hasAttachments = textFiles.length > 0 || images.length > 0;
+		// a paste/upload may still be in flight: wait for it (bounded), then read the CURRENT images — a
+		// fast Send used to fire before setImages landed and silently drop the photo (grok review 2026-10-28)
+		const waited = Date.now();
+		while (pendingAttach.current > 0 && Date.now() - waited < 15000) await new Promise((r) => setTimeout(r, 50));
+		const attached = getImages();
+		const hasAttachments = textFiles.length > 0 || attached.length > 0;
 		// server-side agent: a send DURING a run becomes a steering message (held
 		// until the current thinking/toolcall completes) — allowed. The local
 		// in-browser loop throws on concurrent prompts, so it still blocks.
@@ -1816,7 +1844,9 @@ export function Editor({
 		}
 		// WS payload cap: /ws/agent frames over 25MB kill the socket — cap total
 		// image bytes (raw ≈ base64×0.75) at 12MB (grok r3: 4×8MB ≈ 42MB base64)
-		const imageBytes = images.reduce((n, im) => n + (im.bytes ?? Math.floor((im.data?.length || 0) * 0.75)), 0);
+		// the cap protects the WS FRAME (25MB), so only an image that still travels INLINE counts — a
+		// hash-only part is a few dozen bytes (grok review 2026-10-28)
+		const imageBytes = attached.reduce((n, im) => n + (im.hash ? 0 : (im.bytes ?? Math.floor((im.data?.length || 0) * 0.75))), 0);
 		if (imageBytes > 12 * 1024 * 1024) {
 			onNote("attachments too large (>12MB total) — remove an image");
 			return;
@@ -1848,14 +1878,14 @@ export function Editor({
 			// kilobytes instead of megabytes. `data` is the fallback when the upload did not go through.
 			// `hash`/`bytes` are WIRE fields (pi-agent-core's ImageContent has no hash) — the hub replaces them
 			// with the bytes it stores before the model call, so the cast is deliberate
-			const imgs: any[] = images.map((im) => (im.hash
+			const imgs: any[] = attached.map((im) => (im.hash
 				? { type: "image", mimeType: im.mimeType, hash: im.hash, bytes: im.bytes }
 				: { type: "image", mimeType: im.mimeType, data: im.data }));
 			// empty text + images → a single space: Anthropic rejects empty text blocks
 			const outText = fullText || (imgs.length ? " " : "");
 			const restoreRaw = value; // untrimmed pre-send value
 			const restoreFiles = textFiles;
-			const restoreImages = images;
+			const restoreImages = attached;
 			onClearAttachments();
 			// steering path awaits the hub's accept/reject: a rejected steer (depth 1
 			// lost a race with another device, hub timeout) must NOT destroy the text

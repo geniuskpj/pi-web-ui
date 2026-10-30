@@ -252,23 +252,29 @@ never loses an image because of the transport.
 ### `src/image-encode.ts` (the browser half)
 
 `encodeForModel(file, policy = resolvedImagePolicy())` → `{ blob, mimeType, bytes, width, height, resized, note }`
-and `uploadImage(blob, mimeType, sessionId)` → `{ hash, mimeType, bytes } | null`. Order matters:
+and `uploadImage(blob, mimeType, sessionId)` → `{ hash, mimeType, bytes } | null`. The SIZE comes from
+`lib/image-dims.mjs` (pure header parser: PNG/JPEG/GIF/WebP/BMP, no decoder), which is what lets the
+resolution cap bind without materialising anything. Order matters:
 
-1. **Decide before decoding.** `mode: "original"`, a `PASSTHROUGH_MIME` format (svg/gif/heic…), or a file
-   already inside the level's byte budget returns the original **without touching a decoder** — a
-   screenshot never materialises.
-2. **One capped decode.** `createImageBitmap(file, { imageOrientation: "from-image", resizeWidth: cap })`:
+1. **Decide before decoding.** `mode: "original"`, a `PASSTHROUGH_MIME` format (svg/gif/heic…), or an
+   image that satisfies BOTH budgets *as measured from the header* returns the original **without
+   touching a decoder** — a screenshot never materialises, and a small-but-5000px-wide PNG is still
+   caught (the pure planner checks both budgets; the header is what makes that possible without pixels).
+   A file whose header cannot be read (exotic/truncated) falls back to the byte budget.
+2. **One capped decode.** `createImageBitmap(file, { imageOrientation: "from-image", resizeWidth: min(cap, width) })`:
    a single axis preserves the aspect ratio, so a 12MP photo is never fully materialized (the
-   low-end-iOS OOM trap). EXIF orientation is applied by the decoder, so the bitmap's dims are the
-   oriented ones and `planImageTransform` gets them with `orientation: 1`.
+   low-end-iOS OOM trap) — and because a resize axis is a *target*, clamping it to the header width is
+   what stops a narrow source from being upscaled. EXIF orientation is applied by the decoder, so the
+   bitmap's dims are the oriented ones and `planImageTransform` gets them with `orientation: 1`.
 3. **Plan, then draw.** `planImageTransform({ mimeType, bytes, width: bmp.width, height: bmp.height }, policy)`
    returns the exact target + quality (`planResizeTarget`, byte cap + resolution cap + floor, quality
    ladder). The canvas draws the bitmap into that target (one scale factor, both axes).
 4. **webp, then jpeg.** `convertToBlob`/`toBlob("image/webp")` first; a browser that answers with a
    non-webp type (Safari, old Chrome) gets the jpeg retry. JPEG is only the fallback — it flattens alpha.
-5. **Keep it only if it is smaller** (`blob.size < file.size`) and ≤ the 8MB upload cap, otherwise the
-   original is sent unchanged. Every failure path returns the ORIGINAL blob: the composer never loses an
-   image, and `note` (the plan's reason, or "couldn't decode…") is surfaced in the attach note.
+5. **Replace the original when the encode is smaller** — or when the source was over the RESOLUTION cap
+   and the result at least fits the byte budget (the resolution cap is about what the model sees, so it
+   wins over a few kilobytes). Anything else, and any failure, returns the ORIGINAL blob: the composer
+   never loses an image, and `note` (the plan's reason, or "couldn't decode…") lands in the attach note.
 6. **Upload binary.** `POST /api/agent/session/:id/media` with `mediaUploadHeaders()` (`Content-Type` +
    `x-pi-media-retention` from the localStorage setting) and the token for non-loopback peers. `null` on
    any failure, and the caller keeps the base64 fallback.
@@ -290,6 +296,10 @@ Notes worth keeping:
 7. Encode **on add**, not on send (≤4 images, bounded work; the send stays instant). The chip preview is
    the `data:` URL of the ENCODED bytes — one extra in-memory copy, rooted out when the attachment is
    removed or sent (`URL.createObjectURL` was the alternative, but every drop path would have to revoke).
+   Because the work is async, `addAttachment` keeps a `pendingAttach` count and `send()` WAITS for it
+   (bounded, 15s) and then reads the LIVE list through `getImages()` — otherwise a fast Enter after a
+   paste would send the turn without the photo (grok review 2026-10-28). The 12MB pre-send guard counts
+   INLINE payloads only: it protects the WS frame, and a hash-only part is a few dozen bytes.
 8. The upload knows nothing about the session policy: the retention HEADER is what makes the POST
    memory-only, and the same choice is pushed over the WS so the hub's own writes agree (see `server.md`
    §Retention).

@@ -67,9 +67,9 @@ From another device (phone, LAN, DDNS): non-loopback peers need the API token, w
 - Steering: sending mid-run holds the message as a chip (✎ pull back, ✕ cancel) and injects it at the next step boundary.
 - Retry resumes at the failed call; auto-retry covers rate-limit, network and transient 5xx errors (3×3s, configurable).
 - Thinking blocks collapse; thinking level is switchable from the composer or Settings.
-- Attachments: workspace text files inlined as fenced blocks, images encoded to the *Images* level
-  (resize + webp) and uploaded as binary — the prompt carries a content hash, and the model gets the
-  bytes back server-side.
+- Attachments: workspace text files inlined as fenced blocks; images are sized from their header,
+  re-encoded to the *Images* level (resize + webp) and uploaded as binary, so the prompt carries a
+  content hash and the model gets the bytes back server-side.
 - Compact summarizes older history in place and keeps the recent tail; every ✎ edit parks a restorable version.
 
 **Sessions**
@@ -92,7 +92,7 @@ From another device (phone, LAN, DDNS): non-loopback peers need the API token, w
 
 **Settings**
 - Model and thinking level, turns visible, API keys (import from pi or add), Data use (image level,
-  stream level, image retention per device), theme, server token, auto-retry.
+  stream level, image retention per device — sticky per session), theme, server token, auto-retry.
 
 ## Source
 

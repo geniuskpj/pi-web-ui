@@ -254,5 +254,57 @@ const frames = () => { const out = []; return { out, deliver: (m) => out.push(m)
 	} finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
+// ── 8) RETENTION survives the entry (grok review 2026-10-28, I3) ──────────────
+// The sticky "browser keeps my images" choice used to live only on the in-memory entry: after an
+// eviction or a restart the next write went back to the default and put the bytes on disk.
+{
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-hub-retention-"));
+	const blob = Buffer.alloc(120 * 1024, 0x5b);
+	const stored = [
+		{ role: "user", content: [{ type: "text", text: "photo" }, { type: "image", mimeType: "image/png", data: blob.toString("base64") }], timestamp: 1700000000000 },
+		{ role: "assistant", content: "ok", timestamp: 1700000001000 },
+	];
+	const faux = registerFauxProvider({ api: "faux", provider: "faux", models: [{ id: "faux-1", reasoning: false, input: ["text"] }] });
+	const lines = (jsonl) => jsonl.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+	const make = (mediaDir, load) => {
+		const written = [];
+		const hub = new AgentHub({
+			modelsStore: { faux: { name: "faux", models: [faux.getModel("faux-1")] } },
+			getAuth: () => ({ faux: { key: "k" } }),
+			persist: async (_id, jsonl) => { written.push(jsonl); },
+			broadcast: () => {},
+			getTools: () => [],
+			mediaDir,
+			loadMessages: load,
+		});
+		return { hub, written };
+	};
+	const id = "sess-retention-sticky";
+	try {
+		const load = async () => ({ messages: JSON.parse(JSON.stringify(stored)), metadata: { modelId: "faux-1", thinkingLevel: "high", title: "photo" } });
+		const { hub, written } = make(dir, load);
+		await hub.attach(id, () => {}, {});
+		hub.setMediaRetention(id, "phone", "browser");
+		hub._writeSession(id);
+		const header = lines(written.join(""))[0];
+		check("I3g the session HEADER carries the sticky retention (so it can outlive the entry)",
+			header.imageRetention === "browser", JSON.stringify({ imageRetention: header.imageRetention }));
+		check("I3h …and a 'server' session does not write the field at all (old headers stay clean)",
+			(() => {
+				const { hub: plain, written: w2 } = make(dir, async () => ({ messages: JSON.parse(JSON.stringify(stored)), metadata: { modelId: "faux-1", thinkingLevel: "high", title: "photo" } }));
+				plain.getSession("sess-default").agent.state.messages = JSON.parse(JSON.stringify(stored));
+				plain._writeSession("sess-default");
+				return lines(w2.join(""))[0].imageRetention === undefined;
+			})());
+
+		// a RESTART: the fresh hub must re-learn the choice from the header, not from the process default
+		const jsonl = written.join("");
+		const { hub: hub2 } = make(dir, async () => ({ messages: lines(jsonl).slice(1), metadata: lines(jsonl)[0] }));
+		await hub2.attach(id, () => {}, {});
+		check("I3i a reloaded session still refuses to persist its images (retention outlives the process)",
+			hub2.sessions.get(id)?.retention === "browser" && hub2.mediaPersistFor(id) === false);
+	} finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
 console.log(`\n[hub-hydration] ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

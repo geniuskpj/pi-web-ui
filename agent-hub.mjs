@@ -766,7 +766,7 @@ export class AgentHub {
 			// the transcript may hold hash-only image parts (persisted redacted) — hydrate for the model,
 			// and never send a data-less part (external review I2: the bytes may be gone under browser retention)
 			const { images, missing } = this.hydrateImages(Array.isArray(u.content) ? u.content.filter((b) => b?.type === "image") : []);
-			if (missing.length) console.warn(`[agent-hub] retry ${sessionId.slice(0, 8)}: ${missing.length} image(s) have no bytes — resending the text turn only`);
+			if (missing.length) console.warn(`[agent-hub] retry ${sessionId.slice(0, 8)}: ${missing.length} image(s) have no bytes — resending without them`);
 			entry.agent.state.messages = msgs.slice(0, uIdx);
 			await entry.agent.prompt(text, images.length ? images : undefined);
 			return { ok: true, mode: "resend", dropped };
@@ -970,7 +970,7 @@ export class AgentHub {
 		// redact those too, or every state/steering frame re-sends the full base64
 		// (review report.md L2, 2026-10-27).
 		const pendingImages = msg.pendingPrompt?.images;
-		const redactedImages = this.redactPromptImages(pendingImages);
+		const redactedImages = this.redactPromptImages(pendingImages, sessionId);
 		if (redactedImages !== pendingImages) { out.pendingPrompt = { ...msg.pendingPrompt, images: redactedImages }; changed = true; }
 
 		const event = msg.event;
@@ -983,10 +983,12 @@ export class AgentHub {
 	}
 
 	/** Redact a bare ImageContent[] (the shape `pendingPrompt.images` uses). */
-	redactPromptImages(images) {
+	redactPromptImages(images, sessionId = null) {
 		if (!Array.isArray(images) || !images.length) return images;
 		const wrapped = images.map((im) => ({ role: "user", content: [im] }));
-		const out = this.redactMessages(wrapped);
+		// the session id selects the retention: without it a "browser" session would write the
+		// pending-steer bytes to disk (grok review 2026-10-28)
+		const out = this.redactMessages(wrapped, sessionId);
 		return out === wrapped ? images : out.map((m) => m.content[0]);
 	}
 
@@ -1073,6 +1075,7 @@ export class AgentHub {
 							title: stored.metadata?.title,
 							messages: stored.messages,
 						});
+						if (stored.metadata?.imageRetention) entry.retention = stored.metadata.imageRetention; // sticky across restarts
 					} else if (entry.agent.state.messages.filter((m) => m.role !== "system").length === 0) {
 						// An entry with NO real messages is safe to fill — that is the
 						// poisoned case (created by an attach/prompt that raced the store).
@@ -1084,6 +1087,9 @@ export class AgentHub {
 						if (stored.metadata?.modelId) { const m = this._getModel(stored.metadata.modelId); if (m) entry.agent.state.model = m; }
 						if (stored.metadata?.thinkingLevel) entry.agent.state.thinkingLevel = stored.metadata.thinkingLevel;
 						if (stored.metadata?.title) entry.title = stored.metadata.title;
+						// the sticky retention travels with the session, or an eviction would put the next write
+						// back on disk (grok review 2026-10-28, I3)
+						if (stored.metadata?.imageRetention) entry.retention = stored.metadata.imageRetention;
 					} else {
 						entry.hydrated = true; // live transcript wins; nothing to load
 					}
@@ -1166,6 +1172,10 @@ export class AgentHub {
 		// tail-first cache: the client's IDB chunks are keyed on this generation
 		metadata.rewriteSeq = entry.rewriteSeq || 0;
 		metadata.rewrittenFrom = entry.rewrittenFrom ?? Number.MAX_SAFE_INTEGER;
+		// RETENTION belongs to the session, not to the process (grok review 2026-10-28, I3): without this
+		// the sticky "browser keeps my images" choice died with the entry and the next write hit the disk.
+		// Only written when it differs from the default, so ordinary headers stay unchanged.
+		if (entry.retention && entry.retention !== "server") metadata.imageRetention = entry.retention;
 		if (!entry.createdAt) entry.createdAt = now;
 		return metadata;
 	}

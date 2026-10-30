@@ -39,6 +39,8 @@ Browser (any device)                 Node server (:8787)
 | `lib/provider-models.mjs` | provider `/models` discovery (boot + 30 min): parse + merge new ids into a provider's list |
 | `lib/session-search.mjs` | whole-session find: roles, turns, snippets with match offsets, caps |
 | `lib/rg-json.mjs` | `rg --json` argv + parser for the workspace search (grouped, per-file caps) |
+| `lib/image-dims.mjs` | pixel size from an image HEADER alone (PNG/JPEG/GIF/WebP/BMP) — lets the composer apply the resolution cap without decoding |
+| `src/image-encode.ts` | browser-side encode (`encodeForModel`: decide → capped decode → plan → webp/jpeg) + binary upload (`uploadImage`) |
 | `lib/display-gate.mjs` | which user turns a large session shows (seq-space gate) |
 | `lib/turn-timing.mjs` | opt-in `PI_WEB_TIMING=1` turn timeline (fetch headers/first chunk + hub stages) |
 | `build.mjs` (138 L) | esbuild bundle (`app-[hash].js`), hljs→lib/common alias, manifest.json, .br/.gz precompression, stale-bundle pruning |

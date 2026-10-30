@@ -239,10 +239,13 @@ const msg = (text, parts = []) => ({ role: "user", content: [{ type: "text", tex
 	check("I1b a pasted photo is handed over as a BLOB (no base64 round trip in the paste handler)",
 		/onAddImage\(file\.name \|\| "pasted-image", file, file\.type/.test(chat) && !/readAsDataURL\(/.test(chat));
 	check("I1c the send frame carries a HASH when the upload succeeded (base64 only as the fallback)",
-		/im\.hash\n\s*\? \{ type: "image", mimeType: im\.mimeType, hash: im\.hash, bytes: im\.bytes \}/.test(chat) &&
+		/attached\.map\(\(im\) => \(im\.hash\r?\n\s*\? \{ type: "image", mimeType: im\.mimeType, hash: im\.hash, bytes: im\.bytes \}/.test(chat) &&
 		/: \{ type: "image", mimeType: im\.mimeType, data: im\.data \}\)\)/.test(chat));
-	check("I1d the pre-send size guard counts the ENCODED size, not the original",
-		/images\.reduce\(\(n, im\) => n \+ \(im\.bytes \?\?/.test(chat));
+	check("I1d the pre-send guard counts INLINE payloads only (a hash-only part costs the frame nothing)",
+		/attached\.reduce\(\(n, im\) => n \+ \(im\.hash \? 0 :/.test(chat));
+	check("I1d2 …and the send WAITS for an in-flight encode/upload, reading the LIVE list (no dropped photo)",
+		/pendingAttach\.current > 0 && Date\.now\(\) - waited < 15000/.test(chat) && /const attached = getImages\(\)/.test(chat) &&
+		/imagesRef\.current = images;/.test(chat));
 	check("I1e a recalled steer keeps its hash and is NOT re-encoded or re-uploaded",
 		/\{ encode: !hash \}/.test(chat) && /hash: im\.hash, bytes: im\.bytes \}, \{ encode: false \}/.test(chat));
 	check("I1f a server-side retry sends the hashes back (the hub hydrates them)",
