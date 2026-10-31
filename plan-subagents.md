@@ -362,6 +362,11 @@ in BOTH transcript shapes (`subagent.test.mjs` §R).
 `onPeers`/`controlPeer`/`stopAllPeers`), a `↗ peer transcript` button on the `subagent` tool row, and the
 `public/style.css` block (strip + right-hand sheet, bottom sheet on a phone).
 
+**Schema addition (2026-10-31, copilot review):** `peerId` joined `PEER_RESULT_FIELDS`. The original 8-field
+freeze omitted the very id the follow-up verbs take, so a `run` result could not be stopped, steered, retried
+or opened from the UI. The journal also stores the child's `sessionId` from the moment it exists (a finished
+peer used to have no session to open or retry). Both are pinned in `tests/subagent.test.mjs` §J/§T.
+
 **Still open:** M4 (`read_peer`, budget UX display, peer GC/TTL, user-spawned peers — the `spawn` WS verb does
 not exist yet), M5 (council, arena-bridge peers). **Not yet verified visually:** the M3 UI was built and
 typechecked, but the running `:8787` server predates this work, so seeing it needs a restart + reload (the

@@ -7,6 +7,7 @@
 //
 // Usage: node tests/session-search.test.mjs
 import { searchMessages, messageText, turnNumbers, turnStartSeq, turnEndSeq, MAX_HITS_PER_SEQ, MAX_LIMIT } from "../lib/session-search.mjs";
+import fs from "node:fs";
 
 let passed = 0, failed = 0;
 const check = (name, ok, extra = "") => {
@@ -69,6 +70,16 @@ const TR = (t) => ({ role: "toolResult", toolCallId: "x", content: [{ type: "tex
 	check("W3 malformed messages are skipped, not thrown", weird.hits.length === 1 && weird.hits[0].seq === 3, String(weird.hits[0]?.seq));
 	check("W3 no messages at all is an empty result", searchMessages(undefined, "x").hits.length === 0);
 	check("W4 unicode matches by code unit (no crash on emoji/CJK)", searchMessages([U("lamp 💡 and 日本語 needle")], "needle").hits.length === 1);
+}
+
+// CLEARING THE QUERY MUST ABORT THE IN-FLIGHT REQUEST (copilot review 2026-10-31): otherwise the
+// late response repopulates a hit list for an empty query.
+{
+	const src = fs.readFileSync(new URL("../src/ui/chat.tsx", import.meta.url), "utf8");
+	const clear = /if \(!t\) \{[\s\S]{0,400}findAbort\.current\?\.abort\(\)/.test(src);
+	check("UI-1 clearing the find query aborts the in-flight search (no stale hits)", clear);
+	check("UI-2 …and resets the generation/source markers so a stale-scan banner cannot survive either",
+		/if \(!t\) \{[\s\S]{0,400}findGen\.current = null/.test(src));
 }
 
 console.log(`\n[session-search] ${passed} passed, ${failed} failed`);

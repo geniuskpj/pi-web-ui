@@ -41,6 +41,17 @@ limitation or a deferred item, recorded so it is not rediscovered as a "bug".)
 
 ## Recently closed (kept one release, then pruned)
 
+### 2026-10-31 — copilot review (5 findings, all confirmed and fixed)
+
+| # | Where | Was | Now |
+|---|---|---|---|
+| 1 | `lib/media-egress.mjs` | `persisted` was computed from `dir && persist` BEFORE the write, so a failed write (read-only dir, ENOSPC) left an entry claiming a disk copy — and `evict()` drops persisted entries first *because they can be re-read*, so the image could vanish while `/media` 404s | `persisted` is set only after `writeFileSync` returns; `tests/data-reduction.test.mjs` §L15c–e blocks the shard path with a file and asserts memory-only honesty |
+| 2 | `lib/provider-models.mjs` | a discovered id inherited `api`/`baseUrl` but not the template's `headers`/`compat` (the doc comment claimed otherwise), so on nvidia (`NVCF-POLL-SECONDS`) or a provider needing `compat` it was selectable and failed on its first request | both are copied; per-model numbers (`maxTokens`) deliberately are not — `tests/provider-models.test.mjs` §D1–D7 |
+| 3 | `src/ui/chat.tsx` (find) | clearing the query cleared the hits but did NOT abort the in-flight search, whose late response repopulated a hit list for an empty box | clearing aborts the request and resets the generation/source markers; `tests/session-search.test.mjs` §UI-1/2 |
+| 4 | `agent-hub.mjs` (`_runPeer`) | usage was accumulated from every event that carried `usage` — `message_end` and `turn_end` carry the SAME assistant message, so a child's tokens were double counted and its token budget tripped early | usage is derived from the child's MESSAGES (the app's own UsageBar convention), once per assistant message; `tests/subagent.test.mjs` §T5 |
+| 5 | `lib/peer-lifecycle.mjs` + `agent-hub.mjs` + `peer-tools.mjs` | a completed peer's view had no child session id (the journal entry never stored it and `peerView` never mapped it), so its transcript could not be opened and `retry` had no session to address; and the tool result carried only `sessionId`, while the UI's transcript link and every control verb address a peer BY `peerId` | the journal records the child id as soon as it exists, `peerView` maps it, and `peerId` joins the frozen result schema; `tests/subagent.test.mjs` §J2b/J3b/J3c/T4 |
+
+
 ### 2026-10-28 — image policy (external review I1 · I2 · I3)
 
 All three verified gaps are fixed in one pass (details: `docs/client.md` §image pipeline,

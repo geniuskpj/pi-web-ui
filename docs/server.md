@@ -585,7 +585,7 @@ works on a peer unchanged.
 | Piece | What it does |
 |---|---|
 | `lib/peer-roles.mjs` | role files: `.pi/agents/<role>.md` + frontmatter (`name`, `description`, `tools`, `acceptanceRole`, `thinking`, `model`, `systemPromptMode`). `toolsForRole()` is the SECURITY boundary: a role can only narrow the process tool set, `acceptanceRole: read-only` is a hard floor (no write/edit/bash/…), and no peer ever gets `subagent`. Shipped: `reviewer`, `oracle`, `scout`, `worker`, `delegate`. |
-| `lib/peer-lifecycle.mjs` | the journal (`peer_started` / `peer_ended`), `peerStatusOf()` = pure f(journal, live agents), budgets (`checkPeerBudget` before an Agent exists), and the frozen tool-result schema (`status`, `sessionId`, `role`, `model`, `usage`, `error`, `summary`, `truncated`) with a UTF-8-safe 32 KB cap on `summary` only. |
+| `lib/peer-lifecycle.mjs` | the journal (`peer_started` / `peer_ended`), `peerStatusOf()` = pure f(journal, live agents), budgets (`checkPeerBudget` before an Agent exists), and the frozen tool-result schema (`status`, `peerId`, `sessionId`, `role`, `model`, `usage`, `error`, `summary`, `truncated`) with a UTF-8-safe 32 KB cap on `summary` only. `usage` is derived from the child's MESSAGES (never accumulated per event — `message_end` and `turn_end` carry the same numbers), and `peerId` is what every follow-up verb and the UI's transcript link address. |
 | `peer-supervisor.mjs` | owns lifecycle: child promises, the abort TREE, the caps, the heartbeat. `subagent.execute()` only does `await peers.wait(id)` — no hub lock is held across a child run (the deadlock the design review called out). A cancelled run's verdict beats the runner's (a stop must not be reported as "ok"). |
 | `peer-tools.mjs` | the server wiring: role files from disk (mtime cache, workspace overrides global), `toolsForSession(sessionId, meta)`, and the `subagent` tool. |
 | `agent-hub.mjs` | `spawnPeer`, `_runPeer`, `peersOf`, `remainingPeerBudget`, `controlPeer`, `closePeerJournal`, `_reconcilePeers`. |
@@ -596,7 +596,8 @@ progress into the parent's tool row via `onUpdate` (polled from the peer view). 
 child's FINAL TEXT as a tool result — the child's messages never enter the parent's context (C2/C3).
 
 **Journal + boot reconcile (C18).** A spawn writes its journal entry to the parent's session metadata
-BEFORE the run starts (`metadata.peers`), so status survives a restart. On load, `_reconcilePeers()`
+BEFORE the run starts (`metadata.peers`), including the child's `sessionId` as soon as it exists, so status,
+the transcript and `retry` all survive a restart. On load, `_reconcilePeers()`
 closes entries with no terminal state as `aborted` and, when the transcript still holds the unanswered
 `subagent` tool call, writes the tool result the model is waiting for. (`normalizeRestoredMessages`
 pass 3 usually strips that dangling call first — a provider 400 otherwise — in which case only the

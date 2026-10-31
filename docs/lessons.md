@@ -63,6 +63,23 @@ handler with a `setTimeout`/`AbortController` held in a ref (`onSearchQuery` in 
 that found it: a throwaway `window.__probe = (window.__probe||0)+1` / `window.__probeDeps = [q]` inside the
 effect, then read it over `cdp_eval` after driving the UI (cheaper than reasoning about the framework).
 
+### Four bug shapes the 2026-10-31 copilot review found (all cheap to re-check)
+
+1. **A flag must follow the EFFECT, not the intent.** `media-egress.put()` set `persisted: true` from
+   `dir && persist` before writing; the write's failure was swallowed, and `evict()` evicts persisted
+   entries first *because they can be re-read* — so a failed write became a data-loss path instead of a
+   slow path. Rule: compute the flag from the operation's result.
+2. **Never accumulate usage per EVENT.** `message_end` and `turn_end` carry the same assistant message,
+   so summing every event that has a `usage` doubles it (and trips token budgets early). Derive totals
+   from the MESSAGES — the pattern `UsageBar` already uses — and let events drive progress only.
+3. **A view must carry every id its actions need.** A peer view without the child's `sessionId` cannot
+   be opened or retried; a tool result without `peerId` cannot be followed up (the UI link and
+   stop/steer/retry all address by peer id). When a snapshot and a set of verbs exist, the ids the verbs
+   take belong IN the snapshot.
+4. **A debounced/cancellable search must abort on CLEAR, not only on the next keystroke.** Clearing the
+   box cleared the results, and the request already in flight then repopulated them half a second later
+   (`chat.tsx` find). Same rule for any "empty input" state: cancel, then reset the generation markers.
+
 ### Diagnostic tools in `ws-diag/` (kept, not tests)
 `npm run bench:data` → `data-reduction.bench.mjs` (measured frame/byte table), `simple-llm-timing.mjs`
 (per-stage provider timing over raw sockets: socket → tls → ttfb → firstByte, alone vs N in parallel — the

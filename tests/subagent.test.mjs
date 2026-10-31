@@ -98,9 +98,15 @@ function makeHub({ reply = "THE PEER REPORT", replies = null, persist = async ()
 	const journal = hub.sessions.get("P").peerJournal;
 	check("J1 the parent's entry keeps a peer journal", Array.isArray(journal) && journal.length === 1 && journal[0].peerId === spawned.peerId);
 	check("J2 …which starts as running (written before the run finished)", journal[0].status === "running" && journal[0].endedAt === null);
-	hub.closePeerJournal("P", spawned.peerId, { status: "ok", usage: { input: 1, output: 2, cost: 0 }, turns: 2 });
+	check("J2b the journal knows the CHILD SESSION from second 0 (the panel can attach while it runs)",
+		journal[0].sessionId === spawned.record.sessionId, String(journal[0].sessionId));
+	hub.closePeerJournal("P", spawned.peerId, { status: "ok", usage: { input: 1, output: 2, cost: 0 }, turns: 2, sessionId: spawned.record.sessionId });
 	const closed = hub.sessions.get("P").peerJournal[0];
 	check("J3 closePeerJournal stores the terminal state + usage", closed.status === "idle" && closed.endedAt > 0 && closed.turns === 2);
+	check("J3b …and KEEPS the child session id (a finished peer's transcript stays reachable)",
+		closed.sessionId === spawned.record.sessionId, String(closed.sessionId));
+	check("J3c the journal-backed VIEW carries it too (the panel/retry read the view, not the entry)",
+		hub.peersOf("P")[0].sessionId === spawned.record.sessionId, JSON.stringify(hub.peersOf("P")[0].sessionId));
 	const meta = hub._buildMetadata("P");
 	check("J4 the journal and the peer identity ride the METADATA (they survive a restart)",
 		meta.peers?.[0]?.peerId === spawned.peerId && meta.kind === "user");
@@ -238,12 +244,20 @@ function makeHub({ reply = "THE PEER REPORT", replies = null, persist = async ()
 	hub.getSession("P", { messages: [{ role: "user", content: "go" }] });
 	const s = hub.spawnPeer("P", { role: REVIEWER, task: "long report" });
 	const out = await s.promise;
-	const res = buildPeerResult({ status: out.status, sessionId: out.sessionId, role: "reviewer", model: out.model, usage: out.usage, error: out.error, summary: out.summary });
+	const res = buildPeerResult({ status: out.status, peerId: out.peerId, sessionId: out.sessionId, role: "reviewer", model: out.model, usage: out.usage, error: out.error, summary: out.summary });
 	const text = resultText(res);
 	check("T1 a huge peer report is capped in the TEXT the parent reads", Buffer.byteLength(text, "utf8") < 34 * 1024 && /elided/.test(text));
 	check("T2 …while the raw summary is still available to the UI/storage", res.summary.length === 40 * 1024);
 	check("T3 a successful result names the role, the session and the token total",
 		text.includes("reviewer") && text.includes(out.sessionId) && /tokens/.test(text));
+	check("T4 the result carries the PEER ID (every control verb and the UI's transcript link need it)",
+		out.peerId === s.peerId && res.peerId === s.peerId && PEER_RESULT_FIELDS.includes("peerId"), `${res.peerId}`);
+	check("T5 usage is counted ONCE per assistant message (message_end + turn_end carry the same numbers)",
+		(() => {
+			const used = hub.sessions.get(out.sessionId).agent.state.messages.filter((m) => m.role === "assistant" && m.usage);
+			const expect = used.reduce((n, m) => n + (Number(m.usage.input) || 0) + (Number(m.usage.output) || 0), 0);
+			return res.usage.input + res.usage.output === expect;
+		})(), `reported=${res.usage.input + res.usage.output}`);
 }
 
 console.log(`\n[subagent] ${pass} passed, ${fail} failed`);

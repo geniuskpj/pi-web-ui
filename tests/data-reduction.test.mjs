@@ -305,6 +305,23 @@ const msg = (text, parts = []) => ({ role: "user", content: [{ type: "text", tex
 			fs.existsSync(path.join(dir, h2.slice(0, 2), h2)) && serverish.media.get(h2)?.persisted === true);
 	} finally { fs.rmSync(dir, { recursive: true, force: true }); }
 
+	// A FAILED DISK WRITE MUST NOT CLAIM TO BE PERSISTED (copilot review 2026-10-31): `persisted` drives
+	// eviction (persisted entries go FIRST, because they can be re-read) — a lie there loses the image.
+	{
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-media-ro-"));
+		const bytes = Buffer.from("x".repeat(4096));
+		const hash = hashOf(bytes);
+		// make THIS image's shard path unusable: a FILE where the store wants a directory
+		fs.writeFileSync(path.join(dir, hash.slice(0, 2)), "not a directory");
+		const store = createMediaStore({ dir });
+		const entry = store.put(hash, bytes, "image/png", { persist: true });
+		check("L15c a failed disk write leaves persisted:false (memory-only, honestly)",
+			entry?.persisted === false && !fs.existsSync(path.join(dir, hash.slice(0, 2), hash)));
+		check("L15d …while the bytes are still served from memory", store.get(hash)?.bytes?.length === 4096);
+		check("L15e …and has() does not claim a disk copy either", store.has(hash) === true);
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+
 	// PER-SESSION retention (external review I3, 2026-10-28): it used to be ONE hub-wide boolean, so
 	// the last device to attach decided for every session on the server — and stuck after it left.
 	const rr = { mediaDefaultPersist: true, mediaRetention: new Map(), sessions: new Map(), mediaPersistFor: AgentHub.prototype.mediaPersistFor };

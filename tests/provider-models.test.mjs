@@ -45,5 +45,26 @@ const check = (name, ok, extra = "") => {
 	check("M4 a provider with no models still gets a usable entry (openai-completions default)", empty.models[0].api === "openai-completions" && empty.models[0].baseUrl === undefined);
 }
 
+// A DISCOVERED MODEL MUST CARRY THE PROVIDER'S TRANSPORT CONFIG (copilot review 2026-10-31): `api` and
+// `baseUrl` were copied, `headers`/`compat` were not — so on a provider that needs them (nvidia's
+// NVCF-POLL-SECONDS, a compat thinkingFormat) the new id was selectable and failed on its first request.
+{
+	const models = [{ id: "known", api: "openai-completions", baseUrl: "https://x/v1", headers: { "NVCF-POLL-SECONDS": "3600" }, compat: { thinkingFormat: "openai" }, maxTokens: 131072 }];
+	const before = JSON.stringify(models[0]);
+	const { models: merged, added } = mergeDiscoveredModels("nvidia", models, ["brand-new"]);
+	const got = merged.find((m) => m.id === "brand-new");
+	check("D1 a discovered model inherits the template's headers", got?.headers?.["NVCF-POLL-SECONDS"] === "3600", JSON.stringify(got?.headers));
+	check("D2 …and its compat block", got?.compat?.thinkingFormat === "openai", JSON.stringify(got?.compat));
+	check("D3 …and the api + baseUrl it already inherited", got?.api === "openai-completions" && got?.baseUrl === "https://x/v1");
+	check("D4 …but NOT the template's per-model numbers (a token limit is not transport config)", got?.maxTokens === undefined);
+	check("D5 the id is still labelled discovered, text-only, reasoning off",
+		got?.discovered === true && JSON.stringify(got?.input) === JSON.stringify(["text"]) && got?.reasoning === false);
+	check("D6 a template without headers/compat does not grow empty ones", (() => {
+		const bare = mergeDiscoveredModels("p", [{ id: "a", api: "anthropic-messages" }], ["b"]).models.find((m) => m.id === "b");
+		return bare.headers === undefined && bare.compat === undefined;
+	})());
+	check("D7 the user's own model entry is untouched (no mutation, one id added)", JSON.stringify(models[0]) === before && added.length === 1);
+}
+
 console.log(`\n[provider-models] ${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

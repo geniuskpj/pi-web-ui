@@ -482,7 +482,7 @@ export class AgentHub {
 		for (const peer of dangling) {
 			const callId = openCalls.shift();
 			if (callId) {
-				const result = buildPeerResult({ status: "aborted", sessionId: null, role: peer.role, model: peer.model, error: "the server restarted while this peer was running" });
+				const result = buildPeerResult({ status: "aborted", peerId: peer.peerId, sessionId: peer.sessionId || null, role: peer.role, model: peer.model, error: "the server restarted while this peer was running" });
 				entry.agent.state.messages.push({ role: "toolResult", toolCallId: callId, toolName: "subagent", content: [{ type: "text", text: resultText(result) }], details: result, timestamp: Date.now() });
 				answeredCalls += 1;
 			}
@@ -512,7 +512,10 @@ export class AgentHub {
 		if (!spawned.ok) return spawned;
 		// JOURNAL (D11): persisted with the parent's metadata, so status survives a restart and the boot
 		// reconcile can answer a spawn the process died on.
-		parent.peerJournal = appendJournal(parent.peerJournal || [], spawned.record.entry, { keep: this.peerLimits.journalKeep });
+		// the child session is created SYNCHRONOUSLY inside spawn() (before this line), so its id is
+		// already known — copy it in, or the journal would only learn it later (or never, for a fast run)
+		const entry = { ...spawned.record.entry, ...(spawned.record.sessionId ? { sessionId: spawned.record.sessionId } : {}) };
+		parent.peerJournal = appendJournal(parent.peerJournal || [], entry, { keep: this.peerLimits.journalKeep });
 		// DURABLE BEFORE THE RUN: the journal must be on disk while the child runs, or a crash leaves no
 		// trace of the spawn and the boot reconcile cannot answer the dangling tool call (D11/C18)
 		this.persistSession(parentId, true);
@@ -531,14 +534,27 @@ export class AgentHub {
 			parentSession: peer.parentId,
 		});
 		hooks.setSession(childId);
-		let turns = 0, usage = { input: 0, output: 0, cost: 0 };
+		this.notePeerSession(peer.parentId, peer.id, childId); // the journal knows the child from second 0
+		let turns = 0;
+		// USAGE IS DERIVED FROM THE MESSAGES, not accumulated from events (copilot review 2026-10-31):
+		// `message_end` and `turn_end` both carry the SAME assistant message, so summing every event that
+		// had a `usage` double-counted the child's tokens — which also tripped the child token budget
+		// early. This walks the child's own transcript, exactly like the parent's UsageBar does.
+		const usageOf = () => {
+			let input = 0, output = 0, cost = 0;
+			for (const m of entry.agent.state.messages) {
+				if (m?.role !== "assistant" || !m.usage) continue;
+				input += Number(m.usage.input) || 0;
+				output += Number(m.usage.output) || 0;
+				cost += Number(m.usage.cost?.total ?? m.usage.cost) || 0;
+			}
+			return { input, output, cost };
+		};
 		const off = this.onEvents(childId, (ev) => {
 			if (ev?.type === "turn_end") turns += 1;
-			const u = ev?.message?.usage || ev?.usage;
-			if (u) usage = { input: usage.input + (Number(u.input) || 0), output: usage.output + (Number(u.output) || 0), cost: usage.cost + (Number(u.cost) || 0) };
 			hooks.onUpdate({
 				turn: ev?.type === "turn_end" ? 1 : 0,
-				usage,
+				usage: usageOf(),
 				currentTool: ev?.event?.type === "tool_execution_start" ? ev.event.toolName : null,
 				lastText: extractPreviewText(entry.agent.state.messages.filter((m) => m.role === "assistant").pop()?.content || "", 200),
 			});
@@ -546,7 +562,7 @@ export class AgentHub {
 		const onAbort = () => { try { this.abort(childId); } catch { /* already gone */ } };
 		peer.signal?.addEventListener?.("abort", onAbort, { once: true });
 		try {
-			if (peer.signal?.aborted) return { status: "aborted", error: "stopped before it started", sessionId: childId, usage, turns };
+			if (peer.signal?.aborted) return { status: "aborted", error: "stopped before it started", sessionId: childId, usage: usageOf(), turns };
 			await this.prompt(childId, peer.task);
 			await this._awaitPeerEnd(childId, peer.signal);
 			const last = [...entry.agent.state.messages].reverse().find((m) => m.role === "assistant");
@@ -556,7 +572,7 @@ export class AgentHub {
 				status,
 				error: failed ? (last?.errorMessage || "the peer's run failed") : null,
 				summary: fullTextOf(last?.content) || "(the peer returned no text)",
-				usage, turns, sessionId: childId,
+				usage: usageOf(), turns, sessionId: childId,
 			};
 		} finally {
 			off();
@@ -594,14 +610,31 @@ export class AgentHub {
 		try { this.broadcast(parentId, { type: "peer", sessionId: parentId, peer }); } catch { /* no sockets */ }
 	}
 
+	/**
+	 * The child session now exists: remember its id in the journal IMMEDIATELY (copilot review
+	 * 2026-10-31) so the panel can open the transcript, and a retry can address the session, even if the
+	 * run then dies. Without this a finished peer's view carried no `sessionId` at all.
+	 */
+	notePeerSession(parentId, peerId, sessionId) {
+		const parent = this.sessions.get(parentId);
+		if (!parent || !sessionId) return;
+		const journal = parent.peerJournal || [];
+		const i = journal.findIndex((p) => p.peerId === peerId);
+		if (i < 0) return;
+		journal[i] = { ...journal[i], sessionId };
+		parent.peerJournal = journal;
+		this.persistSession(parentId, false);
+	}
+
 	/** Close a peer's journal entry (called by the supervisor's caller once the result is known). */
-	closePeerJournal(parentId, peerId, { status, error = null, usage = null, turns = 0 } = {}) {
+	closePeerJournal(parentId, peerId, { status, error = null, usage = null, turns = 0, sessionId = null } = {}) {
 		const parent = this.sessions.get(parentId);
 		if (!parent) return;
 		const journal = parent.peerJournal || [];
 		const i = journal.findIndex((p) => p.peerId === peerId);
 		if (i < 0) return;
-		journal[i] = peerEnded(journal[i], { status: status === "ok" ? "idle" : status, error, usage, turns });
+		const entry = { ...journal[i], ...(sessionId ? { sessionId } : {}) }; // keep the child id (both paths)
+		journal[i] = peerEnded(entry, { status: status === "ok" ? "idle" : status, error, usage, turns });
 		parent.peerJournal = journal;
 		this.persistSession(parentId, false);
 	}

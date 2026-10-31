@@ -153,8 +153,10 @@ export function createPeerIntegration({ hub, usableTools, piDir, workspaceDir, e
 				signal?.addEventListener?.("abort", onAbort, { once: true });
 				try {
 					const out = await hubRef().peers.wait(spawned.peerId, parentSessionId);
-					hubRef().closePeerJournal(parentSessionId, spawned.peerId, { status: out.status, error: out.error, usage: out.usage, turns: out.turns });
-					const res = buildPeerResult({ status: out.status, sessionId: out.sessionId, role: role.name, model: out.model, usage: out.usage, error: out.error, summary: out.summary || "" });
+					hubRef().closePeerJournal(parentSessionId, spawned.peerId, { status: out.status, error: out.error, usage: out.usage, turns: out.turns, sessionId: out.sessionId });
+					// `peerId` travels with the result (copilot review 2026-10-31): every follow-up — the UI's
+					// transcript link, stop/steer/retry — addresses a peer BY id, not by its child session
+					const res = buildPeerResult({ status: out.status, peerId: spawned.peerId, sessionId: out.sessionId, role: role.name, model: out.model, usage: out.usage, error: out.error, summary: out.summary || "" });
 					const cut = truncateUtf8(res.summary, hubRef().peerLimits.summaryBytes);
 					res.summary = cut.text;
 					res.truncated = cut.truncated;

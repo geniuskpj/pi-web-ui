@@ -1258,6 +1258,14 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 		clearTimeout(findTimer.current);
 		const t = q.trim();
 		if (!t) {
+			// CLEARING MUST CANCEL (copilot review 2026-10-31): the request already in flight would
+			// otherwise resolve later and repopulate `findHits` for an empty query — a stale hit list
+			// (and a stale highlight) on a box the user just emptied.
+			clearTimeout(findTimer.current);
+			findAbort.current?.abort();
+			findAbort.current = null;
+			findGen.current = null;
+			findSrc.current = null;
 			setFindHits([]); setFindIndex(0); setHighlightSeq(null);
 			setFindMeta((m) => ({ ...m, dirty: false, searching: false, error: null }));
 			return;
