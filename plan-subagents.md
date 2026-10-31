@@ -1,7 +1,8 @@
 # plan-subagents.md — child sessions (peers) in pi web
 
-Status: **M0–M2 IMPLEMENTED** (2026-10-31). M3 (the UI: peer panel, peers strip, session-list grouping) is
-the next step; M4/M5 are still open. See *Implementation log* at the end for the files, the test counts and
+Status: **M0–M3 IMPLEMENTED** (2026-10-31). M4 (budget UX, `read_peer`, peer GC/TTL) and M5 (council,
+arena-bridge peers) are still open — and the UI has been built but NOT yet seen on a live app (that needs a
+server restart, see the implementation log). See *Implementation log* at the end for the files, the test counts and
 the three things the code does differently from this document.
 
 Supersedes the stale `feat/llm-peer-chat` placeholder branch (which
@@ -356,5 +357,12 @@ in BOTH transcript shapes (`subagent.test.mjs` §R).
    transcript's last message + the parent's journal entry, so `metadata.parentSession`/`peerRole` is all the
    child needs. Adding a per-child journal would be a second source of truth for the same fact.
 
-**Still open:** M3 (peer panel, peers strip, session-list grouping, user-spawned peers — the `spawn` WS
-verb does not exist yet), M4 (`read_peer`, budget UX, peer GC/TTL), M5 (council, arena-bridge peers).
+**M3 (UI) also landed the same day:** `src/ui/peer-store.ts` (pure reducer, `tests/peer-store.test.mjs` 19),
+`src/ui/peers.tsx` (`PeerStrip` + `PeerPanel`), `src/proxy-agent.ts` (the `peers`/`peer`/`peer-result` frames,
+`onPeers`/`controlPeer`/`stopAllPeers`), a `↗ peer transcript` button on the `subagent` tool row, and the
+`public/style.css` block (strip + right-hand sheet, bottom sheet on a phone).
+
+**Still open:** M4 (`read_peer`, budget UX display, peer GC/TTL, user-spawned peers — the `spawn` WS verb does
+not exist yet), M5 (council, arena-bridge peers). **Not yet verified visually:** the M3 UI was built and
+typechecked, but the running `:8787` server predates this work, so seeing it needs a restart + reload (the
+DOM/CDP check is the first thing to do after that).

@@ -93,7 +93,8 @@ From another device (phone, LAN, DDNS): non-loopback peers need the API token, w
 **Subagents**
 - The main agent can delegate to a **peer**: a child agent with its own role prompt (`reviewer`, `oracle`,
   `scout`, `worker`, `delegate`, or your own `.pi/agents/*.md`), its own narrowed tool set (read-only roles
-  literally cannot write), and its own **session** — open it from the tool row to read the peer's chat.
+  literally cannot write), and its own **session**. Click the peer's chip under the composer (or `↗ peer
+  transcript` on the tool row) to read its chat while it works.
 - Peers are watched and controlled from the same place: live status, elapsed time, current tool, Stop /
   Stop-all, Steer and Retry — from the UI, from `POST /api/agent/session/:id/peers/…`, or by the agent
   itself via the `subagent` tool. `PI_WEB_PEERS=off` disables the whole feature.

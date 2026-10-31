@@ -304,6 +304,29 @@ Notes worth keeping:
    memory-only, and the same choice is pushed over the WS so the hub's own writes agree (see `server.md`
    §Retention).
 
+## Subagents in the UI (plan-subagents.md M3)
+
+Two components, one source of truth (`src/ui/peer-store.ts`, fed by the server's `peers` snapshot +
+`peer` deltas):
+
+* **`PeerStrip`** (`src/ui/peers.tsx`) — a chip per peer under the composer: `role · status · elapsed ·
+  current tool`, a `■` Stop on a running chip, `Stop all` when more than one runs, and an `at capacity`
+  hint when the concurrency cap is reached. Clicking a chip opens the panel. The elapsed time ticks
+  client-side (one 1 s interval) — the server is not asked to re-send it.
+* **`PeerPanel`** — the peer's OWN session, attached with a SECOND `ProxyAgent` (`pa.connect()`), so the
+  page's main agent keeps owning the route's session. It renders the child's messages through the shared
+  markdown renderer (roles + tool rows are compacted by `peerEntries()`), offers Stop / Retry, a Steer
+  box while the peer runs, and `open` (a new tab on `/s/<childId>`) for the full transcript with the
+  normal chat chrome. Control always goes through `agent.controlPeer(...)` → the WS `peer` verb → the
+  same hub operation a session uses.
+
+The `subagent` tool row gets a `↗ peer transcript` button (the same affordance the bash row has for the
+terminal dock) whenever the result's frozen `details` carry a `peerId`.
+
+**The UI never guesses.** A delta updates the list only after the server sent it; a terminal status can
+never be resurrected by a late progress frame (`peer-store.applyPeer`); a session switch clears the list
+(a chip from the previous session would be a lie); and the agent resets its peer view on every attach.
+
 ## Session loading (tail-first) + IndexedDB cache
 
 The server decides TRANSFER sizes, the client decides DISPLAY granularity.

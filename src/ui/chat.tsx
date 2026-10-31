@@ -40,6 +40,9 @@ import { TerminalPanel, termBus } from "./terminal.js";
 import { renderMarkdown } from "./markdown.js";
 // egress media (plan §2.2b): a transcript image part may carry only a hash → hydrate before re-sending
 import { hydrateImageParts, currentSessionId } from "./media.js";
+// subagents/peers (plan-subagents.md M3): the strip under the composer + the peer transcript panel
+import { PeerStrip, PeerPanel } from "./peers.js";
+import type { Peer } from "./peer-store.js";
 // the browser half of the image policy: resize/re-encode per Settings → Data use, then upload the
 // BYTES and send a hash (no base64 up, none in the transcript, none in the session file)
 import { base64ToBlob, blobToBase64, encodeForModel, uploadImage } from "../image-encode.js";
@@ -261,12 +264,14 @@ function ToolRow({
 	pending,
 	partialText,
 	parentStop,
+	onOpenPeer,
 }: {
 	call: ToolCall;
 	result?: ToolResultMessage;
 	pending?: boolean;
 	partialText?: string;
 	parentStop?: string;
+	onOpenPeer?: (peer: Peer) => void;
 }) {
 	const running = pending && !result;
 	const isError = result?.isError === true;
@@ -295,6 +300,25 @@ function ToolRow({
 				</span>
 			</summary>
 			<div class="pw-tool-body">
+				{call.name === "subagent" && (() => {
+					// the delegation's result carries the child's session id + status (the frozen schema), so
+					// the row can open the peer's transcript — the same affordance the bash row has for the dock
+					const d = (result as any)?.details;
+					const peerId = d?.peerId || (call.arguments as any)?.peerId;
+					if (!peerId || !onOpenPeer) return null;
+					return (
+						<div class="pw-tool-termrow">
+							<button
+								type="button"
+								class="pw-mini-btn"
+								title="Open this peer's own transcript (its messages, tools and report)"
+								onClick={() => onOpenPeer({ id: String(peerId), role: d?.role || (call.arguments as any)?.role || null, model: d?.model || null, status: d?.status === "ok" ? "idle" : (d?.status || "idle"), startedAt: null, endedAt: null, elapsedMs: 0, sessionId: d?.sessionId || null, taskPreview: String((call.arguments as any)?.task || "").slice(0, 180) } as Peer)}
+							>
+								↗ peer transcript
+							</button>
+						</div>
+					);
+				})()}
 				{call.name === "bash" && typeof (call.arguments as any)?.command === "string" && (
 					<div class="pw-tool-termrow">
 						<button
@@ -359,6 +383,7 @@ function AssistantBubble({
     onCancelRetry,
     retryState,
     dimmed,
+    onOpenPeer,
 }: {
 	message: AssistantMessage;
 	streaming: boolean;
@@ -366,6 +391,7 @@ function AssistantBubble({
 	pending?: ReadonlySet<string>;
 	partials?: Map<string, string>;
 	isLast?: boolean;
+	onOpenPeer?: (peer: Peer) => void;
 	onRetry?: () => void;
 	onRetryNow?: () => void;
 	onCancelRetry?: () => void;
@@ -389,6 +415,7 @@ function AssistantBubble({
 							pending={pending?.has(part.id)}
 							partialText={partials?.get(part.id)}
 							parentStop={streaming ? undefined : message.stopReason}
+							onOpenPeer={onOpenPeer}
 						/>
 					);
 				}
@@ -470,6 +497,7 @@ function MessageView(props: {
 	index?: number;
 	justUpdated?: boolean; // compaction completed this render — flash the summary block
 	canMutate?: boolean;
+	onOpenPeer?: (peer: Peer) => void;
 	onEditMessage?: (i: number) => void;
 	editing?: boolean;
 	onSaveEdit?: (i: number, text: string) => void;
@@ -515,6 +543,7 @@ function MessageView(props: {
 	  onCancelRetry={props.onCancelRetry}
 	  retryState={props.retryState}
 	  dimmed={props.dimmed}
+	  onOpenPeer={props.onOpenPeer}
 	 />
 	);
 	if (message.role === "system-notification") return <NotificationLine message={message as SystemNotificationMessage} />;
@@ -780,6 +809,8 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 	const imagesRef = useRef<ComposerImage[]>([]);
 	imagesRef.current = images;
 	const [attachNote, setAttachNote] = useState("");
+	// the open peer transcript (clicking a chip, a strip entry or the subagent tool row)
+	const [peerOpen, setPeerOpen] = useState<Peer | null>(null);
 	const [picker, setPicker] = useState<{ open: boolean; initialFile: string | null }>({ open: false, initialFile: null });
 	// terminal dock state (panel itself is src/ui/terminal.tsx; opened from the
 	// header button or a bash tool row's "↗ terminal")
@@ -1500,6 +1531,7 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 						onRetryNow={retry}
 						onCancelRetry={onCancelRetry}
 						retryState={retryState}
+						onOpenPeer={setPeerOpen}
 						onOpenFile={openFileViewer}
 						/>
 					</>
@@ -1596,6 +1628,8 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 					setImages(imgs);
 				}}
 			/>
+			<PeerStrip agent={agent} onOpen={setPeerOpen} />
+			{peerOpen && <PeerPanel agent={agent} peer={peerOpen} onClose={() => setPeerOpen(null)} />}
 			<UsageBar agent={agent} canCompact={(agent as any).serverSide === true && !state.isStreaming && state.messages.length > 6} compacting={compacting} onCompact={compact}
 			 canVersions={(agent as any).serverSide === true} versionsOpen={versionsOpen} versionsList={versionsList}
 			 onToggleVersions={toggleVersions} onSwitchVersion={switchVersion} />

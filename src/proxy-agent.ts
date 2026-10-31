@@ -11,6 +11,8 @@ import { getCachedChunks, putChunk, gunzip, transferPolicy, cachedRanges, interv
 import { planCachedSplice } from "../lib/chunk-splice.mjs";
 // data-reduction levels live in localStorage (Settings → Data use); the agent is what tells the hub
 import { pushDataReduction } from "./ui/data-settings.js";
+// subagents/peers (plan-subagents.md M3): the snapshot + deltas the server sends, folded by a pure reducer
+import { applyPeer, applyPeers, EMPTY_BUDGET, type Peer, type PeerBudget } from "./ui/peer-store.js";
 // LIVE WRITE-THROUGH (C2): how long a quiet tail may sit in memory before it is
 // written to IDB. Every flush is one gzip of <CHUNK_INTERVAL messages.
 const LIVE_IDLE_MS = 5000;
@@ -145,8 +147,61 @@ export class ProxyAgent {
 		if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(msg));
 	}
 
+	// ── peers (subagents, plan-subagents.md M3) ───────────────────────────────
+	/** The peers of the attached session, as last reported by the server (never guessed). */
+	peers: Peer[] = [];
+	peerBudget: PeerBudget = EMPTY_BUDGET;
+	private peerListeners = new Set<(peers: Peer[], budget: PeerBudget) => void>();
+
+	/** Subscribe to peer updates (the strip + the panel). Fires immediately; returns an unsubscribe. */
+	onPeers(cb: (peers: Peer[], budget: PeerBudget) => void): () => void {
+		this.peerListeners.add(cb);
+		try { cb(this.peers, this.peerBudget); } catch { /* a listener must not break the socket */ }
+		return () => { this.peerListeners.delete(cb); };
+	}
+
+	/** Ask for a fresh snapshot (`peers` frame) — used when the panel opens. */
+	requestPeers(): void {
+		this.sendMsg({ type: "peers", id: makeId() });
+	}
+
+	/** Control ONE peer. The reply (`peer-result`) refreshes the list; nothing is applied optimistically. */
+	controlPeer(action: "stop" | "steer" | "retry", peerId: string, text?: string): void {
+		this.sendMsg({ type: "peer", id: makeId(), action, peerId, ...(text ? { text } : {}) });
+	}
+
+	/** Stop every running peer of this session. */
+	stopAllPeers(): void {
+		this.sendMsg({ type: "peer", id: makeId(), action: "stop-all" });
+	}
+
+	private emitPeers() {
+		for (const cb of this.peerListeners) { try { cb(this.peers, this.peerBudget); } catch { /* ignore */ } }
+	}
+
 	private handleWsMessage(msg: AnyRecord) {
+		if (msg.type === "peers") {
+			this.peers = applyPeers(this.peers, msg.peers as Peer[]);
+			if (msg.budget) this.peerBudget = msg.budget as PeerBudget;
+			this.emitPeers();
+			return;
+		}
+		if (msg.type === "peer") {
+			this.peers = applyPeer(this.peers, msg.peer as Peer);
+			this.emitPeers();
+			return;
+		}
+		if (msg.type === "peer-result") {
+			// the echo carries the refreshed list, so the UI renders the SERVER's truth (no optimism)
+			if (Array.isArray(msg.peers)) this.peers = applyPeers(this.peers, msg.peers as Peer[]);
+			else if (msg.peer) this.peers = applyPeer(this.peers, msg.peer as Peer);
+			this.emitPeers();
+			return;
+		}
 		if (msg.type === "state") {
+			// a NEW session: the previous session's peers are not ours any more (a stale chip is a lie);
+			// the server sends the fresh `peers` snapshot right after this frame
+			if (msg.sessionId && this.sessionId && msg.sessionId !== this.sessionId) { this.peers = []; this.peerBudget = EMPTY_BUDGET; this.emitPeers(); }
 			this.sessionId = msg.sessionId || this.sessionId;
 			this.attached = true;
 			// retry policy lives client-side (Settings → Retry): re-push on every attach
