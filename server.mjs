@@ -59,6 +59,9 @@ import { createTerminalHub } from "./terminal-hub.mjs";
 import { createStreamReducer, normalizeReductionConfig, describeReduction } from "./lib/stream-reduce.mjs";
 // egress media: the hash validator for GET /api/agent/session/:id/media/:hash
 import { isMediaHash } from "./lib/data-reduction.mjs";
+// PEERS / subagents (plan-subagents.md): roles from .pi/agents/*.md, a per-session tool list, and the
+// bound `subagent` tool. The heavy lifting lives in peer-tools.mjs so it is testable without a server.
+import { createPeerIntegration } from "./peer-tools.mjs";
 import { purgeMediaOlderThan } from "./lib/media-egress.mjs";
 import { stripBoilerplate } from "./lib/hp2.mjs";
 import { netClassOf } from "./lib/net-class.mjs";
@@ -2110,6 +2113,24 @@ function hydratePromptImages(raw) {
  *  watch a live turn shrink. Off by default — this is the "let me test it on a debug server" switch. */
 const DR_DEBUG = process.env.PI_WEB_DATA_REDUCTION_DEBUG === "1";
 
+/**
+ * PEER INTEGRATION (plan-subagents.md). `hub: () => agentHub` is lazy on purpose: the tools are built
+ * when a session's Agent is constructed, which is always after the hub exists. PI_WEB_PEERS=off removes
+ * the `subagent` tool entirely (PI_WEB_TOOLS remains the outer, per-tool gate).
+ */
+const PEERS_ENABLED = !["0", "off", "false"].includes(String(process.env.PI_WEB_PEERS || "").toLowerCase());
+const peerIntegration = createPeerIntegration({
+	hub: () => agentHub,
+	usableTools: () => {
+		const allow = (process.env.PI_WEB_TOOLS || "").split(",").map((t) => t.trim()).filter(Boolean);
+		return [...builtinTools, ...extensionTools].filter((t) => !allow.length || allow.includes(t.name));
+	},
+	piDir: PI_DIR,
+	workspaceDir: WORKSPACE_DIR,
+	enabled: PEERS_ENABLED,
+	log: (m) => console.log(m),
+});
+
 /** A stable id for one agent socket (retention votes and other per-connection state are keyed by it). */
 const socketIds = new WeakMap();
 let socketSeq = 0;
@@ -2152,7 +2173,10 @@ const agentHub = new AgentHub({
 	// server-side agent loop (2026-10-21, now the DEFAULT chat path): the same
 	// tool objects the exec bridge exposes run IN-PROCESS; the system prompt and
 	// pi settings.json default model mirror what the browser path used
-	getTools: () => [...builtinTools, ...extensionTools],
+	// PER-SESSION tools: a peer gets its role's narrowed set (read-only roles have no write/edit/bash at
+	// all), a user session gets the normal set plus the bound `subagent` tool (peer-tools.mjs).
+	getTools: (sessionId, meta) => peerIntegration.toolsForSession(sessionId, meta),
+	getRoles: (name) => peerIntegration.resolvePeerRole(name),
 	// store READ accessor: forkSession self-hydrates cold sessions (hub restart,
 	// no attach yet) straight from the JSONL mirror
 	loadMessages: async (id) => { try { const j = await storeOp("get", { id }); return j?.messages?.length ? { messages: j.messages, metadata: j.metadata } : null; } catch { return null; } },
@@ -2313,12 +2337,16 @@ async function listCached() {
 }
 // metadata + non-idle runtime per session (embedded "runtime" field — idle is
 // the ABSENCE of the field; a server restart clears every runtime for free)
-async function enrichedSessions() {
+async function enrichedSessions({ includePeers = false } = {}) {
 	const sessions = await listCached();
-	return sessions.map((m) => {
-		const rt = agentHub.getRuntime(m.id);
-		return rt && rt.status !== "idle" ? { ...m, runtime: { ...rt, clients: agentClients.get(m.id)?.size ?? 0 } } : m;
-	});
+	return sessions
+		// PEERS ARE NOT LIST ENTRIES (plan D10/C17): a child session is reachable by id (the peer panel,
+		// /api/agent/session/:id) but must not fill the sidebar, the sync broadcasts or the IDB cache.
+		.filter((m) => includePeers || (m.kind || "user") !== "peer")
+		.map((m) => {
+			const rt = agentHub.getRuntime(m.id);
+			return rt && rt.status !== "idle" ? { ...m, runtime: { ...rt, clients: agentClients.get(m.id)?.size ?? 0 } } : m;
+		});
 }
 
 let broadcastPending = false;
@@ -2534,6 +2562,21 @@ function agentConn(ws) {
 				case "abort":
 					if (currentSession) agentHub.abort(currentSession);
 					break;
+				// ── PEERS (plan-subagents.md M2): ONE verb set for status + control. The UI calls these; the
+				// parent AGENT reaches the same hub methods through the `subagent` tool. Mutating verbs are
+				// actor-scoped to the attached session (C15), so an open peer panel cannot steer itself.
+				case "peers": {
+					if (!currentSession) { safeSend(ws, { type: "error", id: m.id, error: "attach first" }); break; }
+					safeSend(ws, { type: "peers", id: m.id, sessionId: currentSession, peers: agentHub.peersOf(currentSession), budget: agentHub.remainingPeerBudget(currentSession) });
+					break;
+				}
+				case "peer": {
+					if (!currentSession) { safeSend(ws, { type: "error", id: m.id, error: "attach first" }); break; }
+					agentHub.controlPeer(currentSession, String(m.peerId || ""), String(m.action || "status"), { text: m.text, reason: m.reason })
+						.then((r) => safeSend(ws, { type: "peer-result", id: m.id, peerId: m.peerId || null, action: m.action || null, ...r, peers: agentHub.peersOf(currentSession) }))
+						.catch((err) => safeSend(ws, { type: "error", id: m.id, error: err.message }));
+					break;
+				}
 				case "retry": {
 					// RETRY (2026-10-23, user request): resume a FAILED run at the failure
 					// point — the hub drops the 429/error message and continues the SAME
@@ -2991,7 +3034,33 @@ app.get("/api/agent/events", async (c) => {
 
 // --- session list REST ----------------------------------------------------------
 app.get("/api/sessions", async (c) => {
-	try { return c.json({ sessions: await enrichedSessions() }); }
+	try {
+		// ?kind=all includes peer (subagent) sessions — the peer panel and debugging use it
+		const includePeers = ["all", "peer", "1"].includes(String(c.req.query("kind") || "").toLowerCase());
+		return c.json({ sessions: await enrichedSessions({ includePeers }) });
+	} catch (err) { return c.json({ error: err.message }, 500); }
+});
+
+// ── PEERS (plan-subagents.md M2): status + control over REST, same hub operations as the WS verbs ──
+app.get("/api/agent/session/:id/peers", async (c) => {
+	try {
+		const id = c.req.param("id");
+		return c.json({ peers: agentHub.peersOf(id), budget: agentHub.remainingPeerBudget(id) });
+	} catch (err) { return c.json({ error: err.message }, 500); }
+});
+app.post("/api/agent/session/:id/peers/:peerId/:action", async (c) => {
+	try {
+		const id = c.req.param("id");
+		const action = c.req.param("action");
+		if (!["stop", "steer", "retry"].includes(action)) return c.json({ error: `unknown action "${action}"` }, 400);
+		const body = await c.req.json().catch(() => ({}));
+		const r = await agentHub.controlPeer(id, c.req.param("peerId"), action, { text: body?.text, reason: body?.reason });
+		return c.json(r, r.ok ? 200 : 409);
+	} catch (err) { return c.json({ error: err.message }, 500); }
+});
+app.get("/api/peer/roles", (c) => {
+	// the role catalog (builtins + .pi/agents/*.md), so the UI can offer a role picker
+	try { return c.json({ roles: peerIntegration.catalog(), dirs: peerIntegration.dirs(), enabled: peerIntegration.enabled }); }
 	catch (err) { return c.json({ error: err.message }, 500); }
 });
 app.post("/api/sessions", async (c) => {

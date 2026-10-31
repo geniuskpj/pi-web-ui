@@ -90,6 +90,14 @@ From another device (phone, LAN, DDNS): non-loopback peers need the API token, w
 - Models come from the pi-ai catalog, pi's `models-store.json`, your `models.json` and the provider's own `/models` (fetched at boot).
 - Keyless OpenAI-compatible endpoints work as-is, so local llama.cpp/vLLM/Ollama servers need no credentials.
 
+**Subagents**
+- The main agent can delegate to a **peer**: a child agent with its own role prompt (`reviewer`, `oracle`,
+  `scout`, `worker`, `delegate`, or your own `.pi/agents/*.md`), its own narrowed tool set (read-only roles
+  literally cannot write), and its own **session** — open it from the tool row to read the peer's chat.
+- Peers are watched and controlled from the same place: live status, elapsed time, current tool, Stop /
+  Stop-all, Steer and Retry — from the UI, from `POST /api/agent/session/:id/peers/…`, or by the agent
+  itself via the `subagent` tool. `PI_WEB_PEERS=off` disables the whole feature.
+
 **Settings**
 - Model and thinking level, turns visible, API keys (import from pi or add), Data use (image level,
   stream level, image retention per device — sticky per session), theme, server token, auto-retry.

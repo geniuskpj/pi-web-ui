@@ -10,6 +10,11 @@ import { Agent } from "@earendil-works/pi-agent-core";
 import { alignDown } from "./lib/chunk-window.mjs";
 // egress redaction (plan §2.2b): inline base64 → content hash + the /media route
 import { createMediaStore, redactImageData, hydrateImageData, missingImageHashes } from "./lib/media-egress.mjs";
+// PEERS (plan-subagents.md): a delegation is a NORMAL session with a role, and a supervisor owns the
+// lifecycle/caps/abort-tree so no hub lock is ever held across a child's run (grok review P0-3).
+import { createPeerSupervisor } from "./peer-supervisor.mjs";
+import { composeRolePrompt, PEER_LIMITS } from "./lib/peer-roles.mjs";
+import { peerStarted, peerEnded, appendJournal, danglingSpawns, peerView, buildPeerResult, resultText, PEER_RESULT_FIELDS } from "./lib/peer-lifecycle.mjs";
 // pi-ai 1.4.0: AgentOptions.streamFn is REQUIRED — the compat subpath exports the
 // generic streamSimple dispatcher (routes on model.api) and auto-registers the
 // builtin api providers on import
@@ -25,6 +30,13 @@ function extractPreviewText(content, maxLen = 120) {
 		const tb = content.find((b) => b.type === "text" && b.text);
 		if (tb) return tb.text.trim().replace(/\s+/g, " ").slice(0, maxLen);
 	}
+	return "";
+}
+
+/** The WHOLE text of a message content (no truncation) — a peer's report is its product. */
+function fullTextOf(content) {
+	if (typeof content === "string") return content.trim();
+	if (Array.isArray(content)) return content.filter((b) => b?.type === "text" && b.text).map((b) => b.text).join("\n\n").trim();
 	return "";
 }
 
@@ -122,7 +134,7 @@ const serializeConversation = (messages) => {
 };
 
 export class AgentHub {
-	constructor({ modelsStore, getAuth, persist, broadcast, getTools, getSystemPrompt, defaultModelId, onRuntimeChange, loadMessages, summarize, backupMirror, versions, mediaDir }) {
+	constructor({ modelsStore, getAuth, persist, broadcast, getTools, getSystemPrompt, defaultModelId, onRuntimeChange, loadMessages, summarize, backupMirror, versions, mediaDir, getRoles, peerLimits }) {
 		this.modelsStore = modelsStore;
 		this.getAuth = getAuth;
 		this.persist = persist; // async (id, data, metadata) — worker store (atomic)
@@ -158,7 +170,19 @@ export class AgentHub {
 		// server-side toolset (2026-10-21): the SAME builtin+extension tools the exec
 		// bridge exposes — executed IN THIS PROCESS by the server-side agent loop, so
 		// a run survives browser closes and every device sees live progress
+		// getTools(sessionId, meta) — the SERVER decides the tool list per session: a peer gets its role's
+		// narrowed set (never `subagent`), a user session gets the bound `subagent` tool.
 		this.getTools = getTools || (() => []);
+		this.getRoles = getRoles || (() => null);   // (name) → role | null, from .pi/agents/*.md + builtins
+		this.peerLimits = { ...PEER_LIMITS, ...(peerLimits || {}) };
+		// PEER SUPERVISOR: owns child promises, the abort tree, the caps and a heartbeat. The hub only
+		// gives it `run` (create the child session + prompt it) and a journal accessor (metadata.peers).
+		this.peers = createPeerSupervisor({
+			run: (peer, hooks) => this._runPeer(peer, hooks),
+			journal: (sessionId) => this.sessions.get(sessionId)?.peerJournal || [],
+			onEvent: (parentId, peer) => this._emitPeer(parentId, peer),
+			limits: this.peerLimits,
+		});
 		// effective system prompt (WEB_SYSTEM.md > trusted project SYSTEM.md > global
 		// SYSTEM.md, APPEND_SYSTEM.md appends) — same precedence the browser path uses
 		this.getSystemPrompt = getSystemPrompt || (() => undefined);
@@ -189,18 +213,22 @@ export class AgentHub {
 		return undefined;
 	}
 
-	getSession(sessionId, { modelId, thinkingLevel, title, messages, rewriteSeq, rewrittenFrom } = {}) {
+	getSession(sessionId, { modelId, thinkingLevel, title, messages, rewriteSeq, rewrittenFrom, role = null, parentSession = null } = {}) {
 		this.discarded.delete(sessionId); // explicit re-open undeletes
 		let entry = this.sessions.get(sessionId);
 		if (!entry) {
 			const model = this._getModel(modelId) || this._defaultModel();
 			if (!model) throw new Error("no models available");
-			const level = thinkingLevel || "high";
+			// a PEER starts from its role's system prompt and its role's tool set — the two things that
+			// make it a peer rather than a second chat
+			const level = thinkingLevel || role?.thinking || "high";
+			const isPeer = !!role;
 			// the server resolves this (lib/system-prompt.mjs): a prompt FILE when one is
 			// configured, otherwise a built-in prompt composed in code — so this is never
 			// undefined in practice, and the `systemPrompt ? … : …` belt-and-braces stays
 			// for embedders that pass no resolver at all.
-			const systemPrompt = this.getSystemPrompt();
+			const basePrompt = this.getSystemPrompt();
+			const systemPrompt = isPeer ? composeRolePrompt(role, { parentPrompt: basePrompt }) : basePrompt;
 			const agent = new Agent({
 				streamFn: streamSimple, // pi-ai 1.4.0: streamFn required (compat generic dispatcher)
 				initialState: {
@@ -211,7 +239,8 @@ export class AgentHub {
 					// a session file holds hash-only image parts (see _writeSession) → back to bytes for the model
 					messages: messages ? normalizeRestoredMessages(hydrateImageData(messages, this.media)) : [],
 					...(systemPrompt ? { systemPrompt } : {}),
-					tools: this.getTools(), // read/write/edit/bash + pi extensions — in-process
+					// the SERVER narrows this per session: a peer gets its role's tools, never `subagent`
+					tools: this.getTools(sessionId, { role, kind: isPeer ? "peer" : "user", depth: isPeer ? 1 : 0, parentSession }),
 				},
 			});
 			agent.getApiKey = async (provider) => {
@@ -251,6 +280,13 @@ export class AgentHub {
 				pendingPrompt: null, // steering UI payload {text, images, queuedAt} while held
 				pendingPromptMessage: null, // the exact AgentMessage — consumed on message_end
 			};
+			// peer identity (D1/D10): `kind` is the wire field the session list + /ws/sync use to keep
+			// subagent sessions out of the normal list, `parentSession` links back for the peer panel
+			entry.kind = isPeer ? "peer" : "user";
+			entry.parentSession = parentSession || null;
+			entry.peerRole = role?.name || null;
+			entry.peerJournal = [];         // this session's OWNS children (parents only)
+			if (role) entry.retention = entry.retention; // (peers inherit the default retention)
 			if (title) entry.title = title; // sticky-title source (mirror metadata)
 			this.sessions.set(sessionId, entry);
 
@@ -412,8 +448,223 @@ export class AgentHub {
 		}
 		entry.buffer = null; // stop buffering BEFORE delivering (synchronous — no interleave)
 		deliver({ type: "state", sessionId, ...state, rewriteSeq: entry.rewriteSeq || 0, rewrittenFrom: entry.rewrittenFrom || 0 });
+		// PEERS SNAPSHOT (M2): one frame with every child + its truth status; deltas follow as `peer`
+		try {
+			const peers = this.peersOf(sessionId);
+			if (peers.length) deliver({ type: "peers", sessionId, peers, budget: this.remainingPeerBudget(sessionId) });
+		} catch { /* a peer failure must never break an attach */ }
 		for (const msg of queue) deliver(msg);
 		return entry;
+	}
+
+	/**
+	 * BOOT RECONCILE (C18, grok P0-2): a spawn the server died on leaves a dangling `subagent` tool call
+	 * in the parent's transcript and a journal entry with no end. Finish the transaction — write the tool
+	 * result the model is waiting for, mark the peer aborted — or the next provider call fails on a
+	 * dangling tool call (pi-ai requires every toolCall to have a toolResult).
+	 */
+	_reconcilePeers(sessionId) {
+		const entry = this.sessions.get(sessionId);
+		if (!entry) return 0;
+		const dangling = danglingSpawns(entry.peerJournal || [], { liveIds: [] });
+		if (!dangling.length) return 0;
+		// Which `subagent` calls still lack a result? `normalizeRestoredMessages` pass 3 ALREADY strips a
+		// dangling tool call at load (a provider 400 otherwise), so often there is nothing left to answer —
+		// then the reconcile only has to tell the TRUTH about the peer (the journal), which is exactly the
+		// phantom-"running" bug from the review.
+		const answered = new Set(entry.agent.state.messages.filter((m) => m.role === "toolResult").map((m) => m.toolCallId));
+		const openCalls = [];
+		for (const m of entry.agent.state.messages) {
+			if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
+			for (const part of m.content) if (part?.type === "toolCall" && part.name === "subagent" && !answered.has(part.id)) openCalls.push(part.id);
+		}
+		let reconciled = 0, answeredCalls = 0;
+		for (const peer of dangling) {
+			const callId = openCalls.shift();
+			if (callId) {
+				const result = buildPeerResult({ status: "aborted", sessionId: null, role: peer.role, model: peer.model, error: "the server restarted while this peer was running" });
+				entry.agent.state.messages.push({ role: "toolResult", toolCallId: callId, toolName: "subagent", content: [{ type: "text", text: resultText(result) }], details: result, timestamp: Date.now() });
+				answeredCalls += 1;
+			}
+			const j = entry.peerJournal.findIndex((p) => p.peerId === peer.peerId);
+			if (j >= 0) entry.peerJournal[j] = peerEnded(entry.peerJournal[j], { status: "aborted", error: "the server restarted while this peer was running" });
+			reconciled += 1;
+		}
+		if (reconciled) {
+			console.warn(`[agent-hub] reconciled ${reconciled} interrupted peer spawn(s) in ${sessionId.slice(0, 8)}${answeredCalls ? ` (${answeredCalls} tool result(s) written)` : " (the transcript had already dropped the dangling call)"}`);
+			this.persistSession(sessionId, true);
+		}
+		return reconciled;
+	}
+
+	// ─────────────────────────────────────────────────────────────────── peers (plan-subagents.md)
+
+	/**
+	 * Spawn a peer (child session) for `parentId`. Refusals are RESULTS (a terminal error the parent
+	 * model can read), never throws — a prompt that delegates in a loop must not take the server down.
+	 */
+	spawnPeer(parentId, { role, task, model = null, thinking = null, depth = 0 } = {}) {
+		const parent = this.sessions.get(parentId);
+		if (!parent) return { ok: false, reason: "no live session to delegate from" };
+		if (!role) return { ok: false, reason: "unknown role — use subagent({action:\"list\"}) to see the available roles" };
+		if (parent.kind === "peer") return { ok: false, reason: "peers cannot spawn peers (depth 1)" };
+		const spawned = this.peers.spawn({ parentId, role, task, model, thinking, depth });
+		if (!spawned.ok) return spawned;
+		// JOURNAL (D11): persisted with the parent's metadata, so status survives a restart and the boot
+		// reconcile can answer a spawn the process died on.
+		parent.peerJournal = appendJournal(parent.peerJournal || [], spawned.record.entry, { keep: this.peerLimits.journalKeep });
+		// DURABLE BEFORE THE RUN: the journal must be on disk while the child runs, or a crash leaves no
+		// trace of the spawn and the boot reconcile cannot answer the dangling tool call (D11/C18)
+		this.persistSession(parentId, true);
+		return spawned;
+	}
+
+	/** The runner the supervisor drives: create the child session, prompt it, report its final text. */
+	async _runPeer(peer, hooks) {
+		const childId = crypto.randomUUID();
+		const entry = this.getSession(childId, {
+			modelId: peer.model,
+			thinkingLevel: peer.thinking,
+			title: `${peer.role?.name || "peer"} · ${String(peer.task || "").replace(/\s+/g, " ").slice(0, 60)}`,
+			messages: [],
+			role: peer.role,
+			parentSession: peer.parentId,
+		});
+		hooks.setSession(childId);
+		let turns = 0, usage = { input: 0, output: 0, cost: 0 };
+		const off = this.onEvents(childId, (ev) => {
+			if (ev?.type === "turn_end") turns += 1;
+			const u = ev?.message?.usage || ev?.usage;
+			if (u) usage = { input: usage.input + (Number(u.input) || 0), output: usage.output + (Number(u.output) || 0), cost: usage.cost + (Number(u.cost) || 0) };
+			hooks.onUpdate({
+				turn: ev?.type === "turn_end" ? 1 : 0,
+				usage,
+				currentTool: ev?.event?.type === "tool_execution_start" ? ev.event.toolName : null,
+				lastText: extractPreviewText(entry.agent.state.messages.filter((m) => m.role === "assistant").pop()?.content || "", 200),
+			});
+		});
+		const onAbort = () => { try { this.abort(childId); } catch { /* already gone */ } };
+		peer.signal?.addEventListener?.("abort", onAbort, { once: true });
+		try {
+			if (peer.signal?.aborted) return { status: "aborted", error: "stopped before it started", sessionId: childId, usage, turns };
+			await this.prompt(childId, peer.task);
+			await this._awaitPeerEnd(childId, peer.signal);
+			const last = [...entry.agent.state.messages].reverse().find((m) => m.role === "assistant");
+			const failed = !!last?.errorMessage || last?.stopReason === "error";
+			const status = peer.signal?.aborted ? "aborted" : failed ? "error" : "ok";
+			return {
+				status,
+				error: failed ? (last?.errorMessage || "the peer's run failed") : null,
+				summary: fullTextOf(last?.content) || "(the peer returned no text)",
+				usage, turns, sessionId: childId,
+			};
+		} finally {
+			off();
+			peer.signal?.removeEventListener?.("abort", onAbort);
+			try { this.persistSession(childId, true); } catch { /* best effort: the child's own write */ }
+		}
+	}
+
+	/** Resolve when the child stops streaming (its own run ended), or when the signal aborts. */
+	_awaitPeerEnd(sessionId, signal) {
+		return new Promise((resolve) => {
+			const entry = this.sessions.get(sessionId);
+			if (!entry) return resolve();
+			let done = false;
+			const finish = () => { if (done) return; done = true; off(); signal?.removeEventListener?.("abort", finish); resolve(); };
+			const off = this.onEvents(sessionId, (ev) => {
+				if (ev?.type === "agent_end") finish();
+			});
+			signal?.addEventListener?.("abort", finish, { once: true });
+			// the run may already have finished between prompt() and this subscription
+			if (!entry.agent.state.isStreaming) setTimeout(finish, 0);
+		});
+	}
+
+	/** Peer status deltas → the PARENT's attached sockets (the strip). Rate-limited; terminal always. */
+	_emitPeer(parentId, peer) {
+		const now = Date.now();
+		const terminal = peer?.status && peer.status !== "running";
+		if (!terminal) {
+			const last = this._peerEmitAt?.get(parentId) || 0;
+			if (now - last < 250) return;
+		}
+		this._peerEmitAt ||= new Map();
+		this._peerEmitAt.set(parentId, now);
+		try { this.broadcast(parentId, { type: "peer", sessionId: parentId, peer }); } catch { /* no sockets */ }
+	}
+
+	/** Close a peer's journal entry (called by the supervisor's caller once the result is known). */
+	closePeerJournal(parentId, peerId, { status, error = null, usage = null, turns = 0 } = {}) {
+		const parent = this.sessions.get(parentId);
+		if (!parent) return;
+		const journal = parent.peerJournal || [];
+		const i = journal.findIndex((p) => p.peerId === peerId);
+		if (i < 0) return;
+		journal[i] = peerEnded(journal[i], { status: status === "ok" ? "idle" : status, error, usage, turns });
+		parent.peerJournal = journal;
+		this.persistSession(parentId, false);
+	}
+
+	/** Which session owns this peer (journal scan) — the fallback when the peer is not live here. */
+	_parentOfPeer(peerId) {
+		for (const [sessionId, entry] of this.sessions) {
+			if (entry.peerJournal?.some((p) => p.peerId === peerId)) return sessionId;
+		}
+		return null;
+	}
+
+	/** The snapshot the UI reads (live + journal), newest first. */
+	peersOf(parentId) {
+		return this.peers.peersOf(parentId);
+	}
+
+	remainingPeerBudget(parentId) {
+		const parent = this.sessions.get(parentId);
+		return {
+			spawns: Math.max(0, this.peerLimits.maxSpawnsPerParent - (parent?.peerJournal?.length || 0)),
+			concurrent: Math.max(0, this.peerLimits.maxConcurrentPerParent - this.peers.liveCount(parentId)),
+			concurrentGlobal: Math.max(0, this.peerLimits.maxConcurrentGlobal - this.peers.liveCount(null)),
+		};
+	}
+
+	/**
+	 * Control one peer. ACTOR-SCOPED (C15): only the parent may mutate, a child's own socket cannot
+	 * steer itself, and a foreign session is refused. Every verb maps to the SAME hub operation a
+	 * normal session uses (C14) — no parallel code path.
+	 */
+	async controlPeer(actorSessionId, peerId, action, arg = {}) {
+		// the live tree knows a running peer; the JOURNAL is the fallback (after a restart, or for a peer
+		// that already finished) — so status/control keep working for the whole session lifetime (C16)
+		const parentId = this.peers.parentOf(peerId) || this._parentOfPeer(peerId);
+		const parent = this.sessions.get(parentId || "");
+		const journalEntry = parent ? (parent.peerJournal || []).find((p) => p.peerId === peerId) : null;
+		if (!parentId || !parent || !journalEntry) return { ok: false, reason: "unknown peer" };
+		if (parentId !== actorSessionId) return { ok: false, reason: "only the parent session may control this peer" };
+		const view = this.peers.statusOf(parentId, peerId);
+		const childId = view?.sessionId || null;
+		const live = this.peers.has(peerId);
+		if (action === "stop") {
+			if (!live) return { ok: false, reason: "this peer already finished — nothing to stop" };
+			this.peers.cancel(peerId, { reason: String(arg.reason || "stopped by the user"), status: "aborted" });
+			return { ok: true, peer: this.peers.statusOf(parentId, peerId) };
+		}
+		if (action === "stop-all") {
+			const touched = this.peers.cancel(parentId, { treeWide: true, reason: "stopped by the user", status: "aborted" });
+			return { ok: true, stopped: touched.length };
+		}
+		if (action === "steer") {
+			if (!childId) return { ok: false, reason: "the peer has no live session to steer" };
+			const r = await this.steer(childId, String(arg.text || ""));
+			return { ok: r?.accepted !== false, peer: this.peers.statusOf(parentId, peerId), reason: r?.reason || null };
+		}
+		if (action === "retry") {
+			if (this.peers.has(peerId)) return { ok: false, reason: "a live peer cannot be retried — stop it first (retry must never double the spend)" };
+			if (!childId) return { ok: false, reason: "the peer never produced a session" };
+			const r = await this.retry(childId, { reason: "manual" });
+			return { ok: r?.ok !== false, reason: r?.reason || null, peer: this.peers.statusOf(parentId, peerId) };
+		}
+		return { ok: false, reason: `unknown peer action "${action}"` };
 	}
 
 	persistSession(sessionId, immediate = false) {
@@ -1076,6 +1327,9 @@ export class AgentHub {
 							messages: stored.messages,
 						});
 						if (stored.metadata?.imageRetention) entry.retention = stored.metadata.imageRetention; // sticky across restarts
+						if (stored.metadata?.peers?.length) entry.peerJournal = stored.metadata.peers;
+						if (stored.metadata?.kind === "peer") { entry.kind = "peer"; entry.parentSession = stored.metadata.parentSession || null; entry.peerRole = stored.metadata.peerRole || null; }
+						this._reconcilePeers(sessionId);
 					} else if (entry.agent.state.messages.filter((m) => m.role !== "system").length === 0) {
 						// An entry with NO real messages is safe to fill — that is the
 						// poisoned case (created by an attach/prompt that raced the store).
@@ -1090,6 +1344,9 @@ export class AgentHub {
 						// the sticky retention travels with the session, or an eviction would put the next write
 						// back on disk (grok review 2026-10-28, I3)
 						if (stored.metadata?.imageRetention) entry.retention = stored.metadata.imageRetention;
+						if (stored.metadata?.peers?.length) entry.peerJournal = stored.metadata.peers;
+						if (stored.metadata?.kind === "peer") { entry.kind = "peer"; entry.parentSession = stored.metadata.parentSession || null; entry.peerRole = stored.metadata.peerRole || null; }
+						this._reconcilePeers(sessionId);
 					} else {
 						entry.hydrated = true; // live transcript wins; nothing to load
 					}
@@ -1169,6 +1426,13 @@ export class AgentHub {
 			messageCount: state.messages.length,
 		};
 		if (entry.forkedFrom) metadata.forkedFrom = entry.forkedFrom; // lineage (pi header: parentSession)
+		// PEER IDENTITY ON THE WIRE (D10/C17): `kind` keeps subagent sessions out of the main list, the
+		// sync broadcasts and the IDB cache; the parent link is what the peer panel navigates by.
+		metadata.kind = entry.kind || "user";
+		if (entry.parentSession) metadata.parentSession = entry.parentSession;
+		if (entry.peerRole) metadata.peerRole = entry.peerRole;
+		// the child journal rides in the parent's header, so STATUS survives a restart (D11/C18)
+		if (entry.peerJournal?.length) metadata.peers = entry.peerJournal;
 		// tail-first cache: the client's IDB chunks are keyed on this generation
 		metadata.rewriteSeq = entry.rewriteSeq || 0;
 		metadata.rewrittenFrom = entry.rewrittenFrom ?? Number.MAX_SAFE_INTEGER;

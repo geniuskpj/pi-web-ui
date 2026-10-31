@@ -574,6 +574,66 @@ base64 per image byte to disk (526 KB measured in one real session), whatever th
 * thinking lighter on `lan` (256B floor, 0.8s idle), heavier on `metered` (1KB floor, 2.5s idle, 4s ceiling);
 * an unknown `kind` is treated as `thinking` (never as a silent no-op).
 
+## Subagents / peers (2026-10-31, plan-subagents.md M0–M2)
+
+A **peer** is a child agent the main agent delegates to: its own role prompt, its own narrowed tool set,
+its own session (so the user can open its transcript). It is NOT a new store or a second agent framework —
+`hub.spawnPeer()` creates a normal session with `role` + `parentSession`, and everything that already
+works on a session (attach, `/range`, IDB cache, versions, compaction, media redaction, retry, abort)
+works on a peer unchanged.
+
+| Piece | What it does |
+|---|---|
+| `lib/peer-roles.mjs` | role files: `.pi/agents/<role>.md` + frontmatter (`name`, `description`, `tools`, `acceptanceRole`, `thinking`, `model`, `systemPromptMode`). `toolsForRole()` is the SECURITY boundary: a role can only narrow the process tool set, `acceptanceRole: read-only` is a hard floor (no write/edit/bash/…), and no peer ever gets `subagent`. Shipped: `reviewer`, `oracle`, `scout`, `worker`, `delegate`. |
+| `lib/peer-lifecycle.mjs` | the journal (`peer_started` / `peer_ended`), `peerStatusOf()` = pure f(journal, live agents), budgets (`checkPeerBudget` before an Agent exists), and the frozen tool-result schema (`status`, `sessionId`, `role`, `model`, `usage`, `error`, `summary`, `truncated`) with a UTF-8-safe 32 KB cap on `summary` only. |
+| `peer-supervisor.mjs` | owns lifecycle: child promises, the abort TREE, the caps, the heartbeat. `subagent.execute()` only does `await peers.wait(id)` — no hub lock is held across a child run (the deadlock the design review called out). A cancelled run's verdict beats the runner's (a stop must not be reported as "ok"). |
+| `peer-tools.mjs` | the server wiring: role files from disk (mtime cache, workspace overrides global), `toolsForSession(sessionId, meta)`, and the `subagent` tool. |
+| `agent-hub.mjs` | `spawnPeer`, `_runPeer`, `peersOf`, `remainingPeerBudget`, `controlPeer`, `closePeerJournal`, `_reconcilePeers`. |
+
+**The tool** (`subagent`, one row per delegation): `action: run | list | status | stop | steer | retry`
+(+ `role`, `task`, `peerId`, `text`, `all`, `model`). `run` blocks until the peer finishes and streams
+progress into the parent's tool row via `onUpdate` (polled from the peer view). The parent gets the
+child's FINAL TEXT as a tool result — the child's messages never enter the parent's context (C2/C3).
+
+**Journal + boot reconcile (C18).** A spawn writes its journal entry to the parent's session metadata
+BEFORE the run starts (`metadata.peers`), so status survives a restart. On load, `_reconcilePeers()`
+closes entries with no terminal state as `aborted` and, when the transcript still holds the unanswered
+`subagent` tool call, writes the tool result the model is waiting for. (`normalizeRestoredMessages`
+pass 3 usually strips that dangling call first — a provider 400 otherwise — in which case only the
+journal needs fixing, which is exactly the phantom-"running" bug the review found.)
+
+**Status + control** (one view, one verb set):
+
+| Verb | WS | REST | Tool |
+|---|---|---|---|
+| snapshot | `{type:"peers"}` → `{peers, budget}` (also delivered right after `state` on attach) | `GET /api/agent/session/:id/peers` | `subagent({action:"status"})` |
+| stop / stop-all | `{type:"peer", action:"stop"\|"stop-all", peerId}` | `POST …/peers/:peerId/stop` | `subagent({action:"stop", all?})` |
+| steer | `{type:"peer", action:"steer", peerId, text}` | `POST …/peers/:peerId/steer` | `subagent({action:"steer"})` |
+| retry | `{type:"peer", action:"retry", peerId}` | `POST …/peers/:peerId/retry` | `subagent({action:"retry"})` |
+
+Every verb maps to the SAME hub operation a session uses (`abort`/`steer`/`retry`) and is ACTOR-SCOPED:
+only the parent session may mutate a peer (a peer's own socket is observe-only), an unknown peer is a
+refusal with a reason, and stopping an already-finished peer is refused rather than a silent no-op.
+Replies echo the new status (`peer-result`, `peers`) so the UI never guesses. Deltas ride the parent's
+socket as `{type:"peer", peer}` frames (rate-limited ≤1/250 ms; terminal ones always).
+
+**Caps** (before an Agent is constructed, `PI_WEB_PEERS=off` removes the tool entirely): depth 1 (peers
+cannot spawn peers), 3 concurrent per parent, 6 globally, 24 spawns per parent session (cumulative, in
+the journal — a restart cannot reset it), 10 min wall clock, 40 turns / 200k tokens per peer. Over-budget
+is a terminal error result, never a hang. `PI_WEB_TOOLS` stays the outer per-tool gate.
+
+**Roles on disk**: `/api/peer/roles` lists them (name, description, acceptanceRole, effective tool count,
+model, source) so the UI can offer a picker; a workspace `.pi/agents/<role>.md` overrides the global one,
+and a broken file is reported, never fatal.
+
+**Peers are not list entries** (C17): session metadata carries `kind: "user" | "peer"` (+ `parentSession`,
+`peerRole`), `GET /api/sessions` filters peers out by default (`?kind=all` includes them), and the sync
+broadcasts use the same filtered list — so a delegation never fills the sidebar or the client's IDB cache.
+
+Covered by `tests/peer-roles.test.mjs` (33), `tests/peer-lifecycle.test.mjs` (42),
+`tests/peer-supervisor.test.mjs` (32), `tests/subagent.test.mjs` (45) and
+`tests/subagent-server.e2e.mjs` (17).
+
 ## Logging + graceful shutdown (2026-10-21)
 
 **Tee logger** (top of server.mjs): `console.log/warn/error` are wrapped — the original prints to

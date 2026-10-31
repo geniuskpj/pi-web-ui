@@ -1,6 +1,10 @@
 # plan-subagents.md — child sessions (peers) in pi web
 
-Status: **proposal, not started.** Supersedes the stale `feat/llm-peer-chat` placeholder branch (which
+Status: **M0–M2 IMPLEMENTED** (2026-10-31). M3 (the UI: peer panel, peers strip, session-list grouping) is
+the next step; M4/M5 are still open. See *Implementation log* at the end for the files, the test counts and
+the three things the code does differently from this document.
+
+Supersedes the stale `feat/llm-peer-chat` placeholder branch (which
 contains no peer code — see *Appendix A*). Written 2026-10-31 after reading the reference implementation
 [`nicobailon/pi-subagents`](https://github.com/nicobailon/pi-subagents) (MIT; ideas only, no code copied).
 
@@ -322,3 +326,35 @@ Explicitly *not* adopted: nothing — all nine were consistent with the plan's g
 "no issue" list (reusing JSONL + one Agent per session + hub frames for peers, one row back to the
 parent, one verb vocabulary, server-side loop as the source of truth) matches the plan's own claims and
 is unchanged.
+
+## Implementation log
+
+### 2026-10-31 — M0, M1, M2 landed (server-side, tested; the wire contracts are frozen from here)
+
+| Milestone | Files | Tests |
+|---|---|---|
+| M0 model / visibility / status / caps | `lib/peer-roles.mjs`, `lib/peer-lifecycle.mjs`, `peer-supervisor.mjs` | `peer-roles` 33, `peer-lifecycle` 42, `peer-supervisor` 32 |
+| M1 spawn + one-row result + reconcile | `agent-hub.mjs` (`spawnPeer`, `_runPeer`, `closePeerJournal`, `_reconcilePeers`, metadata `kind`/`peers`), `peer-tools.mjs`, `server.mjs` (`getTools(sessionId, meta)`, role dirs, `/api/peer/roles`) | `subagent.test.mjs` §S/§J/§R/§G/§T |
+| M2 status + control | `agent-hub.mjs` (`peersOf`, `remainingPeerBudget`, `controlPeer`, `_parentOfPeer`, `_emitPeer`, the attach `peers` frame), `server.mjs` (WS `peers`/`peer`, REST `GET …/peers`, `POST …/peers/:peerId/:action`) | `subagent.test.mjs` §C, `subagent-server.e2e.mjs` 17 |
+
+Every invariant the review demanded is pinned as a test: the lock-safety proof (a strict mutex plus a
+parent abort while the child holds it — `peer-supervisor.test.mjs` §L), the honest status function
+(`peer-lifecycle.test.mjs` §S), the caps (§B/§G), the frozen result schema (§R/§T) and the boot reconcile
+in BOTH transcript shapes (`subagent.test.mjs` §R).
+
+**Three deviations from this document, all deliberate:**
+
+1. **The journal rides in the session METADATA (`metadata.peers[]`), not as extra JSONL lines.** Every
+   reader of a session file assumes `line 0 = metadata, rest = messages` (`_writeSession`, `loadMessages`,
+   the worker, `/range`), so non-message lines would break the storage contract. Same facts, survives a
+   restart, no new parser. Bounded by `journalKeep` (50).
+2. **`normalizeRestoredMessages` already strips a dangling `subagent` tool call at load** (pass 3 — a
+   provider 400 otherwise), so the reconcile often has no call left to answer. It therefore ALWAYS fixes
+   the journal (the phantom-`running` bug the review found) and writes the tool result when the call is
+   still present. Both shapes are in the suite; the log line says which one happened.
+3. **The child's own lifecycle is its session, not a second journal.** A peer's terminal state is its
+   transcript's last message + the parent's journal entry, so `metadata.parentSession`/`peerRole` is all the
+   child needs. Adding a per-child journal would be a second source of truth for the same fact.
+
+**Still open:** M3 (peer panel, peers strip, session-list grouping, user-spawned peers — the `spawn` WS
+verb does not exist yet), M4 (`read_peer`, budget UX, peer GC/TTL), M5 (council, arena-bridge peers).

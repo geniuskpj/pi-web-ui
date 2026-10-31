@@ -40,6 +40,10 @@ Browser (any device)                 Node server (:8787)
 | `lib/session-search.mjs` | whole-session find: roles, turns, snippets with match offsets, caps |
 | `lib/rg-json.mjs` | `rg --json` argv + parser for the workspace search (grouped, per-file caps) |
 | `lib/image-dims.mjs` | pixel size from an image HEADER alone (PNG/JPEG/GIF/WebP/BMP) — lets the composer apply the resolution cap without decoding |
+| `lib/peer-roles.mjs` | peer (subagent) roles: `.pi/agents/<role>.md` + frontmatter, the read-only tool floor, `toolsForRole` |
+| `lib/peer-lifecycle.mjs` | peer journal + `peerStatusOf()` (status survives a restart), budgets, the frozen tool-result schema |
+| `peer-supervisor.mjs` | peer lifecycle owner: child promises, abort tree, caps, heartbeat — no hub lock across a child run |
+| `peer-tools.mjs` | server wiring: role files from disk, per-session tool list, the bound `subagent` tool |
 | `src/image-encode.ts` | browser-side encode (`encodeForModel`: decide → capped decode → plan → webp/jpeg) + binary upload (`uploadImage`) |
 | `lib/display-gate.mjs` | which user turns a large session shows (seq-space gate) |
 | `lib/turn-timing.mjs` | opt-in `PI_WEB_TIMING=1` turn timeline (fetch headers/first chunk + hub stages) |
