@@ -13,9 +13,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import { resolveRole, toolsForRole, roleCatalog } from "./lib/peer-roles.mjs";
-import { buildPeerResult, resultText, truncateUtf8 } from "./lib/peer-lifecycle.mjs";
+import { buildPeerResult, resultText } from "./lib/peer-lifecycle.mjs";
 
 const ROLE_NAME_RE = /^[a-z0-9][a-z0-9_-]*$/i;
+/** A delegation task is a briefing, not a file dump (grok pre-restart review, P2). */
+const MAX_TASK_CHARS = 32 * 1024;
+/** Steering a peer is a nudge, not a new prompt. */
+const MAX_STEER_CHARS = 8 * 1024;
 
 /**
  * @param {object} deps
@@ -62,12 +66,23 @@ export function createPeerIntegration({ hub, usableTools, piDir, workspaceDir, e
 	/** The tool list for ONE session: the only place a peer and a user session differ. */
 	function toolsForSession(sessionId, meta = {}) {
 		const base = usableTools();
-		if (meta.role || meta.kind === "peer") {
-			const names = new Set(toolsForRole(meta.role, base.map((t) => t.name)));
-			return base.filter((t) => names.has(t.name));
+		try {
+			if (meta.kind === "peer" && !meta.role) {
+				// an unresolvable role is the SAFEST case, not the widest (grok pre-restart review, P1)
+				return base.filter((t) => t.name === "read_file");
+			}
+			if (meta.role || meta.kind === "peer") {
+				const names = new Set(toolsForRole(meta.role, base.map((t) => t.name)));
+				return base.filter((t) => names.has(t.name));
+			}
+			if (!enabled) return base;
+			return [...base, makeSubagentTool(sessionId)];
+		} catch (err) {
+			// ONE broken role file must not cost a session its tools (grok pre-restart review): a peer falls
+			// back to nothing but its read-only read tools, a user session to the plain builtin set.
+			log(`[peer] toolsForSession fell back for ${String(sessionId).slice(0, 8)}: ${err?.message || err}`);
+			return meta.role || meta.kind === "peer" ? base.filter((t) => t.name === "read_file") : base;
 		}
-		if (!enabled) return base;
-		return [...base, makeSubagentTool(sessionId)];
 	}
 
 	const peerLine = (p) =>
@@ -114,7 +129,10 @@ export function createPeerIntegration({ hub, usableTools, piDir, workspaceDir, e
 				const asText = (text, details = null) => ({ content: [{ type: "text", text }], ...(details ? { details } : {}) });
 
 				if (action === "list") {
-					return asText(catalog().map((r) => `- ${r.name} (${r.acceptanceRole}${r.model ? `, ${r.model}` : ""}) — ${r.description || "(no description)"} [${r.tools} tools]`).join("\n"));
+					// an unreadable role file is REPORTED as such, never printed as a half-built row
+					return asText(catalog().map((r) => (r.error
+						? `- ${r.name}: ${r.error}`
+						: `- ${r.name} (${r.acceptanceRole}${r.model ? `, ${r.model}` : ""}) — ${r.description || "(no description)"} [${r.tools} tools]`)).join("\n"));
 				}
 				if (action === "status") {
 					const peers = hubRef().peersOf(parentSessionId);
@@ -123,7 +141,8 @@ export function createPeerIntegration({ hub, usableTools, piDir, workspaceDir, e
 					return asText(peers.length ? `${peers.map(peerLine).join("\n")}\n${tail}` : `no peers yet\n${tail}`, { peers, budget });
 				}
 				if (action === "stop" || action === "steer" || action === "retry") {
-					const r = await hubRef().controlPeer(parentSessionId, String(params?.peerId || ""), params?.all ? "stop-all" : action, { text: String(params?.text || ""), reason: "the parent agent stopped it" });
+					const text = String(params?.text || "").slice(0, MAX_STEER_CHARS);
+					const r = await hubRef().controlPeer(parentSessionId, String(params?.peerId || ""), params?.all ? "stop-all" : action, { text, reason: "the parent agent stopped it" });
 					const okText = params?.all ? `stopped ${r.stopped ?? 0} peer(s)` : `${action === "steer" ? "steered" : action === "retry" ? "retrying" : "stopping"} ${params?.peerId}`;
 					return asText(r.ok ? okText : `could not ${action}: ${r.reason}`);
 				}
@@ -136,6 +155,7 @@ export function createPeerIntegration({ hub, usableTools, piDir, workspaceDir, e
 				}
 				const task = String(params?.task || "").trim();
 				if (!task) return asText("`task` is required for action:run — give the peer a self-contained job");
+				if (task.length > MAX_TASK_CHARS) return asText(`task is too long (${task.length} > ${MAX_TASK_CHARS} chars) — split it into two delegations`);
 				const spawned = hubRef().spawnPeer(parentSessionId, { role, task, model: params?.model || null });
 				if (!spawned.ok) {
 					const res = buildPeerResult({ status: "error", role: role.name, error: spawned.reason });
@@ -150,17 +170,26 @@ export function createPeerIntegration({ hub, usableTools, piDir, workspaceDir, e
 				}, 1000) : null;
 				poll?.unref?.();
 				const onAbort = () => { try { hubRef().peers.cancel(spawned.peerId, { reason: "the parent's turn was aborted", status: "aborted" }); } catch { /* already gone */ } };
-				signal?.addEventListener?.("abort", onAbort, { once: true });
+				// an ALREADY-aborted signal never fires the listener (grok pre-restart review, P1): a spawn that
+				// races a parent stop would otherwise run to completion
+				if (signal?.aborted) onAbort(); else signal?.addEventListener?.("abort", onAbort, { once: true });
 				try {
 					const out = await hubRef().peers.wait(spawned.peerId, parentSessionId);
 					hubRef().closePeerJournal(parentSessionId, spawned.peerId, { status: out.status, error: out.error, usage: out.usage, turns: out.turns, sessionId: out.sessionId });
 					// `peerId` travels with the result (copilot review 2026-10-31): every follow-up — the UI's
 					// transcript link, stop/steer/retry — addresses a peer BY id, not by its child session
-					const res = buildPeerResult({ status: out.status, peerId: spawned.peerId, sessionId: out.sessionId, role: role.name, model: out.model, usage: out.usage, error: out.error, summary: out.summary || "" });
-					const cut = truncateUtf8(res.summary, hubRef().peerLimits.summaryBytes);
-					res.summary = cut.text;
-					res.truncated = cut.truncated;
+					// ONE truncation, inside resultText (grok pre-restart review, P1): truncating here as well
+					// re-cut the marker on the second pass, and truncated `details.summary` for failures too.
+					const summary = out.status === "ok" ? String(out.summary || "") : "";
+					const res = buildPeerResult({ status: out.status, peerId: spawned.peerId, sessionId: out.sessionId, role: role.name, model: out.model, usage: out.usage, error: out.error, summary });
+					res.truncated = Buffer.byteLength(summary, "utf8") > hubRef().peerLimits.summaryBytes;
 					log(`[peer] ${role.name} ${res.status} (${res.usage.input + res.usage.output} tokens, ${out.turns ?? 0} turns)`);
+					return asText(resultText(res), res);
+				} catch (err) {
+					// THE LAST LINE OF DEFENCE (grok pre-restart review, P0): whatever throws — a wedged wait, a
+					// journal write, a malformed result — the parent MUST get exactly one tool result, or the next
+					// provider call fails on a dangling tool call and the session is stuck.
+					const res = buildPeerResult({ status: "error", peerId: spawned.peerId, sessionId: null, role: role.name, error: `the peer could not be awaited: ${String(err?.message || err)}` });
 					return asText(resultText(res), res);
 				} finally {
 					if (poll) clearInterval(poll);

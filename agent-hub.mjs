@@ -8,6 +8,7 @@
 // Clients can disconnect at any time — long jobs keep running server-side.
 import { Agent } from "@earendil-works/pi-agent-core";
 import { alignDown } from "./lib/chunk-window.mjs";
+import { isMediaHash } from "./lib/data-reduction.mjs";
 // egress redaction (plan §2.2b): inline base64 → content hash + the /media route
 import { createMediaStore, redactImageData, hydrateImageData, missingImageHashes } from "./lib/media-egress.mjs";
 // PEERS (plan-subagents.md): a delegation is a NORMAL session with a role, and a supervisor owns the
@@ -286,7 +287,9 @@ export class AgentHub {
 			entry.parentSession = parentSession || null;
 			entry.peerRole = role?.name || null;
 			entry.peerJournal = [];         // this session's OWNS children (parents only)
-			if (role) entry.retention = entry.retention; // (peers inherit the default retention)
+			// a peer inherits the PARENT's retention (grok pre-restart review: this line used to be a no-op,
+			// so a child of a "browser" session would persist its own images under the process default)
+			if (role && parentSession) entry.retention = this.sessions.get(parentSession)?.retention || undefined;
 			if (title) entry.title = title; // sticky-title source (mirror metadata)
 			this.sessions.set(sessionId, entry);
 
@@ -447,13 +450,19 @@ export class AgentHub {
 			}
 		}
 		entry.buffer = null; // stop buffering BEFORE delivering (synchronous — no interleave)
-		deliver({ type: "state", sessionId, ...state, rewriteSeq: entry.rewriteSeq || 0, rewrittenFrom: entry.rewrittenFrom || 0 });
+		// EVERY frame this attach hands over is redacted (2026-10-31, pre-restart review): the snapshot was
+		// built from `entry.agent.state.messages` RAW and `deliver` sent it verbatim, so every device got
+		// the inline image base64 back on attach (and wrote it into its IDB cache) — the REST/range paths
+		// redacted, this one did not. `deliver` is the single choke point: the snapshot, the peer frame and
+		// the frames buffered while the snapshot was being built all pass through it.
+		const send = (msg) => deliver(this.redactFrame(msg));
+		send({ type: "state", sessionId, ...state, rewriteSeq: entry.rewriteSeq || 0, rewrittenFrom: entry.rewrittenFrom || 0 });
 		// PEERS SNAPSHOT (M2): one frame with every child + its truth status; deltas follow as `peer`
 		try {
 			const peers = this.peersOf(sessionId);
-			if (peers.length) deliver({ type: "peers", sessionId, peers, budget: this.remainingPeerBudget(sessionId) });
+			if (peers.length) send({ type: "peers", sessionId, peers, budget: this.remainingPeerBudget(sessionId) });
 		} catch { /* a peer failure must never break an attach */ }
-		for (const msg of queue) deliver(msg);
+		for (const msg of queue) send(msg);
 		return entry;
 	}
 
@@ -464,6 +473,16 @@ export class AgentHub {
 	 * dangling tool call (pi-ai requires every toolCall to have a toolResult).
 	 */
 	_reconcilePeers(sessionId) {
+		try {
+			return this._reconcilePeersInner(sessionId);
+		} catch (err) {
+			// a broken journal must not take down attach/hydrate for a session (grok pre-restart review)
+			console.warn(`[agent-hub] peer reconcile failed for ${String(sessionId).slice(0, 8)}: ${err?.message || err}`);
+			return 0;
+		}
+	}
+
+	_reconcilePeersInner(sessionId) {
 		const entry = this.sessions.get(sessionId);
 		if (!entry) return 0;
 		const dangling = danglingSpawns(entry.peerJournal || [], { liveIds: [] });
@@ -1228,7 +1247,9 @@ export class AgentHub {
 		const out = [], missing = [];
 		for (const part of list) {
 			if (typeof part.data === "string" && part.data) { out.push({ type: "image", mimeType: part.mimeType || "image/png", data: part.data }); continue; }
-			const hit = part.hash ? this.media.get(part.hash) : null;
+			// a hash-shaped string only (grok pre-restart review 2026-10-31): the store also validates, but a
+			// user-supplied part must never reach a filesystem lookup at all — "missing" is the honest answer
+			const hit = isMediaHash(part.hash) ? this.media.get(part.hash) : null;
 			if (!hit?.bytes) { missing.push(part.hash || "?"); continue; }
 			out.push({ type: "image", mimeType: part.mimeType || hit.mimeType || "image/png", data: Buffer.from(hit.bytes).toString("base64") });
 		}
@@ -1461,7 +1482,7 @@ export class AgentHub {
 		if (entry.forkedFrom) metadata.forkedFrom = entry.forkedFrom; // lineage (pi header: parentSession)
 		// PEER IDENTITY ON THE WIRE (D10/C17): `kind` keeps subagent sessions out of the main list, the
 		// sync broadcasts and the IDB cache; the parent link is what the peer panel navigates by.
-		metadata.kind = entry.kind || "user";
+		if (entry.kind === "peer") metadata.kind = "peer"; // only peers carry it (reader-side default is "user")
 		if (entry.parentSession) metadata.parentSession = entry.parentSession;
 		if (entry.peerRole) metadata.peerRole = entry.peerRole;
 		// the child journal rides in the parent's header, so STATUS survives a restart (D11/C18)
@@ -1845,6 +1866,7 @@ export class AgentHub {
 		this.sessions.delete(sessionId);
 		this.subscribers.delete(sessionId);
 		this.mediaRetention.delete(sessionId); // no session → no retention votes to keep
+		this._peerEmitAt?.delete(sessionId);   // …and no peer-emit rate stamp either
 		// idle delta with a MAX seq — passes the client's stale-frame guard so the
 		// runtime entry is removed everywhere immediately
 		try { this.onRuntimeChange?.(sessionId, { sessionId, status: "idle", seq: Number.MAX_SAFE_INTEGER }); } catch { /* ignore */ }
@@ -1881,6 +1903,7 @@ export class AgentHub {
 				this.sessions.delete(id);
 				this.subscribers.delete(id); // SSE subscribers die with the session
 				this.mediaRetention.delete(id); // (the sticky choice went to disk with the session file)
+			this._peerEmitAt?.delete(id);
 				console.info(`[agent-hub] evicted idle session ${id.slice(0, 8)}`);
 			}
 		}

@@ -64,7 +64,19 @@ Body.`);
 	const readOnly = parseRoleFile(`---\nname: r\ntools: read_file, bash, edit, subagent\nacceptanceRole: read-only\n---\nx`);
 	const tools = toolsForRole(readOnly, AVAILABLE);
 	check("T1 read-only STRIPS the mutating tools even when the file lists them", !tools.includes("bash") && !tools.includes("edit"), JSON.stringify(tools));
-	check("T2 …and keeps the read tools", tools.includes("read_file") && tools.includes("rg_search"));
+	check("T2 …and keeps exactly what the file DECLARED (read_file), not every non-mutating tool",
+		tools.includes("read_file") && !tools.includes("rg_search") && !tools.includes("fetch"), JSON.stringify(tools));
+	check("T2b a read-only role WITHOUT a `tools:` list still gets every non-mutating tool",
+		(() => {
+			const open = parseRoleFile("---\nname: open\nacceptanceRole: read-only\n---\nx");
+			const t = toolsForRole(open, AVAILABLE);
+			return t.includes("read_file") && t.includes("rg_search") && t.includes("fetch") && !t.includes("bash");
+		})());
+	check("T2c …and a DECLARED read-only list cannot be widened by the floor (least privilege)",
+		(() => {
+			const narrow = parseRoleFile("---\nname: narrow\ntools: read_file\nacceptanceRole: read-only\n---\nx");
+			return JSON.stringify(toolsForRole(narrow, AVAILABLE)) === JSON.stringify(["read_file"]);
+		})());
 	check("T3 read-only never keeps write_file", !tools.includes("write_file"));
 	check("T4 a peer NEVER gets `subagent` (no grandchildren), whatever the file says", !toolsForRole(readOnly, AVAILABLE).includes("subagent"));
 	const writer = parseRoleFile(`---\nname: w\ntools: read_file, edit, bash, subagent\nacceptanceRole: writer\n---\nx`);
@@ -98,6 +110,12 @@ Body.`);
 		["reviewer", "oracle", "scout"].every((n) => {
 			const t = toolsForRole(resolveRole(n, {}), AVAILABLE);
 			return t.length > 0 && !t.some((x) => MUTATING_TOOLS.includes(x));
+		}));
+	check("B3b …and each one is limited to the tools ITS file declares (a role is a job description with a budget)",
+		["reviewer", "oracle", "scout"].every((n) => {
+			const role = resolveRole(n, {});
+			const t = toolsForRole(role, AVAILABLE);
+			return t.every((x) => role.tools.includes(x));
 		}));
 	check("B4 worker is a writer with the shell (that is the point of the role)",
 		(() => { const t = toolsForRole(resolveRole("worker", {}), AVAILABLE); return t.includes("bash") && t.includes("edit"); })());

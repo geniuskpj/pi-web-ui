@@ -91,7 +91,7 @@ try {
 		const proxySrc = fs.readFileSync(new URL("../src/proxy-agent.ts", import.meta.url), "utf8");
 		check("E7 ProxyAgent implements setDataReduction and pushes it on every attach",
 			/setDataReduction\(cfg: Record<string, unknown>\): void/.test(proxySrc) && /pushDataReduction\(this\)/.test(proxySrc) &&
-			/import \{ pushDataReduction \} from ".\/ui\/data-settings.js"/.test(proxySrc));
+			/import \{ [^}]*pushDataReduction[^}]* \} from ".\/ui\/data-settings.js"/.test(proxySrc));
 	}
 
 	for (const c of [silent, tuned]) { try { c.ws.close(); } catch { /* gone */ } }

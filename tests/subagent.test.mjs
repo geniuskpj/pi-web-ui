@@ -81,6 +81,15 @@ function makeHub({ reply = "THE PEER REPORT", replies = null, persist = async ()
 	check("S7 the child's TASK is in its own transcript (the peer got the job, not the parent's history)",
 		hub.sessions.get(childId).agent.state.messages.some((m) => m.role === "user" && textOf(m).includes("review the diff")));
 	const pMsgs = hub.sessions.get("P").agent.state.messages;
+	check("S7b a peer inherits its PARENT's image retention (a child of a browser-retention session)",
+		(() => {
+			hub.setMediaRetention("P", "phone", "browser");
+			const s2 = hub.spawnPeer("P", { role: REVIEWER, task: "another" });
+			const child = hub.sessions.get(s2.record.sessionId);
+			const inherited = child?.retention === "browser";
+			hub.setMediaRetention("P", "phone", "server");
+			return inherited;
+		})());
 	check("S8 the parent's transcript is UNTOUCHED by the child (no transcript splicing)",
 		!pMsgs.some((m) => textOf(m).includes("THE PEER REPORT")) &&
 		pMsgs.filter((m) => m.role !== "system").length === 1 &&
@@ -108,8 +117,10 @@ function makeHub({ reply = "THE PEER REPORT", replies = null, persist = async ()
 	check("J3c the journal-backed VIEW carries it too (the panel/retry read the view, not the entry)",
 		hub.peersOf("P")[0].sessionId === spawned.record.sessionId, JSON.stringify(hub.peersOf("P")[0].sessionId));
 	const meta = hub._buildMetadata("P");
-	check("J4 the journal and the peer identity ride the METADATA (they survive a restart)",
-		meta.peers?.[0]?.peerId === spawned.peerId && meta.kind === "user");
+	check("J4 the journal rides the METADATA (it survives a restart)",
+		meta.peers?.[0]?.peerId === spawned.peerId);
+	check("J4b …and a USER session does NOT get a `kind` key (readers default to user; no header churn)",
+		meta.kind === undefined, String(meta.kind));
 	const childMeta = hub._buildMetadata(spawned.record.sessionId);
 	check("J5 the child's own header says it is a peer with a parent (so the list can hide it)",
 		childMeta.kind === "peer" && childMeta.parentSession === "P" && childMeta.peerRole === "reviewer");

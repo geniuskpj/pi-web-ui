@@ -20,10 +20,14 @@ export function PeerStrip({ agent, onOpen }: { agent: any; onOpen: (peer: Peer) 
 	const [peers, setPeers] = useState<Peer[]>(agent?.peers || []);
 	const [budget, setBudget] = useState<PeerBudget | null>(agent?.peerBudget || null);
 	const [, force] = useState(0);
+	const peersRef = useRef<Peer[]>(peers);
+	peersRef.current = peers;
 	useEffect(() => {
 		if (!agent?.onPeers) return;
 		const off = agent.onPeers((list: Peer[], b: PeerBudget) => { setPeers(list); setBudget(b); });
-		const tick = setInterval(() => force((n) => n + 1), 1000); // the elapsed time ticks client-side
+		// the elapsed time ticks client-side — but only while a peer is actually running (an idle strip
+		// with a 1 Hz re-render was pure waste; grok pre-restart review, P2)
+		const tick = setInterval(() => force((n) => (peersRef.current.some((p) => p.status === "running") ? n + 1 : n)), 1000);
 		return () => { off?.(); clearInterval(tick); };
 	}, [agent]);
 	if (!peers.length) return null;
@@ -89,9 +93,12 @@ export function PeerPanel({ agent, peer, onClose }: { agent: any; peer: Peer; on
 	useEffect(() => {
 		const id = peer.sessionId;
 		if (!id) { setErr("the peer has no session yet — it was refused or never started"); return; }
-		const pa = new ProxyAgent(id);
+		// OBSERVE-ONLY (grok pre-restart review, P1): the panel renders the child; it must not be able to
+		// prompt/steer/abort it — control goes through the PARENT's agent (`agent.controlPeer`), which is
+		// exactly how the server scopes it (actor = parent).
+		const pa = new ProxyAgent(id, undefined, { observeOnly: true });
 		peerAgent.current = pa;
-		pa.connect(); // a READ-mostly socket of its own: it never prompts the peer, it renders it
+		pa.connect();
 		const unsub = pa.subscribe((ev: any) => {
 			if (ev?.type === "state") setEntries(peerEntries(pa.state.messages));
 			else if (ev?.type === "agent" && (ev.event?.type === "message_end" || ev.event?.type === "turn_end" || ev.event?.type === "agent_end")) {

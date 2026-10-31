@@ -40,7 +40,9 @@ const peer = (id, extra = {}) => ({ id, role: "reviewer", model: "faux/faux-1", 
 	list = applyPeer(list, peer("a", { status: "aborted", error: "stopped by the user" }));
 	list = applyPeer(list, peer("a", { status: "running", lastText: "still here?" }));
 	check("D4 a TERMINAL status wins over a later `running` delta (no zombie chip)",
-		list[0].status === "aborted" && list[0].lastText === "still here?", list[0].status);
+		list[0].status === "aborted", list[0].status);
+	check("D4b …and the late frame's live fields do NOT land (a stopped chip must stop moving)",
+		list[0].lastText !== "still here?", JSON.stringify({ lastText: list[0].lastText }));
 	list = applyPeer(list, peer("a", { status: "error", error: "boom" }));
 	check("D5 …but a terminal→terminal update still lands (error replaces aborted)", list[0].status === "error" && list[0].error === "boom");
 	list = applyPeer(list, peer("a", { status: "running" }));

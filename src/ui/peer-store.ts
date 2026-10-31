@@ -54,9 +54,10 @@ export function applyPeer(current: Peer[], peer: Peer | null | undefined): Peer[
 	if (i < 0) return sortPeers([...list, peer]);
 	const prev = list[i];
 	const terminal = (s: PeerStatus) => s !== "running";
-	const merged: Peer = { ...prev, ...peer };
-	if (terminal(prev.status) && !terminal(peer.status)) merged.status = prev.status;
-	list[i] = merged;
+	// a late PROGRESS frame for a peer that already finished must not revive its live fields either
+	// (grok pre-restart review, P2): the status stays terminal, so the chip must stop moving with it
+	if (terminal(prev.status) && !terminal(peer.status)) { list[i] = prev; return sortPeers(list); }
+	list[i] = { ...prev, ...peer }; // terminal -> terminal still lands (error may replace aborted)
 	return sortPeers(list);
 }
 

@@ -41,6 +41,31 @@ limitation or a deferred item, recorded so it is not rediscovered as a "bug".)
 
 ## Recently closed (kept one release, then pruned)
 
+### 2026-10-31 — pre-restart grok review of the peers + image work (2 packets, 2 P0s + 9 P1/P2s)
+
+Reviewed the whole delta (2cc7813 → HEAD) before the server restart. Everything actionable is fixed; the
+restart is cleared (with one migration caveat, below).
+
+| Sev | Area | Was | Now |
+|---|---|---|---|
+| **P0** | `peer-supervisor.mjs` | a wall-clock timeout or a cancel only called `abort()`; a runner that ignored it (a wedged tool — the LFP shape) left `wait()` pending forever, so the parent's tool call dangled and the record stayed in the maps. `CANCEL_GRACE_MS` was exported and never used | a force-settle races the runner: after the grace the promise resolves with `aborted`/`timeout` + reason, the record leaves the maps, and a later `wait()` replays it. `sweep()` now reads `controller.signal` (it read a field that never existed) and settles. `tests/peer-supervisor.test.mjs` §F |
+| **P0** | `peer-tools.mjs` | the `run` path had no `catch`: a `wait()`/journal throw rejected the tool → the parent transcript kept a tool call with no result (the exact invariant the module claims) | the last line of defence returns one `error` result for ANY throw; the abort listener also fires when the signal is already aborted |
+| P1 | hub, `attach` | **found by the new e2e check**: the WS attach snapshot (and frames buffered during it) bypassed redaction, so inline image base64 went back to every device and into its IDB cache | `attach` funnels every delivered frame through `redactFrame`; `media-egress.e2e` §E7 asserts no base64 in any attach frame |
+| P1 | retention vs snapshot order | the client's settings frame arrives only after `state`, so the first attach of an imaged session wrote blobs to disk before a "browser" device was heard | the client sends `imageRetention` **with** the attach and the server applies it before the snapshot; `media-egress.e2e` §E7b (no blob written) |
+| P1 | `lib/peer-roles.mjs` `toolsForRole` | the read-only floor returned EVERY non-mutating tool, so a role asking for `read_file` alone also got `fetch` and the whole extension surface | intersect the declared list FIRST, then apply the read-only floor; a peer whose role cannot be resolved gets `read_file` only; `peer-roles` §T2b/T2c/B3b |
+| P1 | `agent-hub.mjs` `hydrateImages` | lost the `isMediaHash` check the old prompt path had (the store also guards, so no traversal, but a user string reached a lookup) | hash shape validated before the store; `hub-hydration` still green |
+| P1 | `agent-hub.mjs` `_buildMetadata` / `_peerEmitAt` / `lib/versions-sidecar.mjs` | `kind: "user"` was written into EVERY session header; the peer-emit rate map and the version append chains grew per session id forever | `kind` only for peers; both maps pruned on discard/evict/completion |
+| P1 | `agent-hub.mjs` `getSession` | `if (role) entry.retention = entry.retention;` was a no-op — a child of a "browser" session persisted under the process default | a peer inherits its parent's retention |
+| P1 | `lib/peer-lifecycle.mjs` | summary truncated twice (the marker could be re-cut on the second pass; `details.summary` truncated for failures too); the leading ellipsis sat outside the byte cap; `error` was uncapped | one truncation in `resultText`, budget covers marker+ellipsis, error capped at 4 KB; `peer-lifecycle` §C |
+| P1 | client | the peer panel's second `ProxyAgent` could prompt/steer/abort the child; `send()` could still drop an in-flight upload after its 15 s wait; concurrent pastes all saw `prev.length === 0` and could all fail past the cap | `observeOnly` mode (mutating frames refused), a still-uploading send is refused with a note, the image slot is reserved synchronously; `data-reduction` §I1d3/I1d4, `peer-store` §D4b |
+| P2 | misc | role catalog printed half-built rows for unreadable files; unbounded `task`/steer text; strip ticked at 1 Hz with no peers | reported as errors, capped at 32 KB/8 KB, tick only while something runs |
+
+**Restart caveat (unchanged, now explicit):** the first persist of a session that holds INLINE images
+rewrites it to hash-only — a one-way migration. The bytes remain in `data/media/<hash>`, but the previous
+commit cannot read hash-only parts, so a rollback of such a session would need the JSONL restored from
+backup or the images re-attached. Sessions without images, and attach-only traffic, are rollback-safe.
+
+
 ### 2026-10-31 — copilot review (5 findings, all confirmed and fixed)
 
 | # | Where | Was | Now |

@@ -11,6 +11,8 @@
 //
 // Usage: node tests/media-egress.e2e.mjs
 import WebSocket from "ws";
+import fs from "node:fs";
+import path from "node:path";
 import { startScratchServer } from "./_scratch-server.mjs";
 import { isMediaHash } from "../lib/data-reduction.mjs";
 import zlib from "node:zlib";
@@ -118,6 +120,46 @@ try {
 		memOnly.persisted === false && (await json(`/api/agent/session/${SESSION}/media/${memOnly.hash}`)).status === 200);
 
 	sync.close();
+
+	// 7) RETENTION MUST BE IN FORCE BEFORE THE FIRST SNAPSHOT (grok pre-restart review 2026-10-31).
+	// The client's settings frame arrives only AFTER `state`, so an attach without the retention would
+	// redact (and therefore WRITE) an inline image to disk before a "browser" device could be heard.
+	// The client now sends it in the attach frame; this drives that exact sequence over a real socket.
+	const SESSION2 = "mediaegress0000000000000000002";
+	const sync2 = new WebSocket(`ws://127.0.0.1:${srv.port}/ws/sync?token=${encodeURIComponent(srv.token)}`);
+	await new Promise((res, rej) => { sync2.on("open", res); sync2.on("error", rej); });
+	sync2.send(JSON.stringify({
+		type: "put", id: SESSION2,
+		jsonl: [JSON.stringify({ id: SESSION2, modelId: "faux-1", thinkingLevel: "high", title: "browser retention", messageCount: 2 }),
+			JSON.stringify({ role: "user", content: [{ type: "text", text: "photo" }, { type: "image", mimeType: "image/png", data: bigBase64 }], timestamp: 1700000000000 }),
+			JSON.stringify({ role: "assistant", content: "ok", timestamp: 1700000001000 })].join("\n"),
+	}));
+	await sleep(500);
+	const mediaDir = path.join(srv.dataDir, "media");
+	const mediaFiles = () => { try { return fs.readdirSync(mediaDir).flatMap((d) => { try { return fs.readdirSync(path.join(mediaDir, d)).map((f) => `${d}/${f}`); } catch { return []; } }); } catch { return []; } };
+	const before = mediaFiles().length;
+	const ws2 = new WebSocket(`ws://127.0.0.1:${srv.port}/ws/agent?token=${encodeURIComponent(srv.token)}`);
+	const frames2 = [];
+	ws2.on("message", (raw) => { try { frames2.push(JSON.parse(raw.toString())); } catch { /* ignore */ } });
+	await new Promise((res, rej) => { ws2.on("open", res); ws2.on("error", rej); });
+	// the browser-retention device attaches: its choice rides the attach frame itself
+	ws2.send(JSON.stringify({ type: "attach", sessionId: SESSION2, tailFirst: false, imageRetention: "browser" }));
+	for (let i = 0; i < 40 && !frames2.some((f) => f.type === "state"); i++) await sleep(100);
+	await sleep(300);
+	// the WS ATTACH snapshot is an egress path too — it used to bypass redaction entirely (found by this
+	// check, 2026-10-31): image base64 travelled back to every device on attach and into its IDB cache
+	check("E7 the WS attach snapshot is REDACTED (hashes, no inline base64 — the leak this check found)",
+		frames2.some((f) => f.type === "state") &&
+		frames2.every((f) => inlineBase64Runs(JSON.stringify(f), { minLength: 512 }).length === 0),
+		`frames=${JSON.stringify(frames2.map((f) => f.type))}`);
+	check("E7b …and NO media blob was written for that session (the vote was applied BEFORE redaction)",
+		mediaFiles().length === before, `${before} → ${mediaFiles().length} files in data/media`);
+	const served = frames2.find((f) => f.type === "state")?.messages?.flatMap?.((m) => (Array.isArray(m?.content) ? m.content : []))?.find?.((p) => p?.type === "image");
+	check("E7c …while the bytes are still reachable for this process (memory-only, served by /media)",
+		!!served?.hash && (await json(`/api/agent/session/${SESSION2}/media/${served.hash}`)).status === 200,
+		`hash=${String(served?.hash).slice(0, 8)}`);
+	ws2.close();
+	sync2.close();
 } finally {
 	await srv.stop();
 }

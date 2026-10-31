@@ -218,7 +218,7 @@ const msg = (text, parts = []) => ({ role: "user", content: [{ type: "text", tex
 
 	const proxySrc = fs.readFileSync(path.join(ROOT, "src/proxy-agent.ts"), "utf8");
 	check("L16d ProxyAgent DEFINES setDataReduction (the optional call in data-settings is now answered)",
-		/setDataReduction\(cfg: Record<string, unknown>\): void/.test(proxySrc) && /import \{ pushDataReduction \} from "\.\/ui\/data-settings\.js"/.test(proxySrc));
+		/setDataReduction\(cfg: Record<string, unknown>\): void/.test(proxySrc) && /import \{ [^}]*pushDataReduction[^}]* \} from "\.\/ui\/data-settings\.js"/.test(proxySrc));
 	check("L16e …and the ATTACH handler re-pushes it (a reload cannot silently disable the feature)",
 		/pushDataReduction\(this\);/.test(proxySrc) && /this\.pushAutoRetrySetting\(\);[\s\S]{0,400}pushDataReduction\(this\)/.test(proxySrc));
 	check("L16f the settings dialog calls a REAL method now (no optional-call blind alley for the levels)",
@@ -246,6 +246,10 @@ const msg = (text, parts = []) => ({ role: "user", content: [{ type: "text", tex
 	check("I1d2 …and the send WAITS for an in-flight encode/upload, reading the LIVE list (no dropped photo)",
 		/pendingAttach\.current > 0 && Date\.now\(\) - waited < 15000/.test(chat) && /const attached = getImages\(\)/.test(chat) &&
 		/imagesRef\.current = images;/.test(chat));
+	check("I1d3 …refuses the send when the upload is STILL running after the wait (never a silent drop)",
+		/if \(pendingAttach\.current > 0\) \{/.test(chat) && /still uploading/.test(chat));
+	check("I1d4 …and the 4-image slot is RESERVED synchronously (concurrent pastes cannot all lose)",
+		/imagesRef\.current\.length \+ pendingAttach\.current >= MAX_IMAGE_ATTACH/.test(chat));
 	check("I1e a recalled steer keeps its hash and is NOT re-encoded or re-uploaded",
 		/\{ encode: !hash \}/.test(chat) && /hash: im\.hash, bytes: im\.bytes \}, \{ encode: false \}/.test(chat));
 	check("I1f a server-side retry sends the hashes back (the hub hydrates them)",

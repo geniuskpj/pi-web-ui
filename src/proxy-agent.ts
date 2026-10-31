@@ -10,7 +10,7 @@ import { makeId } from "./id.js";
 import { getCachedChunks, putChunk, gunzip, transferPolicy, cachedRanges, intervalDiff, sweepStale, planLiveChunk, toNdjson, gzipText, verifyChunkText } from "./idb-cache.js";
 import { planCachedSplice } from "../lib/chunk-splice.mjs";
 // data-reduction levels live in localStorage (Settings → Data use); the agent is what tells the hub
-import { pushDataReduction } from "./ui/data-settings.js";
+import { pushDataReduction, readImageRetention } from "./ui/data-settings.js";
 // subagents/peers (plan-subagents.md M3): the snapshot + deltas the server sends, folded by a pure reducer
 import { applyPeer, applyPeers, EMPTY_BUDGET, type Peer, type PeerBudget } from "./ui/peer-store.js";
 // LIVE WRITE-THROUGH (C2): how long a quiet tail may sit in memory before it is
@@ -56,8 +56,16 @@ export class ProxyAgent {
 	private generation = 0;
 	private readyCallbacks: Array<(ok: boolean) => void> = [];
 
-	constructor(sessionId: string, initialModel?: any) {
+	/**
+	 * `observeOnly` = this client may read the session but never DRIVE it (the peer panel attaches to a
+	 * child session with its own socket; a stray prompt/steer/abort from that socket would fight the
+	 * parent's agent — grok pre-restart review 2026-10-31). Mutating frames are dropped, loudly.
+	 */
+	private observeOnly = false;
+
+	constructor(sessionId: string, initialModel?: any, opts: { observeOnly?: boolean } = {}) {
 		this.sessionId = sessionId || makeId(); // randomUUID is secure-context-only
+		this.observeOnly = !!opts.observeOnly;
 		if (initialModel) this.state.model = initialModel;
 		// IDB GC (v2): generations are never erased on rewrite — they are collected
 		// here, by date: a tab coming back to the foreground is the natural moment
@@ -109,7 +117,10 @@ export class ProxyAgent {
 					const sid = this.sessionId;
 					const haveTo = await this.cachedCoverTo();
 					if (gen !== this.generation || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-					this.sendMsg({ type: "attach", sessionId: sid, modelId: this.state.model?.id, thinkingLevel: this.state.thinkingLevel, tailFirst: true, haveTo });
+					// `imageRetention` travels WITH the attach (grok review 2026-10-31): the settings frame
+					// only arrives after `state`, so without this the first snapshot of an image-bearing
+					// session would write its blobs to disk before a "browser" device could be heard.
+					this.sendMsg({ type: "attach", sessionId: sid, modelId: this.state.model?.id, thinkingLevel: this.state.thinkingLevel, tailFirst: true, haveTo, imageRetention: readImageRetention() });
 					const cbs = this.readyCallbacks.splice(0);
 					cbs.forEach((cb) => cb(this.attached));
 				})();
@@ -143,7 +154,14 @@ export class ProxyAgent {
 		this.retryTimer = setTimeout(() => this.dial(), delay);
 	}
 
+	/** Frames that change a session. An observe-only client never sends one. */
+	private static readonly MUTATING = new Set(["prompt", "steer", "abort", "retry", "cancel-retry", "edit-commit", "rewrite", "restore", "fork", "compact", "discard", "set-model", "set-thinking"]);
+
 	private sendMsg(msg: AnyRecord) {
+		if (this.observeOnly && ProxyAgent.MUTATING.has(String(msg?.type))) {
+			console.warn(`[proxy-agent] observe-only client refused a "${msg.type}" frame for ${String(this.sessionId).slice(0, 8)}`);
+			return;
+		}
 		if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(msg));
 	}
 

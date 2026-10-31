@@ -241,8 +241,10 @@ const frames = () => { const out = []; return { out, deliver: (m) => out.push(m)
 		const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "pi-hub-persist-b-"));
 		try {
 			const { hub: hub3, written: written3 } = makePersisting(dir2);
-			await hub3.attach(id, () => {}, {});
+			// the vote comes BEFORE the first egress now (the client sends its retention WITH the attach):
+			// attach redacts, and redaction is what stores the bytes, so the order is the whole point
 			hub3.setMediaRetention(id, "phone", "browser");
+			await hub3.attach(id, () => {}, {});
 			hub3._writeSession(id);
 			const jsonl3 = written3.join("");
 			const part3 = partOf(jsonl3);

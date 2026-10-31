@@ -928,8 +928,15 @@ export function ChatView({ agent, retryState, onCancelRetry }: { agent: Agent; r
 	const addAttachment = async (name: string, src: { base64?: string; blob?: Blob; hash?: string; bytes?: number; mimeType?: string }, opts: { encode?: boolean } = {}) => {
 		const { encode = true } = opts;
 		let mimeType = src.mimeType || src.blob?.type || "image/png";
+		// RESERVE THE SLOT SYNCHRONOUSLY (grok pre-restart review 2026-10-31, P1): the cap used to be
+		// checked after the awaits, so N concurrent pastes all saw `prev.length === 0` and — past the cap —
+		// every one of them failed, attaching nothing. Reserve first, release in `finally`.
+		if (imagesRef.current.length + pendingAttach.current >= MAX_IMAGE_ATTACH) {
+			note(`max ${MAX_IMAGE_ATTACH} images`);
+			return;
+		}
 		// a paste encodes + uploads asynchronously: count it as in flight so a fast Send can WAIT for it
-		// instead of silently dropping the photo, and so the 4-image cap counts it (grok review 2026-10-28)
+		// instead of silently dropping the photo, and so the cap counts it (grok review 2026-10-28)
 		pendingAttach.current += 1;
 		try {
 			let blob: Blob | null = src.blob ?? (src.base64 ? base64ToBlob(src.base64, mimeType) : null);
@@ -1872,6 +1879,12 @@ export function Editor({
 		// fast Send used to fire before setImages landed and silently drop the photo (grok review 2026-10-28)
 		const waited = Date.now();
 		while (pendingAttach.current > 0 && Date.now() - waited < 15000) await new Promise((r) => setTimeout(r, 50));
+		if (pendingAttach.current > 0) {
+			// still encoding/uploading AFTER the wait (a slow link): sending now would silently drop the
+			// attachment (grok pre-restart review, P1), so refuse and keep the draft.
+			onNote("an attachment is still uploading — try again in a moment");
+			return;
+		}
 		const attached = getImages();
 		const hasAttachments = textFiles.length > 0 || attached.length > 0;
 		// server-side agent: a send DURING a run becomes a steering message (held

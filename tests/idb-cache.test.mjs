@@ -282,8 +282,8 @@ const disjoint = (rs) => rs.every((r, i) => i === 0 || rs[i - 1].toSeq <= r.from
 		/from "\.\/lib\/range-window\.mjs"/.test(serverSrc) && !/chunkFromSeq\(chunkIndexOf\(/.test(serverSrc) &&
 		/from "\.\/chunk-window\.mjs"/.test(fs.readFileSync(path.join(ROOT, "lib/range-window.mjs"), "utf8")) &&
 		/from "\.\/lib\/chunk-window\.mjs"/.test(hubSrc) && /const snapped = alignDown\(from\)/.test(hubSrc));
-	check("C1 the client reports its cached reach with the attach",
-		/private async cachedCoverTo\(\)/.test(proxySrc) && /tailFirst: true, haveTo \}/.test(proxySrc) && /cachedRanges\(this\.sessionId\)/.test(proxySrc));
+	check("C1 the client reports its cached reach with the attach (and its image retention with it)",
+		/private async cachedCoverTo\(\)/.test(proxySrc) && /tailFirst: true, haveTo, imageRetention/.test(proxySrc) && /cachedRanges\(this\.sessionId\)/.test(proxySrc));
 	check("C2 the client treats the sent window start as its dense-window start and fills the prefix",
 		/const sentFrom = Number\(\(sparse as any\)\.sentFrom \?\? sparse\.fromSeq\)/.test(proxySrc) &&
 		/filledFrom: sentFrom/.test(proxySrc) &&

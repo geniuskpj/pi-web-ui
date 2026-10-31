@@ -185,5 +185,34 @@ const okRunner = async (peer, hooks) => {
 	})());
 }
 
+// ── FORCE-SETTLE: a runner that IGNORES abort must not wedge the parent (grok pre-restart, P0) ──
+{
+	// a runner that never resolves and never looks at the signal — the wedged-tool shape (LFP incident)
+	const h = harness({ run: async () => { await new Promise(() => {}); return { status: "ok" }; } });
+	const s = h.sup.spawn({ parentId: "P", role: role() });
+	await sleep(20);
+	check("F1 the peer is live and running while its runner hangs", h.sup.statusOf("P", s.peerId)?.status === "running");
+	const t0 = Date.now();
+	h.sup.cancel("P", { treeWide: true, reason: "wedged", status: "aborted" });
+	const res = await Promise.race([s.promise, sleep(8000).then(() => null)]);
+	const dt = Date.now() - t0;
+	check("F2 wait() STILL settles — the abort grace forces the result", res !== null, String(res));
+	check("F3 …as aborted, with the reason, well inside the grace window", res?.status === "aborted" && /wedged/.test(String(res?.error)), `${res?.status} in ${dt}ms`);
+	check("F4 …and the record leaves the maps (no leak, no phantom chip)", h.sup.has(s.peerId) === false && h.sup.liveCount("P") === 0);
+	check("F5 a second wait() replays the settled result instead of hanging", (await h.sup.wait(s.peerId, "P")).status === "aborted");
+}
+{
+	// the heartbeat path: a runner that ignores abort and was NOT cancelled (only its signal is aborted)
+	const h = harness({ run: async () => { await new Promise(() => {}); return { status: "ok" }; } });
+	const s = h.sup.spawn({ parentId: "P", role: role() });
+	await sleep(20);
+	check("F6 sweep claims nothing while the signal is healthy", h.sup.sweep().length === 0);
+	s.record.cancelledAs = "timeout";
+	s.record.controller.abort("wall clock");
+	const swept = h.sup.sweep();
+	const settled = await Promise.race([s.promise, sleep(2000).then(() => null)]);
+	check("F7 …and settles the peer once only its SIGNAL is aborted", swept.length === 1 && settled !== null, `swept=${swept.length} settled=${settled?.status}`);
+}
+
 console.log(`\n[peer-supervisor] ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

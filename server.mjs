@@ -2528,9 +2528,12 @@ function agentConn(ws) {
 					// the prefix via /range into IDB — instead of every attach shipping 2-7MB.
 					// attach() now hydrates the entry itself before snapshotting (2026-10-24) —
 					// await it so the first frame can never be an empty pre-hydration state
-					await agentHub.attach(currentSession, (msg) => safeSend(ws, msg), { tailFirst: !!m.tailFirst, haveTo: Number(m.haveTo) || 0 });
-					// a socket that already told us its image retention applies it to the session it just attached
+					// RETENTION BEFORE THE SNAPSHOT (grok pre-restart review 2026-10-31): attach redacts, and
+					// redaction is what writes media blobs — so the device's choice must be in force first.
+					// The client sends it with the attach frame (and re-sends it on every state frame).
+					if (m.imageRetention) ws.__mediaRetention = m.imageRetention === "browser" ? "browser" : "server";
 					if (ws.__mediaRetention) agentHub.setMediaRetention(currentSession, socketId(ws), ws.__mediaRetention);
+					await agentHub.attach(currentSession, (msg) => safeSend(ws, msg), { tailFirst: !!m.tailFirst, haveTo: Number(m.haveTo) || 0 });
 					break;
 				}
 				case "prompt": {

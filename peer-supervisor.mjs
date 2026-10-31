@@ -16,9 +16,14 @@
 //   * `cancel()` aborts subtrees with a timeout, then orphans (the zombie lesson: a wedged run must not
 //     keep a "running" peer forever).
 //
-// Tested with a fake runner and a deliberately re-entrancy-throwing lock (tests/peer-supervisor.test.mjs).
+// CONTRACT WITH THE CALLER: the journal accessor must already contain the `peer_started` entry for a
+// spawn by the time `spawn()` returns — the hub appends it synchronously (`spawnPeer`). The cumulative
+// spawn budget is counted from that journal, so a caller that forgets it can spawn forever.
+//
+// Tested with a fake runner, a deliberately re-entrancy-throwing lock, and a runner that ignores abort
+// (tests/peer-supervisor.test.mjs).
 
-import { PEER_LIMITS, checkPeerBudget, checkPeerRunBudget, peerStarted, peerEnded, appendJournal, findPeer, peerView, peerStatusOf, danglingSpawns } from "./lib/peer-lifecycle.mjs";
+import { PEER_LIMITS, TERMINAL_STATUSES, checkPeerBudget, checkPeerRunBudget, peerStarted, peerEnded, findPeer, peerView, peerStatusOf, danglingSpawns } from "./lib/peer-lifecycle.mjs";
 
 const CANCEL_GRACE_MS = 5000;
 
@@ -57,10 +62,22 @@ export function createPeerSupervisor({ run, journal, onEvent = () => {}, limits 
 		const peerId = `p${++seq}-${Math.random().toString(36).slice(2, 8)}`;
 		const entry = peerStarted({ id: peerId, role: role?.name || null, model, task, parentSession: parentId, at: now() });
 		const controller = new AbortController();
+		// FORCE-SETTLE (grok pre-restart review 2026-10-31, P0): abort() only ASKS. A runner that ignores the
+		// signal (a wedged tool — the LFP shape) would leave `wait()` pending forever, the parent's tool call
+		// dangling and the record in the maps. After CANCEL_GRACE_MS the promise settles anyway, with the
+		// reason recorded, so the transcript always gets its result.
+		let settleNow = null;
+		const forced = new Promise((resolve) => { settleNow = resolve; });
+		const forceAfter = (status, reason, delayMs = CANCEL_GRACE_MS) => {
+			record.cancelledAs = record.cancelledAs || status;
+			record.cancelReason = record.cancelReason || reason;
+			setTimeout(() => { record.forced = true; settleNow({ forced: true, status, error: reason }); }, Math.max(0, delayMs)).unref?.();
+		};
 		const record = {
 			id: peerId, parentId, role: role?.name || null, model, controller,
 			status: "running", turns: 0, tokens: 0, usage: { input: 0, output: 0, cost: 0 },
 			lastText: "", currentTool: null, startedAt: now(), entry, sessionId: null,
+			forceAfter: (status, reason, delayMs) => forceAfter(status, reason, delayMs),
 		};
 		records.set(peerId, record);
 		tree.set(peerId, parentId);
@@ -74,10 +91,18 @@ export function createPeerSupervisor({ run, journal, onEvent = () => {}, limits 
 
 		record.promise = (async () => {
 			try {
-				const out = await run({ id: peerId, parentId, role, task, model, thinking, signal: controller.signal }, {
-					onUpdate: (patch) => noteUpdate(peerId, patch),
-					setSession: (sid) => { record.sessionId = sid; },
-				});
+				const out = await Promise.race([
+					run({ id: peerId, parentId, role, task, model, thinking, signal: controller.signal }, {
+						onUpdate: (patch) => noteUpdate(peerId, patch),
+						setSession: (sid) => { record.sessionId = sid; },
+					}),
+					forced, // the force-settle above: a wedged runner cannot hold this promise hostage
+				]);
+				if (out?.forced) {
+					record.status = out.status === "timeout" ? "timeout" : "aborted";
+					record.error = out.error;
+					return { status: record.status, error: out.error, sessionId: record.sessionId, role: role?.name || null, model, usage: record.usage, turns: record.turns, peerId };
+				}
 				// A CANCELLED run's verdict wins over whatever the runner returned: a budget/stop/timeout
 				// abort must not be reported as "ok" just because the child happened to finish its step
 				// (grok P0-3: the model has to learn the truth, or it retries a peer that was stopped).
@@ -96,7 +121,10 @@ export function createPeerSupervisor({ run, journal, onEvent = () => {}, limits 
 				return { status: record.status, error: record.error, sessionId: record.sessionId, role: role?.name || null, model, usage: record.usage, turns: record.turns, peerId };
 			} finally {
 				clearTimeout(timeout);
-				if (record.status === "running") record.status = "idle";
+				// TERMINAL STATUS BEFORE ANY JOURNAL WRITE (grok pre-restart review, P1): `peerEnded` refuses a
+				// non-terminal status and a throw HERE would reject the promise — the one thing the parent's tool
+				// call must never see. An unknown runner status becomes `error`.
+				if (!TERMINAL_STATUSES.includes(record.status)) record.status = record.status === "running" ? "idle" : "error";
 				record.endedAt = now();
 				record.result = record.result || { status: record.status === "idle" ? "ok" : record.status, error: record.error || null, sessionId: record.sessionId, role: record.role, model: record.model, usage: record.usage, turns: record.turns, peerId, summary: record.summary || "" };
 				settled.set(peerId, record.result);
@@ -156,6 +184,7 @@ export function createPeerSupervisor({ run, journal, onEvent = () => {}, limits 
 		rec.cancelReason = reason;
 		rec.cancelledAs = status;
 		try { rec.controller.abort(reason); } catch { /* already aborted */ }
+		rec.forceAfter?.(status, reason); // ask, then ENFORCE (see the force-settle note in spawn)
 		return [peerId];
 	}
 
@@ -183,7 +212,8 @@ export function createPeerSupervisor({ run, journal, onEvent = () => {}, limits 
 				return {
 					status: status === "idle" ? "ok" : status === "needs_result" ? "aborted" : status,
 					error: entry.error || (status === "needs_result" ? "the server restarted while this peer was running" : null),
-					sessionId: null, role: entry.role, model: entry.model, usage: entry.usage || { input: 0, output: 0, cost: 0 }, turns: entry.turns || 0, peerId, summary: "",
+					// the journal knows the child, so a peer whose run ended in another process keeps its link
+					sessionId: entry.sessionId ?? null, role: entry.role, model: entry.model, usage: entry.usage || { input: 0, output: 0, cost: 0 }, turns: entry.turns || 0, peerId, summary: "",
 				};
 			}
 		}
@@ -198,11 +228,17 @@ export function createPeerSupervisor({ run, journal, onEvent = () => {}, limits 
 	}
 
 	/** Heartbeat: settle anything that claims to run with no live record (the zombie lesson). */
+	/**
+	 * Heartbeat: anything claiming to run with an ABORTED signal is settled FOR REAL (the zombie lesson).
+	 * It used to read `rec.signal` — a field the record never had — so it silently never fired.
+	 */
 	function sweep() {
 		const settled = [];
-		for (const rec of records.values()) {
+		for (const rec of [...records.values()]) {
 			if (rec.status !== "running") continue;
-			if (rec.signal?.aborted) settled.push(rec.id);
+			if (!rec.controller?.signal?.aborted) continue;
+			rec.forceAfter?.(rec.cancelledAs || "aborted", rec.cancelReason || "aborted", 0);
+			settled.push(rec.id);
 		}
 		return settled;
 	}
