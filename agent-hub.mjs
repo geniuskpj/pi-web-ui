@@ -227,6 +227,8 @@ export class AgentHub {
 			const model = modelObject || this._getModel(modelId) || this._defaultModel();
 			if (!model) throw new Error("no models available");
 			const effectiveStreamFn = streamFn || streamSimple;
+			// remembered so a force-kill rebuild keeps the same backend (arena peers are the case that matters)
+			const rememberStreamFn = effectiveStreamFn;
 			// a PEER starts from its role's system prompt and its role's tool set — the two things that
 			// make it a peer rather than a second chat
 			const level = thinkingLevel || role?.thinking || "high";
@@ -286,6 +288,7 @@ export class AgentHub {
 			};
 			// peer identity (D1/D10): `kind` is the wire field the session list + /ws/sync use to keep
 			// subagent sessions out of the normal list, `parentSession` links back for the peer panel
+			entry.streamFn = rememberStreamFn; // the backend this session runs on (see _forceKill)
 			entry.kind = isPeer ? "peer" : "user";
 			entry.parentSession = parentSession || null;
 			entry.peerRole = role?.name || null;
@@ -567,9 +570,11 @@ export class AgentHub {
 	 * one with an identical fresh Agent instead of muting it — streamFn, api key, system prompt and tools
 	 * are wired in exactly one place.
 	 */
-	_makeAgent({ model, thinkingLevel = "high", systemPrompt, tools, messages }) {
+	_makeAgent({ model, thinkingLevel = "high", systemPrompt, tools, messages, streamFn = null }) {
 		const agent = new Agent({
-			streamFn: streamSimple,
+			// the backend travels with the session (review 2026-10-31): rebuilding a peer must not silently
+			// swap an arena bridge for the pi dispatcher
+			streamFn: streamFn || streamSimple,
 			initialState: {
 				model,
 				thinkingLevel,
@@ -1851,6 +1856,7 @@ export class AgentHub {
 			systemPrompt: dead.state.systemPrompt,
 			tools: dead.state.tools || [],
 			messages,
+			streamFn: entry.streamFn || null, // ARENA peers must stay on the arena backend after a kill
 		});
 		entry.unsub = this._bindAgent(entry, sessionId);
 		entry.pendingPrompt = null;

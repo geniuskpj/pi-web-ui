@@ -196,6 +196,84 @@ export async function chat(message, slug, modelId) {
 	}
 }
 
+// ── review 2026-10-31: the queue must hold the TAB, and a cancelled request must not dispatch ──
+{
+	// the FAKE BRIDGE is a fixture FILE (tests/fixtures/arena-timeline-bridge.mjs): it writes an
+	// enter/exit timeline to PI_TEST_ARENA_LOG, so overlap is measured, not assumed
+	const { readFileSync: read, rmSync, mkdtempSync } = await import("node:fs");
+	const os = await import("node:os");
+	const pathMod = await import("node:path");
+	const dir = mkdtempSync(pathMod.join(os.tmpdir(), "arena-queue-"));
+	const timeline = pathMod.join(dir, "timeline.log");
+	process.env.PI_TEST_ARENA_LOG = timeline;
+	const fixture = pathMod.join(pathMod.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "fixtures", "arena-timeline-bridge.mjs");
+	const bridge = createArenaBridge({ bridgePath: fixture, timeoutMs: 250, log: () => {} });
+	const events = () => { try { return read(timeline, "utf8").trim().split("\n").map((l) => JSON.parse(l)); } catch { return []; } };
+	/** max simultaneous in-bridge calls, read off the timeline */
+	const maxOverlap = () => { let cur = 0, max = 0; for (const e of events()) { cur += e.what === "enter" ? 1 : -1; max = Math.max(max, cur); } return max; };
+	try {
+		const [a, b] = await Promise.all([
+			bridge.chat({ slug: "grok-4.6-high", message: "one" }),
+			bridge.chat({ slug: "grok-4.6-high", message: "two" }),
+		]);
+		check("J1 two serialized calls never overlap on the tab", maxOverlap() === 1 && a.status === "ok" && b.status === "ok", `overlap=${maxOverlap()} ${a.status}/${b.status}`);
+
+		// a call that outlives the 250ms timeout, followed by a normal one
+		const slow = bridge.chat({ slug: "grok-4.6-high", message: "HANG please" });
+		const next = bridge.chat({ slug: "grok-4.6-high", message: "next" });
+		const [slowRes, nextRes] = await Promise.all([slow, next]);
+		check("J2 a timed-out call reports the timeout to its caller", slowRes.status === "error" && /exceeded/.test(String(slowRes.error)), String(slowRes.error).slice(0, 70));
+		check("J3 …the next call WAITED for the abandoned one (no overlap after a timeout)", maxOverlap() === 1, `overlap=${maxOverlap()}`);
+		check("J4 …and still answered (the timeout covers the CALL, not the queue wait)", nextRes.status === "ok" && /^OK/.test(nextRes.text), `${nextRes.status}: ${nextRes.text}`);
+		check("J5 …and the abandoned answer was discarded, not returned as someone else's", !/HANG/.test(String(nextRes.text)));
+
+		// a request cancelled WHILE QUEUED must never be dispatched
+		const controller = new AbortController();
+		const holder = bridge.chat({ slug: "grok-4.6-high", message: "HANG first" });
+		await sleep(30);
+		const before = events().filter((e) => e.what === "enter" && e.message.includes("never")).length;
+		const queued = bridge.chat({ slug: "grok-4.6-high", message: "never run me", signal: controller.signal });
+		controller.abort();
+		const [holderRes, queuedRes] = await Promise.all([holder, queued]);
+		check("J6 stopping a QUEUED call returns aborted without touching the tab",
+			queuedRes.status === "aborted" && events().filter((e) => e.what === "enter" && e.message.includes("never")).length === before, String(queuedRes.error));
+		check("J7 …while the call holding the tab still finished on its own terms", holderRes.status === "ok" || /exceeded/.test(String(holderRes.error)));
+		check("J8 a call cancelled BEFORE it is made never queues at all",
+			(await (() => { const c = new AbortController(); c.abort(); return bridge.chat({ slug: "grok-4.6-high", message: "x", signal: c.signal }); })()).status === "aborted");
+		check("J9 the tab is idle at the end (nothing held the queue)", bridge.busy() === false);
+	} finally {
+		try { rmSync(dir, { recursive: true, force: true }); } catch { /* temp files */ }
+	}
+}
+
+// ── the arena BACKEND must survive a forced kill (review 2026-10-31, P2) ────
+{
+	const calls = [];
+	const bridge = {
+		async available() { return { ok: true, reason: null }; },
+		async resolveModelId() { return "uuid-grok"; },
+		async listNames() { return ["grok-4.6-high"]; },
+		async chat({ slug, message }) { calls.push({ slug, message }); return { status: "ok", text: `ARENA#${calls.length}`, routedModel: "xai/grok" }; },
+	};
+	const { hub, faux } = makeHub({ bridge });
+	hub.getSession("P", { messages: [{ role: "user", content: "delegate" }] });
+	const s = hub.spawnPeer("P", { role: resolveRole("oracle", {}), task: "first arena question", model: "arena/grok-4.6-high" });
+	const first = await s.promise;
+	check("B1 the arena peer ran through the bridge", calls.length === 1 && first.status === "ok", `${first.status} calls=${calls.length}`);
+	// force-kill it (the wedged shape: the hub does not care that the arena call already finished)
+	hub.sessions.get(first.sessionId).runtime = { status: "running", startedAt: Date.now(), turn: 0, currentTool: null, lastText: null, pendingPrompts: 0 };
+	hub.sessions.get(first.sessionId).agent.state.isStreaming = true;
+	const killed = hub._forceKill(first.sessionId, "test");
+	check("B2 the kill replaced the Agent", killed === true);
+	const entry = hub.sessions.get(first.sessionId);
+	check("B3 …and the REBUILT session kept a streamFn (B4/B5 prove it is the arena one, not streamSimple)",
+		typeof entry.streamFn === "function", String(typeof entry.streamFn));
+	const again = await Promise.race([hub.prompt(first.sessionId, "second arena question"), sleep(2000).then(() => ({ accepted: false, reason: "timed out" }))]);
+	check("B4 a prompt after the kill still goes to ARENA (the bridge got the second call)", calls.length === 2, `calls=${calls.length} accepted=${again?.accepted}`);
+	check("B5 …and the fake pi provider was never used for it", (() => { const msgs = entry.agent.state.messages.filter((m) => m.role === "assistant"); return msgs.every((m) => String((m.content || [])[0]?.text || "").startsWith("ARENA#")); })(), JSON.stringify(entry.agent.state.messages.map((m) => `${m.role}:${String((m.content || [])[0]?.text || "").slice(0, 10)}`)));
+	void faux;
+}
+
 // ── the real bridge factory is honest about a missing checkout ──────────────
 {
 	const missing = createArenaBridge({ bridgePath: "C:/definitely/not/here/chat-api.mjs", log: () => {} });
