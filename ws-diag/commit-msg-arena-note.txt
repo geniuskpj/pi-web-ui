@@ -1,0 +1,16 @@
+feat(arena): restore the review/perf scripts from the snapshot branch + state the no-tools limitation in the prompt
+
+Answering "did you check temp/pre-revert-3c162a8, is it restored?" with the repo, not with memory:
+
+* 3c162a8 IS restored: `git diff --stat 3c162a8 b1d768c` is EMPTY (the cherry-pick reproduced its tree
+  exactly), and the diff from b1d768c to HEAD shows only my LATER work — nothing of it was lost.
+* the safety snapshot a88e0f8 also preserved things that were never committed and were removed by the
+  revert's clean: `lib/arena-models.mjs` + `lib/arena-peer.mjs` (my FIRST arena attempt, the separate
+  code path the user asked me to replace), plus `ws-diag/deepseek-review.mjs` and
+  `ws-diag/peer-review.mjs`. The arena pair is superseded by the unified lib/arena-stream.mjs, but the two
+  scripts are the tools that produced the deepseek review and the first (rejected) peer review — they are
+  restored from the snapshot here.
+* ported the one thing the old pair had that the unified module lacked: ARENA_PEER_NOTE, now part of
+  EVERY arena prompt (a model cannot discover from a tool description that it has no tools).
+
+tests/arena-peer.test.mjs 34 checks (F3/F4 pin the note in every flattened prompt). tsc clean, build OK.

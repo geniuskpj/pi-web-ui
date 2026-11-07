@@ -42,7 +42,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 	check("F1 the system prompt leads and the roles are labelled",
 		prompt.startsWith("# System") && prompt.includes("user: review this") && prompt.includes("assistant: on it"));
 	check("F2 attachments degrade to a marker (the bridge cannot send images)", prompt.includes("[image]") && prompt.includes("user: extra"));
-	check("F3 junk context cannot throw", flattenContext(null) === "" && typeof flattenContext({ messages: null }) === "string");
+	check("F3 junk context cannot throw (and still carries the limitation note)", typeof flattenContext(null) === "string" && typeof flattenContext({ messages: null }) === "string" && /NO tools/.test(flattenContext(null)));
+	check("F4 every arena prompt STATES the limitation (no tools, text only) — the model cannot discover it",
+		/NO tools/.test(prompt) && /cannot read files/.test(flattenContext({ systemPrompt: "role" })));
 }
 
 // ── a fake bridge, injected exactly like the real one ──────────────────────
