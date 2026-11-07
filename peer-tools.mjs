@@ -67,6 +67,11 @@ export function createPeerIntegration({ hub, usableTools, piDir, workspaceDir, e
 	function toolsForSession(sessionId, meta = {}) {
 		const base = usableTools();
 		try {
+			if (meta.kind === "peer" && meta.role?.model && /^arena\s*[:/]/i.test(String(meta.role.model))) {
+				// an ARENA peer has no tools at all: the bridge is text in / text out (lib/arena-stream.mjs).
+				// Same peer path, same session, same journal — only the backend differs.
+				return [];
+			}
 			if (meta.kind === "peer" && !meta.role) {
 				// an unresolvable role is the SAFEST case, not the widest (grok pre-restart review, P1)
 				return base.filter((t) => t.name === "read_file");
@@ -119,7 +124,7 @@ export function createPeerIntegration({ hub, usableTools, piDir, workspaceDir, e
 					peerId: { type: "string", description: "peer id for stop/steer/retry (see status)" },
 					text: { type: "string", description: "guidance for steer" },
 					all: { type: "boolean", description: "stop every peer of this session" },
-					model: { type: "string", description: "optional model id override for the peer" },
+					model: { type: "string", description: "optional model override: a pi model id (e.g. deepseek-ai/deepseek-v4.1-flash) or arena/<slug> (e.g. arena/grok-4.6-high) for a keyless peer — arena peers have NO tools" },
 				},
 				required: ["action"],
 			},
@@ -129,10 +134,20 @@ export function createPeerIntegration({ hub, usableTools, piDir, workspaceDir, e
 				const asText = (text, details = null) => ({ content: [{ type: "text", text }], ...(details ? { details } : {}) });
 
 				if (action === "list") {
-					// an unreadable role file is REPORTED as such, never printed as a half-built row
-					return asText(catalog().map((r) => (r.error
+					// an unreadable role file is REPORTED as such, never printed as a half-built row; and the
+					// model should not pick a backend that cannot run on this machine
+					const arena = await (hubRef().arena?.available?.() ?? Promise.resolve({ ok: false, reason: "no arena bridge configured" }));
+					const lines = catalog().map((r) => (r.error
 						? `- ${r.name}: ${r.error}`
-						: `- ${r.name} (${r.acceptanceRole}${r.model ? `, ${r.model}` : ""}) — ${r.description || "(no description)"} [${r.tools} tools]`)).join("\n"));
+						: `- ${r.name} (${r.acceptanceRole}${r.model ? `, ${r.model}` : ""}) — ${r.description || "(no description)"} [${r.tools} tools]`));
+					if (arena.ok) {
+						// show REAL slugs from the live catalog: the model should not guess a name that does not exist
+						const names = await (hubRef().arena?.listNames?.(6) ?? Promise.resolve(null)).catch?.(() => null) ?? null;
+						lines.push(`- arena: AVAILABLE — pass model:\`arena/<slug>\` for a keyless peer with NO tools${names?.length ? ` (e.g. ${names.join(", ")})` : " (e.g. arena/grok-4.6-high)"}`);
+					} else {
+						lines.push(`- arena: unavailable (${arena.reason})`);
+					}
+					return asText(lines.join("\n"));
 				}
 				if (action === "status") {
 					const peers = hubRef().peersOf(parentSessionId);

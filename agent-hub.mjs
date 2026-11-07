@@ -15,6 +15,9 @@ import { createMediaStore, redactImageData, hydrateImageData, missingImageHashes
 // lifecycle/caps/abort-tree so no hub lock is ever held across a child's run (grok review P0-3).
 import { createPeerSupervisor } from "./peer-supervisor.mjs";
 import { composeRolePrompt, PEER_LIMITS } from "./lib/peer-roles.mjs";
+// ARENA AS A BACKEND (2026-10-31): a peer whose model is `arena/<slug>` runs through the SAME session,
+// role, tools, journal, status and control code — only its streamFn and model object differ.
+import { parseModelSpec, arenaModel, makeArenaStreamFn } from "./lib/arena-stream.mjs";
 import { peerStarted, peerEnded, appendJournal, danglingSpawns, peerView, buildPeerResult, resultText, PEER_RESULT_FIELDS } from "./lib/peer-lifecycle.mjs";
 // pi-ai 1.4.0: AgentOptions.streamFn is REQUIRED — the compat subpath exports the
 // generic streamSimple dispatcher (routes on model.api) and auto-registers the
@@ -135,7 +138,7 @@ const serializeConversation = (messages) => {
 };
 
 export class AgentHub {
-	constructor({ modelsStore, getAuth, persist, broadcast, getTools, getSystemPrompt, defaultModelId, onRuntimeChange, loadMessages, summarize, backupMirror, versions, mediaDir, getRoles, peerLimits }) {
+	constructor({ modelsStore, getAuth, persist, broadcast, getTools, getSystemPrompt, defaultModelId, onRuntimeChange, loadMessages, summarize, backupMirror, versions, mediaDir, getRoles, peerLimits, arena }) {
 		this.modelsStore = modelsStore;
 		this.getAuth = getAuth;
 		this.persist = persist; // async (id, data, metadata) — worker store (atomic)
@@ -176,6 +179,8 @@ export class AgentHub {
 		this.getTools = getTools || (() => []);
 		this.getRoles = getRoles || (() => null);   // (name) → role | null, from .pi/agents/*.md + builtins
 		this.peerLimits = { ...PEER_LIMITS, ...(peerLimits || {}) };
+		// the arena bridge (optional, injected): `{ available(), chat() }` — see lib/arena-stream.mjs
+		this.arena = arena || null;
 		// PEER SUPERVISOR: owns child promises, the abort tree, the caps and a heartbeat. The hub only
 		// gives it `run` (create the child session + prompt it) and a journal accessor (metadata.peers).
 		this.peers = createPeerSupervisor({
@@ -214,12 +219,14 @@ export class AgentHub {
 		return undefined;
 	}
 
-	getSession(sessionId, { modelId, thinkingLevel, title, messages, rewriteSeq, rewrittenFrom, role = null, parentSession = null } = {}) {
+	getSession(sessionId, { modelId, model: modelObject = null, streamFn = null, thinkingLevel, title, messages, rewriteSeq, rewrittenFrom, role = null, parentSession = null } = {}) {
 		this.discarded.delete(sessionId); // explicit re-open undeletes
 		let entry = this.sessions.get(sessionId);
 		if (!entry) {
-			const model = this._getModel(modelId) || this._defaultModel();
+			// an explicit model object (arena) wins over the catalog lookup; streamFn too
+			const model = modelObject || this._getModel(modelId) || this._defaultModel();
 			if (!model) throw new Error("no models available");
+			const effectiveStreamFn = streamFn || streamSimple;
 			// a PEER starts from its role's system prompt and its role's tool set — the two things that
 			// make it a peer rather than a second chat
 			const level = thinkingLevel || role?.thinking || "high";
@@ -231,7 +238,7 @@ export class AgentHub {
 			const basePrompt = this.getSystemPrompt();
 			const systemPrompt = isPeer ? composeRolePrompt(role, { parentPrompt: basePrompt }) : basePrompt;
 			const agent = new Agent({
-				streamFn: streamSimple, // pi-ai 1.4.0: streamFn required (compat generic dispatcher)
+				streamFn: effectiveStreamFn, // pi-ai 1.4.0 requires it; arena passes its own
 				initialState: {
 					model,
 					thinkingLevel: level,
@@ -433,7 +440,13 @@ export class AgentHub {
 		if (!parent) return { ok: false, reason: "no live session to delegate from" };
 		if (!role) return { ok: false, reason: "unknown role — use subagent({action:\"list\"}) to see the available roles" };
 		if (parent.kind === "peer") return { ok: false, reason: "peers cannot spawn peers (depth 1)" };
-		const spawned = this.peers.spawn({ parentId, role, task, model, thinking, depth });
+		// the model SPEC travels on the record: `arena/<slug>` or a pi id (the tool arg beats the role file)
+		const spec = parseModelSpec(model) || parseModelSpec(role.model) || parseModelSpec(parent.agent.state.model?.id);
+		// refuse BEFORE creating a child nobody can run: an arena spec needs the CDP bridge
+		if (spec?.kind === "arena" && !this.arena) {
+			return { ok: false, reason: "arena peers need the CDP bridge: open arena.ai in the debugged browser (logged in) or set PI_WEB_ARENA_BRIDGE" };
+		}
+		const spawned = this.peers.spawn({ parentId, role, task, model: spec?.spec || null, thinking, depth });
 		if (!spawned.ok) return spawned;
 		// JOURNAL (D11): persisted with the parent's metadata, so status survives a restart and the boot
 		// reconcile can answer a spawn the process died on.
@@ -449,8 +462,15 @@ export class AgentHub {
 
 	/** The runner the supervisor drives: create the child session, prompt it, report its final text. */
 	async _runPeer(peer, hooks) {
+		// ONE path: an arena peer is the same session/Agent/role/journal machinery, built with a different
+		// streamFn + model object (user instruction 2026-10-31). `tools: []` comes from the tool list below
+		// — the bridge cannot call tools, and the streamFn prepends that fact to the prompt.
+		const spec = parseModelSpec(peer.model);
+		const isArena = spec?.kind === "arena";
+		if (isArena && !this.arena) return { status: "error", error: "arena peers need the CDP bridge (open arena.ai in the debugged browser, or set PI_WEB_ARENA_BRIDGE)", summary: "", usage: { input: 0, output: 0, cost: 0 }, turns: 0, sessionId: null };
 		const childId = crypto.randomUUID();
 		const entry = this.getSession(childId, {
+			...(isArena ? { model: arenaModel(spec.slug), streamFn: makeArenaStreamFn({ bridge: this.arena, slug: spec.slug, log: (m) => console.log(m) }) } : {}),
 			modelId: peer.model,
 			thinkingLevel: peer.thinking,
 			title: `${peer.role?.name || "peer"} · ${String(peer.task || "").replace(/\s+/g, " ").slice(0, 60)}`,
@@ -647,6 +667,8 @@ export class AgentHub {
 			return { ok: true, stopped: touched.length };
 		}
 		if (action === "steer") {
+			const child = childId ? this.sessions.get(childId) : null;
+			if (child?.agent.state.model?.provider === "arena") return { ok: false, reason: "an arena peer answers one request at a time — steer is not supported (stop it and delegate again with the extra guidance)" };
 			if (!childId) return { ok: false, reason: "the peer has no live session to steer" };
 			const r = await this.steer(childId, String(arg.text || ""));
 			return { ok: r?.accepted !== false, peer: this.peers.statusOf(parentId, peerId), reason: r?.reason || null };
