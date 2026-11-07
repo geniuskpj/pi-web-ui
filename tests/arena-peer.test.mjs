@@ -24,7 +24,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 	check("P1 `arena/<slug>` selects the backend", parseModelSpec("arena/grok-4.6-high")?.kind === "arena" && parseModelSpec("arena/grok-4.6-high").slug === "grok-4.6-high");
 	check("P2 …and the colon form too", parseModelSpec("ARENA: gemini-3.1-pro-preview")?.slug === "gemini-3.1-pro-preview");
 	check("P3 a pi id stays a pi id", parseModelSpec("deepseek-ai/deepseek-v4.1-flash")?.kind === "pi");
-	check("P4 an empty/garbage spec is null (never a half-spec)", parseModelSpec("") === null && parseModelSpec("arena/") === null && parseModelSpec(null) === null);
+	check("P4 an empty spec is null and bare `arena` means the arena ROUTER (not a pi fallback)",
+		parseModelSpec("") === null && parseModelSpec(null) === null &&
+		parseModelSpec("arena")?.router === true && parseModelSpec("arena:")?.router === true && parseModelSpec("arena/max")?.slug === "max");
 	check("P5 the model object looks like a model to every other reader",
 		arenaModel("grok-4.6-high").id === "arena/grok-4.6-high" && arenaModel("x").provider === "arena" && arenaModel("x").input.includes("text"));
 }
@@ -171,6 +173,11 @@ export async function chat(message, slug, modelId) {
 		check("Q1 both calls completed through the real wrapper", ra.status === "ok" && rb.status === "ok" && /REAL WRAPPER/.test(ra.text));
 		check("Q1b the SLUG was resolved to the model UUID first (the bridge's own slug field is gone)",
 			calls[0].modelId === "uuid-grok" && calls[1].modelId === "uuid-claude", JSON.stringify(calls.map((c) => c.modelId)));
+		check("Q1d a ROUTER request still works (no 'Max' entry in this fake catalog → the bridge's own default)",
+			await (async () => {
+				const r = await bridge.chat({ slug: "", message: "route this" });
+				return r.status === "ok" && /REAL WRAPPER|Max/.test(r.text);
+			})());
 		check("Q1c an unknown slug is refused WITH suggestions from the catalog", await (async () => {
 			const r = await bridge.chat({ slug: "grok-nope", message: "x" });
 			return r.status === "error" && /no model "grok-nope"/.test(r.error) && /grok-4\.6-high/.test(r.error);

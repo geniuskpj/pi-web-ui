@@ -124,7 +124,7 @@ export function createPeerIntegration({ hub, usableTools, piDir, workspaceDir, e
 					peerId: { type: "string", description: "peer id for stop/steer/retry (see status)" },
 					text: { type: "string", description: "guidance for steer" },
 					all: { type: "boolean", description: "stop every peer of this session" },
-					model: { type: "string", description: "optional model override: a pi model id (e.g. deepseek-ai/deepseek-v4.1-flash) or arena/<slug> (e.g. arena/grok-4.6-high) for a keyless peer — arena peers have NO tools" },
+					model: { type: "string", description: "optional model override: a pi model id (e.g. deepseek-ai/deepseek-v4.1-flash), or `arena` (arena routes it) / `arena/<slug>` (e.g. arena/grok-4.6-high) for a keyless peer — arena peers have NO tools" },
 				},
 				required: ["action"],
 			},
@@ -143,7 +143,7 @@ export function createPeerIntegration({ hub, usableTools, piDir, workspaceDir, e
 					if (arena.ok) {
 						// show REAL slugs from the live catalog: the model should not guess a name that does not exist
 						const names = await (hubRef().arena?.listNames?.(6) ?? Promise.resolve(null)).catch?.(() => null) ?? null;
-						lines.push(`- arena: AVAILABLE — pass model:\`arena/<slug>\` for a keyless peer with NO tools${names?.length ? ` (e.g. ${names.join(", ")})` : " (e.g. arena/grok-4.6-high)"}`);
+						lines.push(`- arena: AVAILABLE — pass model:\`arena\` (let arena route it) or \`arena/<slug>\` for a keyless peer with NO tools${names?.length ? ` (e.g. ${names.join(", ")})` : " (e.g. arena/grok-4.6-high)"}`);
 					} else {
 						lines.push(`- arena: unavailable (${arena.reason})`);
 					}

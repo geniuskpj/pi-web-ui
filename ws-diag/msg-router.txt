@@ -1,0 +1,24 @@
+feat(arena): bare `arena` = the arena router (resolved by NAME, not the bridge's hardcoded uuid)
+
+User question: "are arena_chat or arena_peer has default model? models in arena are changed."
+
+Answer, verified against the bridge and the fetched catalog (ws/arena/models.json, 1074 entries):
+* `arena_chat` DOES have a default: the bridge hardcodes the "Max" router
+  (`modelId || '019b24bb-5caf-71c3-b854-37d0c7086f21'`), and that entry still exists
+  (`publicName: "Max"`, organization "boss-bandit") — but it is a UUID, i.e. exactly the kind of value a
+  catalog reshuffle can invalidate.
+* `arena_peer` had NO arena default: a spec had to carry a slug, so bare `arena` fell through to the
+  PARENT'S pi model (silently, and not what `model: arena` reads like), and a role pinned to a renamed
+  slug failed with suggestions.
+
+Now:
+* `parseModelSpec("arena")` / `"arena:"` / `"arena/max"` / `"arena/router"` = the ROUTER
+  (`{kind:"arena", slug:null, router:true}`);
+* the router is resolved BY NAME against the live catalog ("max"), so a changed UUID cannot break it; if
+  the catalog cannot answer, the call falls through to the bridge's OWN default (chat(message, undefined)),
+  which is the documented "no model named" path;
+* a named slug still resolves by publicName/displayName/name and an unknown one is refused WITH suggestions;
+* the tool's `model` parameter and the `list` action now say `arena` is the routed default.
+
+tests/arena-peer.test.mjs 35 checks: P4 (bare arena = router, "arena/max" = the max slug) and Q1d (a router
+request survives a catalog with no "Max" entry). tsc clean, build OK, the other peer suites unchanged.
