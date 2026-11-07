@@ -62,6 +62,8 @@ import { isMediaHash } from "./lib/data-reduction.mjs";
 // PEERS / subagents (plan-subagents.md): roles from .pi/agents/*.md, a per-session tool list, and the
 // bound `subagent` tool. The heavy lifting lives in peer-tools.mjs so it is testable without a server.
 import { createPeerIntegration } from "./peer-tools.mjs";
+// arena as a peer BACKEND (same peer path, different streamFn): the bridge is optional and lazy
+import { createArenaBridge } from "./lib/arena-stream.mjs";
 import { purgeMediaOlderThan } from "./lib/media-egress.mjs";
 import { stripBoilerplate } from "./lib/hp2.mjs";
 import { netClassOf } from "./lib/net-class.mjs";
@@ -2119,6 +2121,9 @@ const DR_DEBUG = process.env.PI_WEB_DATA_REDUCTION_DEBUG === "1";
  * the `subagent` tool entirely (PI_WEB_TOOLS remains the outer, per-tool gate).
  */
 const PEERS_ENABLED = !["0", "off", "false"].includes(String(process.env.PI_WEB_PEERS || "").toLowerCase());
+// the arena bridge: resolved lazily, never at boot (a missing checkout must not stop the server)
+const arenaBridge = createArenaBridge({ repoRoot: __dirname, log: (m) => console.log(m) });
+
 const peerIntegration = createPeerIntegration({
 	hub: () => agentHub,
 	usableTools: () => {
@@ -2177,6 +2182,8 @@ const agentHub = new AgentHub({
 	// all), a user session gets the normal set plus the bound `subagent` tool (peer-tools.mjs).
 	getTools: (sessionId, meta) => peerIntegration.toolsForSession(sessionId, meta),
 	getRoles: (name) => peerIntegration.resolvePeerRole(name),
+	// arena peers: the SAME spawnPeer/_runPeer path, with lib/arena-stream.mjs as the model backend
+	arena: arenaBridge,
 	// store READ accessor: forkSession self-hydrates cold sessions (hub restart,
 	// no attach yet) straight from the JSONL mirror
 	loadMessages: async (id) => { try { const j = await storeOp("get", { id }); return j?.messages?.length ? { messages: j.messages, metadata: j.metadata } : null; } catch { return null; } },
