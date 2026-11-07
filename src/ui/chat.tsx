@@ -1773,6 +1773,10 @@ export function Editor({
 		}
 	});
 	const [streaming, setStreaming] = useState(agent.state.isStreaming);
+	// STOPPING = a Stop was sent and the SERVER has not confirmed yet (user report 2026-10-31: the client
+	// used to fake the end locally, so the button turned into Send while generation continued and there was
+	// no way to kill it). While stopping, the button stays a Stop and re-sends.
+	const [stopping, setStopping] = useState<boolean>(!!(agent as any).stopping);
 	// hub-side pending steering message (chip up ⇒ Steer hidden/Enter blocked —
 	// depth 1; grok review P2: a second mid-run send would be REJECTED and a
 	// fire-and-forget send would silently destroy the typed text)
@@ -1799,8 +1803,20 @@ export function Editor({
 				setPendingSteer((agent as any).pendingPrompt ?? null);
 			}
 			setStreaming(agent.state.isStreaming);
+			setStopping(!!(agent as any).stopping);
 		});
 	}, [agent]);
+
+	// an unconfirmed stop is a real state the user must see (and be able to retry): the server needs up to
+	// its kill grace (~6s) and, when a run is wedged, escalates to a forced kill — say so instead of lying
+	useEffect(() => {
+		if (!stopping || !streaming) return;
+		const t = setTimeout(() => {
+			if (!(agent as any).stopping) return;
+			onNote("stop not confirmed yet — the server is still working on it. Click Stop again to escalate.");
+		}, 9000);
+		return () => clearTimeout(t);
+	}, [stopping, streaming, agent]);
 
 	// draft persistence
 	useEffect(() => {
@@ -1874,6 +1890,13 @@ export function Editor({
 	const enterSends = computeEnterSends(enterSendsPref());
 
 	const send = async () => {
+		// A SEND WHILE STOPPING (user report 2026-10-31): the server may still be streaming for a few
+		// seconds, and a prompt in that window is converted into a STEER — the opposite of what someone who
+		// just pressed Stop wants. Refuse, and keep the draft.
+		if ((agent as any).sendWouldSteer || ((agent as any).stopping && streaming)) {
+			onNote("still stopping — send again in a moment (the run has not confirmed yet)");
+			return;
+		}
 		const text = value.trim();
 		// a paste/upload may still be in flight: wait for it (bounded), then read the CURRENT images — a
 		// fast Send used to fire before setImages landed and silently drop the photo (grok review 2026-10-28)
@@ -2093,12 +2116,18 @@ export function Editor({
 					<EffortPill agent={agent} />
 					<div class="pw-spacer" />
 					{streaming && serverSide && !pendingSteer && (value.trim() || textFiles.length || images.length) ? (
-						<button type="button" class="pw-send pw-steer-send" title="Steer — hold until the current step completes, then send" onClick={() => void send()}>
+						<button type="button" class="pw-send pw-steer-send" title="Steer — hold until the current step completes, then send" onClick={() => void send()} hidden={stopping}>
 							⏩ Steer
 						</button>
 					) : null}
-					<button type="button" class="pw-send" onClick={() => void (streaming ? stop() : send())} disabled={!streaming && !value.trim() && !textFiles.length && !images.length}>
-						{streaming ? "Stop" : "Send"}
+					<button
+						type="button"
+						class="pw-send"
+						title={stopping ? "Stop was requested — click again to force it" : undefined}
+						onClick={() => void (streaming || stopping ? stop() : send())}
+						disabled={!streaming && !stopping && !value.trim() && !textFiles.length && !images.length}
+					>
+						{stopping ? (streaming ? "Stopping…" : "Stopped") : streaming ? "Stop" : "Send"}
 					</button>
 				</div>
 			</div>

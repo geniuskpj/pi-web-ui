@@ -99,7 +99,9 @@ export function createPeerSupervisor({ run, journal, onEvent = () => {}, limits 
 					forced, // the force-settle above: a wedged runner cannot hold this promise hostage
 				]);
 				if (out?.forced) {
-					record.status = out.status === "timeout" ? "timeout" : "aborted";
+					// keep the actual reason: a budget stop is an `error`, a wall-clock stop is a `timeout`
+					// (deepseek review P2 — it used to collapse everything but `timeout` into `aborted`)
+					record.status = ["timeout", "error", "aborted"].includes(out.status) ? out.status : "aborted";
 					record.error = out.error;
 					return { status: record.status, error: out.error, sessionId: record.sessionId, role: role?.name || null, model, usage: record.usage, turns: record.turns, peerId };
 				}

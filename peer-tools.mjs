@@ -142,9 +142,16 @@ export function createPeerIntegration({ hub, usableTools, piDir, workspaceDir, e
 				}
 				if (action === "stop" || action === "steer" || action === "retry") {
 					const text = String(params?.text || "").slice(0, MAX_STEER_CHARS);
-					const r = await hubRef().controlPeer(parentSessionId, String(params?.peerId || ""), params?.all ? "stop-all" : action, { text, reason: "the parent agent stopped it" });
-					const okText = params?.all ? `stopped ${r.stopped ?? 0} peer(s)` : `${action === "steer" ? "steered" : action === "retry" ? "retrying" : "stopping"} ${params?.peerId}`;
-					return asText(r.ok ? okText : `could not ${action}: ${r.reason}`);
+					// the control path needs the SAME guarantee as `run` (deepseek review P1): an exception
+					// here used to escape execute() and leave the parent's tool call with no result at all
+					try {
+						const r = await hubRef().controlPeer(parentSessionId, String(params?.peerId || ""), params?.all ? "stop-all" : action, { text, reason: "the parent agent stopped it" });
+						const okText = params?.all ? `stopped ${r.stopped ?? 0} peer(s)` : `${action === "steer" ? "steered" : action === "retry" ? "retrying" : "stopping"} ${params?.peerId}`;
+						return asText(r.ok ? okText : `could not ${action}: ${r.reason}`);
+					} catch (err) {
+						const res = buildPeerResult({ status: "error", peerId: params?.peerId || null, role: null, error: `the ${action} request failed: ${String(err?.message || err)}` });
+						return asText(resultText(res), res);
+					}
 				}
 				if (action !== "run") return asText(`unknown action "${action}" — use run, list, status, stop, steer or retry`);
 

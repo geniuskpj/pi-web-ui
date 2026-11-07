@@ -13,6 +13,8 @@ import { planCachedSplice } from "../lib/chunk-splice.mjs";
 import { pushDataReduction, readImageRetention } from "./ui/data-settings.js";
 // subagents/peers (plan-subagents.md M3): the snapshot + deltas the server sends, folded by a pure reducer
 import { applyPeer, applyPeers, EMPTY_BUDGET, type Peer, type PeerBudget } from "./ui/peer-store.js";
+// the two-phase Stop state (sent vs CONFIRMED by the server) — pure, and unit-tested
+import { createStopTracker, shouldRefuseSend } from "./ui/stop-state.js";
 // LIVE WRITE-THROUGH (C2): how long a quiet tail may sit in memory before it is
 // written to IDB. Every flush is one gzip of <CHUNK_INTERVAL messages.
 const LIVE_IDLE_MS = 5000;
@@ -217,6 +219,8 @@ export class ProxyAgent {
 			return;
 		}
 		if (msg.type === "state") {
+			// the server's own view of `isStreaming` is the only confirmation that counts
+			if ((msg as any).isStreaming === false) this.clearStopping();
 			// a NEW session: the previous session's peers are not ours any more (a stale chip is a lie);
 			// the server sends the fresh `peers` snapshot right after this frame
 			if (msg.sessionId && this.sessionId && msg.sessionId !== this.sessionId) { this.peers = []; this.peerBudget = EMPTY_BUDGET; this.emitPeers(); }
@@ -335,10 +339,11 @@ export class ProxyAgent {
 			case "turn_end":
 				if (ev.message?.role === "assistant" && ev.message?.errorMessage) this.state.errorMessage = ev.message.errorMessage;
 				break;
-			case "agent_start": this.state.isStreaming = true; this.state.errorMessage = undefined; break;
+			case "agent_start": this.state.isStreaming = true; this.state.errorMessage = undefined; this.clearStopping(); break;
 			case "agent_end":
 				this.state.isStreaming = false;
 				this.state.streamingMessage = undefined;
+				this.clearStopping(); // the server's terminal event IS the confirmation a stop was waiting for
 				this.liveFlush("agent_end"); // C2: the run is over — write the open tail
 				break;
 		}
@@ -791,11 +796,33 @@ export class ProxyAgent {
 		this.sendMsg({ type: "steering-cancel" });
 	}
 
+	/**
+	 * STOP (user report 2026-10-31: "sometimes it does not stop, but the button turned into Send so I cannot
+	 * kill it"). This used to FAKE the end locally — `isStreaming = false`, `streamingMessage` cleared and a
+	 * synthetic `agent_end` — so the UI believed the run was over while the server was still generating:
+	 * the Stop button became Send and there was no way to try again.
+	 *
+	 * Now the request is only a REQUEST: the local state stays "streaming" until the SERVER confirms (a
+	 * `state` frame with isStreaming:false, or a terminal agent event). `stopping` drives the UI (the button
+	 * keeps saying Stop and re-sends on click); `stoppingFor` lets it escalate visually.
+	 */
 	abort(): void {
+		this.stopTracker.request();
 		this.sendMsg({ type: "abort" });
-		this.state.isStreaming = false;
-		this.state.streamingMessage = undefined;
-		this.notifyListeners({ type: "agent_end", synthetic: true });
+		this.notifyListeners({ type: "abort-requested" });
+	}
+
+	/** Is a stop in flight (sent, not yet confirmed by the server)? */
+	get stopping(): boolean { return this.stopTracker.stopping; }
+	/** How long the stop has been unconfirmed, ms. */
+	get stoppingFor(): number { return this.stopTracker.stoppingFor; }
+	private stopTracker = createStopTracker();
+	/** Would a send now be turned into a steer? (the composer uses this to refuse + explain) */
+	get sendWouldSteer(): boolean { return shouldRefuseSend(this.stopTracker.stopping, this.state.isStreaming); }
+	/** The server said the run is over (or a new one started) — clear the pending-stop state. */
+	private clearStopping() {
+		if (!this.stopTracker.confirm()) return;
+		this.notifyListeners({ type: "abort-confirmed" });
 	}
 
 	setModel(modelId: string): void { this.sendMsg({ type: "set-model", modelId }); }

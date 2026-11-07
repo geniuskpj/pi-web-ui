@@ -1,0 +1,60 @@
+fix(stop): make Stop actually kill the run (server force-kill + client stops lying), plus the deepseek-review fixes
+
+User report 2026-10-31: "when user clicked stop, sometimes generation is not stopped. But stop button
+already changed into send thus I cannot kill session/generation. State sync is broken."
+
+TWO halves were broken, and each alone was enough to produce that symptom.
+
+CLIENT — the UI lied locally. ProxyAgent.abort() set `isStreaming = false`, cleared `streamingMessage`
+and emitted a SYNTHETIC `agent_end` the moment Stop was clicked. If the server did not actually stop
+(hub latency, or a wedged run), the composer had already switched to Send: no way to try again, and the
+prompt that followed was silently converted into a STEER. Now a stop is a REQUEST:
+* src/ui/stop-state.ts (new, pure): `request()` / `confirm()` / `stopping` / `stoppingFor`, so the
+  awkward part is unit-tested instead of inferred (tests/stop-state.test.mjs, 18 checks);
+* ProxyAgent keeps `isStreaming` untouched, exposes `stopping` + `sendWouldSteer`, and clears the pending
+  stop only when the SERVER confirms (state frame with isStreaming:false, agent_end, or a new run);
+* chat.tsx keeps the button a Stop ("Stopping…", re-sends on click, never disabled by an empty composer),
+  hides Steer while stopping, refuses a send with a note (it would have become a steer), and escalates
+  visibly after ~9s ("the server is still working on it — click Stop again").
+
+SERVER — a kill that did not kill. `abort()` only asked; a run that ignored it kept streaming, so the hub
+settled the RUNTIME (the UI showed idle) while pi still generated — and pi's internal `activeRun` guard
+then refused the next prompt. Muting is not a kill, so:
+* `_bindAgent()` — the event wiring extracted from getSession into ONE place, returning the unsubscribe;
+* `_makeAgent()` + `_apiKeyFor()` — the Agent is built and configured in ONE place (no drift between a
+  fresh session and a rebuilt one);
+* `_forceKill()` — after the grace (PI_WEB_KILL_GRACE_MS, default 6s, tunable for tests): detach the
+  subscription (the abandoned run can no longer reach the transcript, the UI or the persister), abort,
+  replace the Agent with a FRESH one carrying a COPY of the visible transcript, DROP THE PROMPT LOCK and
+  bump `mutateEpoch` (the wedged prompt held the lock forever — a new prompt queued behind it, which is
+  the same "cannot kill" in another shape), settle the runtime with `forced:true`, and send a `note`
+  frame so every device learns why;
+* abort()'s backstop now escalates to `_forceKill` instead of pretending the run ended.
+
+tests/force-kill.test.mjs (15 checks) drives a child run that NEVER finishes and proves: the kill happens,
+the transcript survives, the abandoned run cannot append into it, and — the point — a NEW prompt is
+accepted and answered afterwards.
+
+DEEPSEEK REVIEW (deepseek-ai/deepseek-v4.1-flash via pi-agent-core, 30 min, 26k output tokens; the
+packet-inlining script lives in ws-diag/deepseek-review.mjs, output in ws-diag/deepseek-review.md).
+Three real bugs found and fixed:
+* stop-all was UNREACHABLE: the tool sends an empty `peerId`, and controlPeer resolved the peer before
+  its `stop-all` branch, so `{action:"stop", all:true}` always answered "unknown peer" while every peer
+  kept running (now the session-scoped verbs come first) — §D1;
+* the boot reconcile called every unfinished spawn "dangling", INCLUDING a live peer: a re-hydrate while
+  a peer ran wrote a fake "server restarted" tool result and the peer's real result arrived later — TWO
+  results for one toolCallId, the exact failure the reconcile exists to prevent (now live-aware via
+  `peers.dangling()`) — §D2;
+* the control branch (stop/steer/retry) had no catch, so a throwing steer left the parent's tool call
+  unanswered (now it returns one error row, like the run path) — §D3;
+plus two smaller ones: a forced settle collapsed a budget `error` into `aborted`, and `retry` was not
+latched per peer (two clients could both resume it).
+
+Also re-applied b1d768c (the pre-restart grok fixes the revert had dropped: supervisor force-settle,
+one-row guarantee, attach redaction, least privilege, journal sessionId, peerId in the result schema) —
+it is committed on main again, and the attach path that shipped inline base64 is redacted once more.
+
+Suites: force-kill 15 (new), stop-state 18 (new), subagent 62, peer-supervisor 39, peer-lifecycle 42,
+peer-roles 36, peer-store 20, subagent-server e2e 17, media-egress e2e 14, data-reduction 185,
+hub-hydration 31, idb-cache 76, session-search 27, retry 50, versions 33, zombie 11, shutdown 9,
+runtime-seq 6, stream-reduce e2e 7 — all green; tsc clean, build OK, and the server boots (scratch e2e).

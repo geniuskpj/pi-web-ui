@@ -244,11 +244,7 @@ export class AgentHub {
 					tools: this.getTools(sessionId, { role, kind: isPeer ? "peer" : "user", depth: isPeer ? 1 : 0, parentSession }),
 				},
 			});
-			agent.getApiKey = async (provider) => {
-				const auth = this.getAuth();
-				const e = auth[provider];
-				return typeof e === "string" ? e : e?.key;
-			};
+			agent.getApiKey = (provider) => this._apiKeyFor(provider);
 			entry = {
 				agent,
 				// HYDRATION FLAG (2026-10-24): an entry created BEFORE the transcript is
@@ -293,102 +289,8 @@ export class AgentHub {
 			if (title) entry.title = title; // sticky-title source (mirror metadata)
 			this.sessions.set(sessionId, entry);
 
-			agent.subscribe((event) => {
-				entry.seq += 1;
-				// runtime status (fable5 design): BOUNDARY events emit a tiny
-				// {type:"runtime"} delta frame to ALL devices; message_update only
-				// refreshes the in-memory lastText preview, broadcast ≤ once per 2s
-				if (event.type === "agent_start") {
-					entry.runtime = {
-						status: "running",
-						startedAt: Date.now(),
-						turn: entry.agent.state.messages.filter((m) => m.role === "user").length,
-						currentTool: null,
-						lastText: null,
-						pendingPrompts: 0,
-					};
-					this.emitRuntime(sessionId);
-				} else if (event.type === "tool_execution_start") {
-					entry.runtime.currentTool = event.toolName || null;
-					this.emitRuntime(sessionId);
-				} else if (event.type === "tool_execution_end") {
-					entry.runtime.currentTool = null;
-					this.emitRuntime(sessionId);
-				} else if (event.type === "message_update" && event.message?.role === "assistant") {
-					const t = (event.message.content || []).filter((c) => c.type === "text").map((c) => c.text || "").join("");
-					if (t) {
-						entry.runtime.lastText = t.length > 120 ? "…" + t.slice(-119) : t;
-						if (!entry.previewTimer) {
-							const pt = setTimeout(() => {
-								entry.previewTimer = null;
-								if (entry.runtime.status === "running") this.emitRuntime(sessionId);
-							}, 2000);
-							pt.unref?.();
-							entry.previewTimer = pt;
-						}
-					}
-				} else if (event.type === "message_end" && event.message?.role === "assistant") {
-					// preview also tracks COMPLETED assistant messages — some models stream
-					// tool-call text without text-type message_update deltas (deepseek DSML)
-					const t = (event.message.content || []).filter((c) => c.type === "text").map((c) => c.text || "").join("");
-					if (t && entry.runtime.status === "running") {
-						entry.runtime.lastText = t.length > 120 ? "…" + t.slice(-119) : t;
-						this.emitRuntime(sessionId);
-					}
-				} else if (event.type === "message_end" && event.message?.role === "user" && entry.pendingPromptMessage && event.message === entry.pendingPromptMessage) {
-					// the steered message was just injected at a turn boundary — clear the
-					// pending chip everywhere (reference equality: pi re-emits the SAME object)
-					entry.pendingPromptMessage = null;
-					entry.pendingPrompt = null;
-					entry.followUpCount = 0;
-					entry.runtime.pendingPrompts = 0;
-					this.emitRuntime(sessionId);
-					this.emitSteering(sessionId);
-				} else if (event.type === "agent_end") {
-					if (entry.previewTimer) { clearTimeout(entry.previewTimer); entry.previewTimer = null; }
-					// phantom-streaming guard (killstop test 2026-10-23): after ABORT pi's
-					// state.isStreaming stayed true indefinitely — any device attaching in
-					// that window saw a frozen "streaming" transcript that never updates
-					// (no further events come). The terminal event is ground truth.
-					// ONE implementation (main's _settleRuntime refactor): the retry
-					// feature's note rides along so an alive-sessions row still previews
-					// WHY the run failed.
-					const { lastA, failed } = this._settleRuntime(sessionId, entry, { lastText: entry.retryNote || null });
-					// RETRY policy (2026-10-23): a run that ended in an error either gets a
-					// scheduled auto-retry (rate limit / network / transient 5xx — see
-					// _isRetryableError) or stops retrying. The counter resets on success and
-					// on every user action (prompt/steer/abort/edit/retry), so it only ever
-					// chains consecutive failures of the same turn.
-					if (failed) this._maybeScheduleAutoRetry(entry, sessionId, lastA);
-					else { entry.retryAttempts = 0; entry.retryNote = null; entry.retryGivenUp = false; entry.retryPending = null; }
-				}
-				const payload = { type: "agent-event", sessionId, seq: entry.seq, event };
-				// liveness heartbeat for the zombie self-heal (grok Q1): multi-turn runs
-				// legitimately dip pi's isStreaming false between LLM calls — only a run
-				// that has been QUIESCENT for the staleness floor is a zombie
-				entry.lastEventAt = Date.now();
-				// attach() buffering hook (2026-10-21: replaces the old global
-				// this.broadcast swap, which was not reentrant when two attaches overlapped)
-				if (entry.buffer) entry.buffer.push(payload);
-				else this.broadcast(sessionId, payload);
-				// SSE subscribers fan out from a per-session set (2026-10-21 P2 fix:
-				// onEvents no longer wraps/restores the shared broadcast)
-				const subs = this.subscribers.get(sessionId);
-				if (subs) for (const cb of [...subs]) { try { cb({ type: "agent-event", event }); } catch { /* listener error — drop */ } }
-				entry.lastActivity = Date.now();
-				// persistence triggers: user message immediately; everything else debounced —
-				// EXCEPT agent_end: the turn boundary flushes NOW (2026-10-22 postmortem:
-				// the final reply of a turn was lost when the server was hard-killed while
-				// the 400ms-debounced 5MB put was still in flight; a turn boundary is the
-				// one point users cannot afford to lose)
-				if (event.type === "message_end" && event.message?.role === "user") {
-					this.persistSession(sessionId, true);
-				} else if (event.type === "agent_end") {
-					this.persistSession(sessionId, true);
-				} else if (event.type === "message_end") {
-					this.persistSession(sessionId, false);
-				}
-			});
+			// the unsubscribe is KEPT so a wedged run can be detached (see _forceKill)
+			entry.unsub = this._bindAgent(entry, sessionId);
 		}
 		entry.lastActivity = Date.now();
 		return entry;
@@ -485,7 +387,11 @@ export class AgentHub {
 	_reconcilePeersInner(sessionId) {
 		const entry = this.sessions.get(sessionId);
 		if (!entry) return 0;
-		const dangling = danglingSpawns(entry.peerJournal || [], { liveIds: [] });
+		// LIVE-AWARE (deepseek review 2026-10-31, P1): `liveIds: []` called every unfinished spawn "dangling",
+		// so a re-hydrate while a peer was RUNNING wrote a fake "server restarted" tool result into the
+		// transcript — and the peer's real result arrived later: two results for one toolCallId, the exact
+		// failure this reconcile exists to prevent. The supervisor knows which peers are alive.
+		const dangling = this.peers.dangling(sessionId);
 		if (!dangling.length) return 0;
 		// Which `subagent` calls still lack a result? `normalizeRestoredMessages` pass 3 ALREADY strips a
 		// dangling tool call at load (a provider 400 otherwise), so often there is nothing left to answer —
@@ -629,6 +535,33 @@ export class AgentHub {
 		try { this.broadcast(parentId, { type: "peer", sessionId: parentId, peer }); } catch { /* no sockets */ }
 	}
 
+	/** The provider credential for an Agent (string or {key} in auth.json). One implementation. */
+	_apiKeyFor(provider) {
+		const auth = this.getAuth();
+		const e = auth?.[provider];
+		return typeof e === "string" ? e : e?.key;
+	}
+
+	/**
+	 * Build a configured Agent for a session. Extracted (2026-10-31) so the FORCE KILL can replace a wedged
+	 * one with an identical fresh Agent instead of muting it — streamFn, api key, system prompt and tools
+	 * are wired in exactly one place.
+	 */
+	_makeAgent({ model, thinkingLevel = "high", systemPrompt, tools, messages }) {
+		const agent = new Agent({
+			streamFn: streamSimple,
+			initialState: {
+				model,
+				thinkingLevel,
+				messages: messages || [],
+				...(systemPrompt ? { systemPrompt } : {}),
+				tools: tools || [],
+			},
+		});
+		agent.getApiKey = (provider) => this._apiKeyFor(provider);
+		return agent;
+	}
+
 	/**
 	 * The child session now exists: remember its id in the journal IMMEDIATELY (copilot review
 	 * 2026-10-31) so the panel can open the transcript, and a retry can address the session, even if the
@@ -686,6 +619,14 @@ export class AgentHub {
 	 * normal session uses (C14) — no parallel code path.
 	 */
 	async controlPeer(actorSessionId, peerId, action, arg = {}) {
+		// ── session-scoped verbs FIRST (deepseek review 2026-10-31, P1): `stop-all` names no peer, and the
+		// per-peer lookup below rejected the empty id — so the tool's `{action:"stop", all:true}` always
+		// answered "unknown peer" while every peer kept running. Dead branch, live bug.
+		if (action === "stop-all") {
+			if (!this.sessions.has(actorSessionId)) return { ok: false, reason: "unknown session" };
+			const touched = this.peers.cancel(actorSessionId, { treeWide: true, reason: String(arg.reason || "stopped by the user"), status: "aborted" });
+			return { ok: true, stopped: touched.length, peers: this.peersOf(actorSessionId) };
+		}
 		// the live tree knows a running peer; the JOURNAL is the fallback (after a restart, or for a peer
 		// that already finished) — so status/control keep working for the whole session lifetime (C16)
 		const parentId = this.peers.parentOf(peerId) || this._parentOfPeer(peerId);
@@ -712,11 +653,122 @@ export class AgentHub {
 		}
 		if (action === "retry") {
 			if (this.peers.has(peerId)) return { ok: false, reason: "a live peer cannot be retried — stop it first (retry must never double the spend)" };
+			// in-flight latch (deepseek P2): a finished peer is not "live", so two clients could both retry
+			this._peerRetrying ??= new Set();
+			if (this._peerRetrying.has(peerId)) return { ok: false, reason: "this peer is already being retried" };
+			this._peerRetrying.add(peerId);
+			setTimeout(() => this._peerRetrying?.delete(peerId), 30000).unref?.();
 			if (!childId) return { ok: false, reason: "the peer never produced a session" };
 			const r = await this.retry(childId, { reason: "manual" });
 			return { ok: r?.ok !== false, reason: r?.reason || null, peer: this.peers.statusOf(parentId, peerId) };
 		}
 		return { ok: false, reason: `unknown peer action "${action}"` };
+	}
+
+	/**
+	 * The ONE place a session's agent events are wired into the hub: runtime frames, steering, persistence
+	 * triggers, broadcast, budget guards and the retry policy. Extracted from getSession (2026-10-31) so a
+	 * FORCED KILL can detach a wedged run and re-bind a fresh Agent — `abort()` alone leaves a run that
+	 * ignores it, and pi's own `activeRun` guard then refuses the next prompt. Returns the unsubscribe.
+	 */
+	_bindAgent(entry, sessionId) {
+		const agent = entry.agent;
+			agent.subscribe((event) => {
+				entry.seq += 1;
+				// runtime status (fable5 design): BOUNDARY events emit a tiny
+				// {type:"runtime"} delta frame to ALL devices; message_update only
+				// refreshes the in-memory lastText preview, broadcast ≤ once per 2s
+				if (event.type === "agent_start") {
+					entry.runtime = {
+						status: "running",
+						startedAt: Date.now(),
+						turn: entry.agent.state.messages.filter((m) => m.role === "user").length,
+						currentTool: null,
+						lastText: null,
+						pendingPrompts: 0,
+					};
+					this.emitRuntime(sessionId);
+				} else if (event.type === "tool_execution_start") {
+					entry.runtime.currentTool = event.toolName || null;
+					this.emitRuntime(sessionId);
+				} else if (event.type === "tool_execution_end") {
+					entry.runtime.currentTool = null;
+					this.emitRuntime(sessionId);
+				} else if (event.type === "message_update" && event.message?.role === "assistant") {
+					const t = (event.message.content || []).filter((c) => c.type === "text").map((c) => c.text || "").join("");
+					if (t) {
+						entry.runtime.lastText = t.length > 120 ? "…" + t.slice(-119) : t;
+						if (!entry.previewTimer) {
+							const pt = setTimeout(() => {
+								entry.previewTimer = null;
+								if (entry.runtime.status === "running") this.emitRuntime(sessionId);
+							}, 2000);
+							pt.unref?.();
+							entry.previewTimer = pt;
+						}
+					}
+				} else if (event.type === "message_end" && event.message?.role === "assistant") {
+					// preview also tracks COMPLETED assistant messages — some models stream
+					// tool-call text without text-type message_update deltas (deepseek DSML)
+					const t = (event.message.content || []).filter((c) => c.type === "text").map((c) => c.text || "").join("");
+					if (t && entry.runtime.status === "running") {
+						entry.runtime.lastText = t.length > 120 ? "…" + t.slice(-119) : t;
+						this.emitRuntime(sessionId);
+					}
+				} else if (event.type === "message_end" && event.message?.role === "user" && entry.pendingPromptMessage && event.message === entry.pendingPromptMessage) {
+					// the steered message was just injected at a turn boundary — clear the
+					// pending chip everywhere (reference equality: pi re-emits the SAME object)
+					entry.pendingPromptMessage = null;
+					entry.pendingPrompt = null;
+					entry.followUpCount = 0;
+					entry.runtime.pendingPrompts = 0;
+					this.emitRuntime(sessionId);
+					this.emitSteering(sessionId);
+				} else if (event.type === "agent_end") {
+					if (entry.previewTimer) { clearTimeout(entry.previewTimer); entry.previewTimer = null; }
+					// phantom-streaming guard (killstop test 2026-10-23): after ABORT pi's
+					// state.isStreaming stayed true indefinitely — any device attaching in
+					// that window saw a frozen "streaming" transcript that never updates
+					// (no further events come). The terminal event is ground truth.
+					// ONE implementation (main's _settleRuntime refactor): the retry
+					// feature's note rides along so an alive-sessions row still previews
+					// WHY the run failed.
+					const { lastA, failed } = this._settleRuntime(sessionId, entry, { lastText: entry.retryNote || null });
+					// RETRY policy (2026-10-23): a run that ended in an error either gets a
+					// scheduled auto-retry (rate limit / network / transient 5xx — see
+					// _isRetryableError) or stops retrying. The counter resets on success and
+					// on every user action (prompt/steer/abort/edit/retry), so it only ever
+					// chains consecutive failures of the same turn.
+					if (failed) this._maybeScheduleAutoRetry(entry, sessionId, lastA);
+					else { entry.retryAttempts = 0; entry.retryNote = null; entry.retryGivenUp = false; entry.retryPending = null; }
+				}
+				const payload = { type: "agent-event", sessionId, seq: entry.seq, event };
+				// liveness heartbeat for the zombie self-heal (grok Q1): multi-turn runs
+				// legitimately dip pi's isStreaming false between LLM calls — only a run
+				// that has been QUIESCENT for the staleness floor is a zombie
+				entry.lastEventAt = Date.now();
+				// attach() buffering hook (2026-10-21: replaces the old global
+				// this.broadcast swap, which was not reentrant when two attaches overlapped)
+				if (entry.buffer) entry.buffer.push(payload);
+				else this.broadcast(sessionId, payload);
+				// SSE subscribers fan out from a per-session set (2026-10-21 P2 fix:
+				// onEvents no longer wraps/restores the shared broadcast)
+				const subs = this.subscribers.get(sessionId);
+				if (subs) for (const cb of [...subs]) { try { cb({ type: "agent-event", event }); } catch { /* listener error — drop */ } }
+				entry.lastActivity = Date.now();
+				// persistence triggers: user message immediately; everything else debounced —
+				// EXCEPT agent_end: the turn boundary flushes NOW (2026-10-22 postmortem:
+				// the final reply of a turn was lost when the server was hard-killed while
+				// the 400ms-debounced 5MB put was still in flight; a turn boundary is the
+				// one point users cannot afford to lose)
+				if (event.type === "message_end" && event.message?.role === "user") {
+					this.persistSession(sessionId, true);
+				} else if (event.type === "agent_end") {
+					this.persistSession(sessionId, true);
+				} else if (event.type === "message_end") {
+					this.persistSession(sessionId, false);
+				}
+			});
 	}
 
 	persistSession(sessionId, immediate = false) {
@@ -1113,20 +1165,19 @@ export class AgentHub {
 		// !isStreaming is false, so the kill backstop is the only closer for the
 		// original phantom case; _settleRuntime writes the flag as documented
 		// last-resort for the library bug).
+		// a tunable grace (PI_WEB_KILL_GRACE_MS) so tests can drive the whole escalation quickly
+		const grace = Math.max(20, Number(this.killGraceMs ?? process.env.PI_WEB_KILL_GRACE_MS) || 6000);
 		const trySettle = (delay) => setTimeout(() => {
 			const e = this.sessions.get(sessionId);
 			if (!e || e.runtime?.status === "idle") return;
 			if (!e.agent.state.isStreaming) this._settleRuntime(sessionId, e);
-			else trySettle(2500); // one retry, ~4s total
-		}, delay).unref?.();
-		trySettle(1500);
+			else trySettle(Math.round(grace * 0.4)); // one retry inside the grace window
+		}, Math.round(grace * 0.25)).unref?.();
+		trySettle(Math.round(grace * 0.25));
 		setTimeout(() => {
 			const e = this.sessions.get(sessionId);
-			if (e && e.runtime?.status !== "idle") {
-				console.warn(`[hub] force-settle backstop: ${sessionId} still not settled 6s after Kill — overriding (library flag stuck / no agent_end)`);
-				this._settleRuntime(sessionId, e);
-			}
-		}, 6000).unref?.();
+			if (e && e.runtime?.status !== "idle") this._forceKill(sessionId, `still streaming ${(grace / 1000).toFixed(1)}s after Kill`);
+		}, grace).unref?.();
 	}
 
 	setModel(sessionId, modelId) {
@@ -1748,6 +1799,59 @@ export class AgentHub {
 			entry.compacting = false;
 			this.broadcastState(sessionId); // final frame: new messages + compacting:false (success AND failure)
 		}
+	}
+
+	/**
+	 * FORCED KILL (user report 2026-10-31: "Stop sometimes does not stop, and the button turned into Send,
+	 * so I cannot kill it"). `agent.abort()` ASKS; when the run ignores it (a wedged provider or tool
+	 * promise) pi keeps streaming and its internal `activeRun` then refuses the next prompt. Muting is not a
+	 * kill, and claiming `isStreaming:false` is worse, so this:
+	 *   1. drops the event subscription — the abandoned run can never reach the transcript, the UI or the
+	 *      persister again;
+	 *   2. replaces the Agent with a FRESH one carrying a COPY of the visible transcript (pi's guard lives
+	 *      on the old instance), so the session is genuinely usable again;
+	 *   3. settles the runtime and tells every client (a `note` frame + `forced: true`).
+	 * The abandoned request may still burn tokens at the provider — nothing recalls it — but the user can
+	 * stop and act again, which is what Kill has to mean.
+	 */
+	_forceKill(sessionId, why = "the run did not confirm the stop") {
+		const entry = this.sessions.get(sessionId);
+		if (!entry) return false;
+		if (entry.runtime?.status !== "running" && !entry.agent.state.isStreaming) return false;
+		const dead = entry.agent;
+		try { entry.unsub?.(); } catch { /* already detached */ }
+		try { dead.abort(); } catch { /* already dead */ }
+		try { dead.clearAllQueues?.(); } catch { /* older core */ }
+		const messages = [...(dead.state.messages || [])]; // a COPY: the abandoned run must not append into it
+		entry.agent = this._makeAgent({
+			model: dead.state.model,
+			thinkingLevel: dead.state.thinkingLevel,
+			systemPrompt: dead.state.systemPrompt,
+			tools: dead.state.tools || [],
+			messages,
+		});
+		entry.unsub = this._bindAgent(entry, sessionId);
+		entry.pendingPrompt = null;
+		entry.pendingPromptMessage = null;
+		entry.followUpCount = 0;
+		// THE LOCK TOO (found by tests/force-kill.test.mjs K8): the wedged prompt never resolved, so it held
+		// `entry.promptLock` forever and every later prompt queued behind it — the session was idle but
+		// unusable, which is the user's "I cannot kill it" in another shape. Drop the chain and bump the
+		// epoch so prompts that were ALREADY waiting for the old run are refused as stale instead of being
+		// replayed against the fresh agent.
+		entry.promptLock = null;
+		entry.mutateEpoch = (entry.mutateEpoch || 0) + 1;
+		entry.retryAttempts = 0;
+		entry.retryNote = null;
+		entry.runtime = { status: "idle", startedAt: null, turn: 0, currentTool: null, lastText: "stopped (forced)", pendingPrompts: 0, forced: true };
+		entry.forcedKillAt = Date.now();
+		console.warn(`[hub] FORCE-KILLED ${sessionId.slice(0, 8)}: ${why} — the wedged run is detached, the session is usable again`);
+		try { this.broadcast(sessionId, { type: "note", note: `stop forced (${why}) — the run was detached; you can send again` }); } catch { /* no sockets */ }
+		this.emitRuntime(sessionId);
+		this.emitSteering(sessionId);
+		this.broadcastState(sessionId);
+		this.persistSession(sessionId, true);
+		return true;
 	}
 
 	/** Runtime for an existing entry — idle included, seq-stamped (the client's

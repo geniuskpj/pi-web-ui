@@ -23,6 +23,7 @@ const check = (name, cond, detail = "") => {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const textOf = (m) => (typeof m?.content === "string" ? m.content : (m?.content || []).filter((b) => b?.type === "text").map((b) => b.text || "").join(" "));
 const REVIEWER = resolveRole("reviewer", {});
+const ORACLE = resolveRole("oracle", {});
 const SESSION_TOOLS = ["read_file", "write_file", "edit", "bash", "fetch"];
 
 /** A hub whose tool list is per-session, exactly like server.mjs wires it. */
@@ -247,6 +248,63 @@ function makeHub({ reply = "THE PEER REPORT", replies = null, persist = async ()
 	const journalView = hub.peersOf("P");
 	check("C11 the status view reports the finished peer from the JOURNAL once the run is gone",
 		journalView.length === 1 && journalView[0].status !== "running");
+}
+
+// ── deepseek review 2026-10-31: three REAL bugs it found ───────────────────
+// D1 stop-all was unreachable (the tool sends an empty peerId; the per-peer lookup rejected it first)
+// D2 the boot reconcile called every unfinished spawn "dangling", including a LIVE peer — it wrote a fake
+//    "server restarted" tool result while the peer was still running, and the peer's own result arrived
+//    later: TWO results for one toolCallId
+// D3 the control branch had no catch, so a throwing steer/retry left the parent's tool call unanswered
+{
+	const { hub, faux } = makeHub({ hangTools: true });
+	// BOTH children must hang inside the tool, or the second one finishes and has nothing to stop
+	faux.setResponses([fauxAssistantMessage([fauxToolCall("read_file", { path: "x" })]), fauxAssistantMessage([fauxToolCall("read_file", { path: "y" })])]);
+	hub.getSession("P", { messages: [{ role: "user", content: "go" }] });
+	const a = hub.spawnPeer("P", { role: REVIEWER, task: "one" });
+	const b = hub.spawnPeer("P", { role: ORACLE, task: "two" });
+	await sleep(120);
+	for (let i = 0; i < 20 && hub.peersOf("P").filter((p) => p.status === "running").length < 2; i++) await sleep(50);
+	check("D1a both children are really running before the stop-all", hub.peersOf("P").filter((p) => p.status === "running").length === 2, JSON.stringify(hub.peersOf("P").map((p) => p.status)));
+	const stopAll = await hub.controlPeer("P", "", "stop-all", { reason: "review D1" });
+	check("D1 stop-all works with NO peerId (the id the tool actually sends)",
+		stopAll.ok === true && stopAll.stopped === 2, JSON.stringify(stopAll));
+	check("D1b …and both peers settle as aborted", (await a.promise).status === "aborted" && (await b.promise).status === "aborted");
+	check("D1c …while a foreign session still cannot stop them",
+		(await hub.controlPeer("OTHER", "", "stop-all")).ok === false);
+}
+{
+	// a LIVE peer must survive a reconcile (a re-hydrate while it runs)
+	const { hub, faux } = makeHub({ hangTools: true });
+	faux.setResponses([fauxAssistantMessage([fauxToolCall("read_file", { path: "x" })]), fauxAssistantMessage([fauxText("unused")])]);
+	hub.getSession("P", { messages: [{ role: "user", content: "go" }] });
+	const s = hub.spawnPeer("P", { role: REVIEWER, task: "still running" });
+	await sleep(120);
+	const before = hub.sessions.get("P").agent.state.messages.length;
+	const reconciled = hub._reconcilePeers("P");
+	check("D2 a RUNNING peer is not reconciled as dead", reconciled === 0, `reconciled=${reconciled}`);
+	check("D2b …so no bogus tool result was injected (that would double the result later)",
+		hub.sessions.get("P").agent.state.messages.length === before && !hub.sessions.get("P").agent.state.messages.some((m) => /restarted while this peer/.test(String(m?.content?.[0]?.text || ""))));
+	check("D2c …and its journal entry is still open", hub.sessions.get("P").peerJournal[0].endedAt === null);
+	void s;
+	await hub.controlPeer("P", s.peerId, "stop");
+	await s.promise;
+}
+{
+	// the control branch must answer even when the hub throws
+	const { createPeerIntegration } = await import("../peer-tools.mjs");
+	const { resolveRole: rr } = await import("../lib/peer-roles.mjs");
+	const integration = createPeerIntegration({
+		hub: () => ({ controlPeer: async () => { throw new Error("session vanished"); }, peersOf: () => [], remainingPeerBudget: () => ({ spawns: 1, concurrent: 1, concurrentGlobal: 1 }), peers: { statusOf: () => null }, peerLimits: { summaryBytes: 1024 } }),
+		usableTools: () => [{ name: "read_file" }],
+		piDir: "/nonexistent", workspaceDir: "/nonexistent", enabled: true, log: () => {},
+	});
+	const tool = integration.toolsForSession("P", {}).find((t) => t.name === "subagent");
+	let threw = false, out = null;
+	try { out = await tool.execute("1", { action: "stop", peerId: "p1" }); } catch { threw = true; }
+	check("D3 a throwing control call still returns ONE tool result (never a dangling call)", threw === false && !!out?.content?.[0]?.text, threw ? "it threw" : JSON.stringify(out?.content?.[0]?.text)?.slice(0, 80));
+	check("D3b …and the result is the frozen error shape", out?.details?.status === "error" && /session vanished/.test(String(out.details.error)));
+	check("D3c the role registry is still reachable through the same integration", !!rr("reviewer", {}));
 }
 
 // ── result shape through the tool path (C3/C21) ────────────────────────────
