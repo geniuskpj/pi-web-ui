@@ -50,7 +50,17 @@
     "test:reduce": "node tests/stream-reduce.test.mjs",
     "test:reduce-e2e": "node tests/stream-reduce.e2e.mjs",
     "test:imgcompress": "node tests/image-compression.test.mjs",
-    "test:media-e2e": "node tests/media-egress.e2e.mjs"
+    "test:media-e2e": "node tests/media-egress.e2e.mjs",
+    "test:peerroles": "node tests/peer-roles.test.mjs",
+    "test:peerlife": "node tests/peer-lifecycle.test.mjs",
+    "test:peersup": "node tests/peer-supervisor.test.mjs",
+    "test:peerstore": "node tests/peer-store.test.mjs",
+    "test:subagent": "node tests/subagent.test.mjs",
+    "test:subagent-e2e": "node tests/subagent-server.e2e.mjs",
+    "test:forcekill": "node tests/force-kill.test.mjs",
+    "test:stopstate": "node tests/stop-state.test.mjs",
+    "test:arena": "node tests/arena-peer.test.mjs",
+    "test:imagedims": "node tests/image-dims.test.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "1.4.0",

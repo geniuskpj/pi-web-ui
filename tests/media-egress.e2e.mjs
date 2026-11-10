@@ -39,6 +39,24 @@ const MESSAGES = [
 	...Array.from({ length: 8 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `turn ${i} ` + "lorem ipsum dolor sit amet ".repeat(30), timestamp: 1700000001000 + i })),
 ];
 
+/**
+ * Wait for the STORE to actually answer — by CONTENT, never by status. `GET /api/agent/session/:id`
+ * answers 200 with `exists:false` for a session the worker has not written yet (and `/range` answers 200
+ * with a lone metadata line), so a status check passes instantly and every later assertion reads an empty
+ * session. That is exactly how this suite passed locally and failed in CI (2026-11-01): the seed wait was
+ * "any `sessions` frame", which /ws/sync pushes on connect, before the server processes the put.
+ */
+const waitFor = async (fn, { tries = 100, step = 100, what = "content" } = {}) => {
+	let last = null;
+	for (let i = 0; i < tries; i++) {
+		last = await fn();
+		if (last?.ok) return last;
+		await sleep(step);
+	}
+	console.error(`  ! readiness timeout waiting for ${what} after ${tries * step}ms`);
+	return last;
+};
+
 const srv = await startScratchServer();
 const H = { "x-pi-web-token": srv.token };
 const json = async (path, init = {}) => {
@@ -59,11 +77,21 @@ try {
 		type: "put", id: SESSION,
 		jsonl: [JSON.stringify({ id: SESSION, modelId: "faux-1", thinkingLevel: "high", title: "photo session", messageCount: MESSAGES.length }), ...MESSAGES.map((m) => JSON.stringify(m))].join("\n"),
 	}));
-	for (let i = 0; i < 40 && !frames.some((f) => f.type === "sessions"); i++) await sleep(100);
-	await sleep(300);
+	// READINESS BY CONTENT, NOT BY FRAME TYPE (CI failure 2026-11-01). This used to wait for ANY `sessions`
+	// frame — but /ws/sync pushes the list ON CONNECT, before the server has processed our `put`, so a slow
+	// runner (CI: Node 22/24, two matrix jobs) satisfied the condition immediately and every later read hit
+	// a session that did not exist yet: the body came back empty (0.0KB) and the egress checks failed while
+	// passing on a fast local machine. Poll the READ the checks actually use.
+	const seeded = await waitFor(async () => {
+		const r = await json(`/api/agent/session/${SESSION}`);
+		return { ok: r.body?.exists === true && (r.body?.messages?.length || 0) >= MESSAGES.length, r };
+	}, { what: `session ${SESSION} with ${MESSAGES.length} messages` });
+	const full = seeded?.r;
+	check("E0 the seeded session is READABLE with its content before the egress checks",
+		seeded?.ok === true, `exists=${full?.body?.exists} messages=${full?.body?.messages?.length} status=${full?.status}`);
+	void frames;
 
 	// 2) the FULL session body (what attach/open reads)
-	const full = await json(`/api/agent/session/${SESSION}`);
 	check("E1 the full-session body has no inline image base64 at all",
 		full.status === 200 && inlineBase64Runs(full.text, { minLength: 512 }).length === 0,
 		`${(full.text.length / 1024).toFixed(1)}KB body, longest base64 run ${inlineBase64Runs(full.text, { minLength: 512 })[0] || 0}`);
@@ -77,14 +105,24 @@ try {
 	// 3) THE BACKFILL PATH (the review's H1): the NDJSON range window. NOTE: this route deliberately
 	// ships RAW gzip bytes (the client stores them in IDB and gunzips in JS), so we gunzip here.
 	const rangePath = `/api/agent/session/${SESSION}/range?fromSeq=0&toSeq=${MESSAGES.length + 1}`;
-	const rangeRes = await fetch(srv.url(rangePath), { headers: H });
-	const rangeBuf = Buffer.from(await rangeRes.arrayBuffer());
-	const isGzip = rangeBuf[0] === 0x1f && rangeBuf[1] === 0x8b;
-	const body = isGzip ? zlib.gunzipSync(rangeBuf).toString("utf8") : rangeBuf.toString("utf8");
+	// the window is read by CONTENT too: for a session the worker has not written yet, /range answers 200
+	// with a single metadata line (the CI log's "lines=1"), which is not an empty-page failure but a race
+	const readRange = () => waitFor(async () => {
+		const res = await fetch(srv.url(rangePath), { headers: H });
+		const buf = Buffer.from(await res.arrayBuffer());
+		const gz = buf[0] === 0x1f && buf[1] === 0x8b;
+		const text = gz ? zlib.gunzipSync(buf).toString("utf8") : buf.toString("utf8");
+		const msgs = text.split(String.fromCharCode(10)).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+		return { ok: msgs.length > 1 && msgs.some((m) => Array.isArray(m?.content) && m.content.some((p) => p?.type === "image")), res, buf, text, msgs, gz };
+	}, { what: "the /range window with its image part" });
+	const ranged = await readRange();
+	const rangeRes = ranged?.res, rangeBuf = ranged?.buf;
+	const isGzip = ranged?.gz;
+	const body = ranged?.text;
 	check("E2 the /range NDJSON window carries NO inline base64 (the backfill leak is closed)",
-		rangeRes.status === 200 && inlineBase64Runs(body, { minLength: 512 }).length === 0,
-		`${(body.length / 1024).toFixed(1)}KB window${isGzip ? " (gzip " + (rangeBuf.length / 1024).toFixed(1) + "KB)" : ""}, longest run ${inlineBase64Runs(body, { minLength: 512 })[0] || 0}`);
-	const rangeMsgs = body.split(String.fromCharCode(10)).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+		rangeRes?.status === 200 && inlineBase64Runs(body || "", { minLength: 512 }).length === 0,
+		`${((body || "").length / 1024).toFixed(1)}KB window${isGzip ? " (gzip " + (rangeBuf.length / 1024).toFixed(1) + "KB)" : ""}, longest run ${inlineBase64Runs(body || "", { minLength: 512 })[0] || 0}`);
+	const rangeMsgs = ranged?.msgs || [];
 	const rangeImg = findImage(rangeMsgs);
 	check("E2b …and its image part resolves by hash, so the client can write it to IDB and render later",
 		isMediaHash(rangeImg?.hash) && rangeImg.bytes > 100 * 1024,
@@ -134,7 +172,13 @@ try {
 			JSON.stringify({ role: "user", content: [{ type: "text", text: "photo" }, { type: "image", mimeType: "image/png", data: bigBase64 }], timestamp: 1700000000000 }),
 			JSON.stringify({ role: "assistant", content: "ok", timestamp: 1700000001000 })].join("\n"),
 	}));
-	await sleep(500);
+	// the same content-based readiness as the main seed (fixed sleeps are what made this suite CI-flaky)
+	const seeded2 = await waitFor(async () => {
+		const r = await json(`/api/agent/session/${SESSION2}`);
+		return { ok: r.body?.exists === true, r };
+	}, { what: `session ${SESSION2}` });
+	check("E7-pre the second seeded session is readable (with content) before the attach",
+		seeded2?.ok === true, `exists=${seeded2?.r?.body?.exists} status=${seeded2?.r?.status}`);
 	const mediaDir = path.join(srv.dataDir, "media");
 	const mediaFiles = () => { try { return fs.readdirSync(mediaDir).flatMap((d) => { try { return fs.readdirSync(path.join(mediaDir, d)).map((f) => `${d}/${f}`); } catch { return []; } }); } catch { return []; } };
 	const before = mediaFiles().length;

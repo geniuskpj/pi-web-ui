@@ -80,6 +80,26 @@ jobs:
       # data transfer (plan-mobile-data.md §6): pure policy/planning (images, egress redaction,
       # turn coalescing, thinking flush thresholds) + the WS deflate handshake. All hermetic —
       # the deflate suite starts a scratch server and never provisions a pty/shell.
+      # SUBAGENTS / PEERS (2026-10-31), plus the STORE-fix suites that were never wired:
+      # hermetic by construction — faux providers or a fake arena bridge, no provider keys, no pty, no
+      # bash. They cover the peer lifecycle, the caps, the tool-result contract, the stop/kill escalation
+      # and the arena backend; the media suite below is where the CI race of 2026-11-01 appeared.
+      - name: "Tests (subagents/peers, force-kill, stop state, arena backend)"
+        run: |
+          npm run test:peerroles
+          npm run test:peerlife
+          npm run test:peersup
+          npm run test:peerstore
+          npm run test:subagent
+          npm run test:subagent-e2e
+          npm run test:forcekill
+          npm run test:stopstate
+          npm run test:arena
+          npm run test:imagedims
+      # NOTE (2026-11-01): every suite that seeds a session over /ws/sync must wait for CONTENT, not for a
+      # frame type or a status code — `GET /api/agent/session/:id` answers 200 with `exists:false` for a
+      # session the worker has not written, and /ws/sync pushes the session list on CONNECT. The media e2e
+      # suite failed in CI (and passed locally) for exactly that reason; see ws-diag/ci-race-probe.mjs.
       - name: "Tests (data reduction, thinking flush, WS deflate)"
         run: |
           npm run test:data
